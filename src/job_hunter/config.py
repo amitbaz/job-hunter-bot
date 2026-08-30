@@ -5,7 +5,13 @@ from pathlib import Path
 
 import yaml
 
-from .models import Settings, SearchPolicy
+from .models import (
+    DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES,
+    DEFAULT_ENGINEERING_TITLE_KEYWORDS,
+    DEFAULT_ENGINEERING_TITLE_PHRASES,
+    Settings,
+    SearchPolicy,
+)
 
 
 def load_settings(config_path: Path) -> Settings:
@@ -30,13 +36,25 @@ def load_settings(config_path: Path) -> Settings:
         blocked_title_keywords=data.get("blocked_title_keywords", []),
         salary_floor_eur=data.get("salary_floor_eur", 90000),
         thresholds=data.get("thresholds", {}),
-        max_jobs_per_run=data.get("max_jobs_per_run", 25),
+        max_jobs_per_run=data.get("max_jobs_per_run", 75),
         search_queries=data.get("search_queries", []),
         ats=data.get("ats", {}),
         role_families=data.get("role_families", []),
         search_query_templates=data.get("search_query_templates", []),
         search_domains=data.get("search_domains", []),
         max_search_queries_per_run=data.get("max_search_queries_per_run", 30),
+        engineering_title_keywords=list(
+            data.get("engineering_title_keywords", DEFAULT_ENGINEERING_TITLE_KEYWORDS)
+        ),
+        engineering_title_phrases=list(
+            data.get("engineering_title_phrases", DEFAULT_ENGINEERING_TITLE_PHRASES)
+        ),
+        blocked_profession_title_phrases=list(
+            data.get(
+                "blocked_profession_title_phrases",
+                DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES,
+            )
+        ),
     )
 
     return Settings(

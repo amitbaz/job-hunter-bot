@@ -1,6 +1,50 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 
+DEFAULT_ENGINEERING_TITLE_KEYWORDS = [
+    "engineer",
+    "developer",
+]
+
+DEFAULT_ENGINEERING_TITLE_PHRASES = [
+    "technical lead",
+    "frontend lead",
+    "front-end lead",
+    "software lead",
+    "engineering lead",
+    "software architect",
+    "frontend architect",
+    "front-end architect",
+    "web architect",
+]
+
+DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES = [
+    "product manager",
+    "platform product manager",
+    "technical product manager",
+    "product designer",
+    "ux designer",
+    "ui designer",
+    "product marketing manager",
+    "program manager",
+    "project manager",
+    "customer success manager",
+    "solutions consultant",
+    "sales engineer",
+    "solutions engineer",
+    "support engineer",
+    "data engineer",
+    "machine learning engineer",
+    "ml engineer",
+    "data scientist",
+    "ml researcher",
+    "machine learning researcher",
+    "ios engineer",
+    "android engineer",
+    "mobile engineer",
+    "embedded engineer",
+]
+
 
 @dataclass(slots=True)
 class Job:
@@ -41,6 +85,7 @@ class PrefilterResult:
     should_evaluate: bool
     hard_blocker: bool
     reason: str
+    reason_code: str = ""
 
 
 @dataclass(slots=True)
@@ -50,13 +95,22 @@ class SearchPolicy:
     blocked_title_keywords: list
     salary_floor_eur: int
     thresholds: dict
-    max_jobs_per_run: int = 25
+    max_jobs_per_run: int = 75
     search_queries: list = field(default_factory=list)
     ats: dict = field(default_factory=dict)
     role_families: list[str] = field(default_factory=list)
     search_query_templates: list[str] = field(default_factory=list)
     search_domains: list[str] = field(default_factory=list)
     max_search_queries_per_run: int = 30
+    engineering_title_keywords: list[str] = field(
+        default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_KEYWORDS)
+    )
+    engineering_title_phrases: list[str] = field(
+        default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_PHRASES)
+    )
+    blocked_profession_title_phrases: list[str] = field(
+        default_factory=lambda: list(DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES)
+    )
 
 
 @dataclass(slots=True)

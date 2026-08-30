@@ -1,10 +1,48 @@
 timezone: Europe/Berlin
 scheduled_hour: 9
-max_jobs_per_run: 25
+max_jobs_per_run: 75
 thresholds:
   package: 75
   possible: 65
 salary_floor_eur: 90000
+engineering_title_keywords:
+  - engineer
+  - developer
+engineering_title_phrases:
+  - technical lead
+  - frontend lead
+  - front-end lead
+  - software lead
+  - engineering lead
+  - software architect
+  - frontend architect
+  - front-end architect
+  - web architect
+blocked_profession_title_phrases:
+  - product manager
+  - platform product manager
+  - technical product manager
+  - product designer
+  - ux designer
+  - ui designer
+  - product marketing manager
+  - program manager
+  - project manager
+  - customer success manager
+  - solutions consultant
+  - sales engineer
+  - solutions engineer
+  - support engineer
+  - data engineer
+  - machine learning engineer
+  - ml engineer
+  - data scientist
+  - ml researcher
+  - machine learning researcher
+  - ios engineer
+  - android engineer
+  - mobile engineer
+  - embedded engineer
 target_titles:
   - senior product engineer
   - senior frontend engineer

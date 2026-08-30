@@ -64,9 +64,21 @@ def test_load_settings_requires_telegram_in_non_dry_run(monkeypatch, tmp_path: P
 def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
     cfg = tmp_path / "search.yml"
     cfg.write_text(
-        "timezone: Europe/Berlin\nscheduled_hour: 9\nmax_jobs_per_run: 25\n"
+        "timezone: Europe/Berlin\nscheduled_hour: 9\nmax_jobs_per_run: 75\n"
         "thresholds:\n  package: 75\n  possible: 65\nsalary_floor_eur: 90000\n"
         "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "engineering_title_keywords:\n"
+        "  - engineer\n"
+        "  - developer\n"
+        "engineering_title_phrases:\n"
+        "  - technical lead\n"
+        "  - frontend lead\n"
+        "  - software architect\n"
+        "blocked_profession_title_phrases:\n"
+        "  - product manager\n"
+        "  - product designer\n"
+        "  - sales engineer\n"
+        "  - data engineer\n"
         "max_search_queries_per_run: 4\n"
         "role_families:\n"
         "  - staff product engineer\n"
@@ -86,6 +98,19 @@ def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
     monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
     settings = load_settings(cfg)
+    assert settings.policy.max_jobs_per_run == 75
+    assert settings.policy.engineering_title_keywords == ["engineer", "developer"]
+    assert settings.policy.engineering_title_phrases == [
+        "technical lead",
+        "frontend lead",
+        "software architect",
+    ]
+    assert settings.policy.blocked_profession_title_phrases == [
+        "product manager",
+        "product designer",
+        "sales engineer",
+        "data engineer",
+    ]
     assert settings.policy.max_search_queries_per_run == 4
     assert settings.policy.role_families == [
         "staff product engineer",
