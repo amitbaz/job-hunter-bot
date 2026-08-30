@@ -1,10 +1,11 @@
 import json
+import logging
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
-from job_hunter.models import Job, RunSummary, SearchPolicy, Settings
+from job_hunter.models import CandidatePreferences, Job, RunSummary, SearchPolicy, Settings
 from job_hunter.pipeline import run_pipeline, should_run_scheduled
 from job_hunter.store import JobStore
 
@@ -12,10 +13,23 @@ from job_hunter.store import JobStore
 class FakeGemini:
     def __init__(self):
         self.model = "gemini-test"
+        self.preference_calls = 0
         self.eval_calls = 0
         self.cover_letter_calls = 0
 
     def generate_text(self, prompt, *, json_mode=False):
+        if json_mode and "preferred_roles" in prompt:
+            self.preference_calls += 1
+            payload = {
+                "preferred_roles": ["Senior Product Engineer"],
+                "preferred_seniority": ["senior"],
+                "must_have_signals": ["React"],
+                "nice_to_have_signals": ["TypeScript"],
+                "preferred_locations": ["Germany"],
+                "avoid_signals": ["manager"],
+                "summary": "Remote product-oriented frontend engineer.",
+            }
+            return json.dumps(payload)
         if json_mode:
             self.eval_calls += 1
             payload = {
@@ -326,6 +340,38 @@ def test_pipeline_retries_only_missing_pdf_when_digest_already_sent(settings):
     assert store.has_delivery(job_id, "telegram_document") is True
     assert gemini.eval_calls == 1
     assert gemini.cover_letter_calls == 1
+
+
+def test_pipeline_extracts_preferences_once_without_logging_profile(settings, monkeypatch, caplog):
+    settings.candidate_profile = "SENSITIVE_PROFILE_TEXT"
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+    extracted = []
+
+    def fake_extract(profile, passed_gemini, policy):
+        extracted.append((profile, passed_gemini, policy))
+        return CandidatePreferences(
+            preferred_roles=["Senior Product Engineer"],
+            preferred_seniority=["senior"],
+            must_have_signals=["React"],
+            nice_to_have_signals=[],
+            preferred_locations=["Germany"],
+            avoid_signals=["manager"],
+            summary="Compact summary",
+        )
+
+    monkeypatch.setattr("job_hunter.pipeline.extract_candidate_preferences", fake_extract)
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert extracted == [(settings.candidate_profile, gemini, settings.policy)]
+    assert "profile extraction: source=" in caplog.text
+    assert settings.candidate_profile not in caplog.text
+    assert job.description not in caplog.text
+    assert gemini.eval_calls == 1
 
 
 def test_should_run_scheduled_matches_local_hour():

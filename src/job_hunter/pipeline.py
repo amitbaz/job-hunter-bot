@@ -10,6 +10,7 @@ from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
 from job_hunter.models import DigestItem, Material, RunSummary, Settings
+from job_hunter.preferences import extract_candidate_preferences, preferences_source
 from job_hunter.pdf import render_cover_letter_pdf
 from job_hunter.discovery import collect_candidates
 from job_hunter.ranking import rank_jobs
@@ -22,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 _READY_DECISIONS = {"high_priority", "package_match"}
 _MIN_DELIVERABLE_SCORE = 61
+
+
+def _select_candidates(ranked, policy, preferences):
+    del preferences
+    return ranked[: policy.max_jobs_per_run]
 
 
 def cover_letter_output_dir(settings: Settings) -> Path:
@@ -100,9 +106,11 @@ def run_pipeline(
     pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
     out_dir = cover_letter_output_dir(settings)
     discovery = collect_candidates(sources, store, http, settings.policy)
+    preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy)
+    logger.info("profile extraction: source=%s", preferences_source(preferences))
     summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy)
-    selected = ranked[: settings.policy.max_jobs_per_run]
+    selected = _select_candidates(ranked, settings.policy, preferences)
     deferred_by_budget = max(0, len(ranked) - len(selected))
     logger.info("discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s", discovery.stats.raw, discovery.stats.unique, discovery.stats.prefilter_rejected, discovery.stats.profession_rejected, discovery.stats.eligible, len(selected), deferred_by_budget)
     source_counts = {}

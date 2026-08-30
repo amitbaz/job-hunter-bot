@@ -114,6 +114,17 @@ class SearchPolicy:
 
 
 @dataclass(slots=True)
+class CandidatePreferences:
+    preferred_roles: list[str]
+    preferred_seniority: list[str]
+    must_have_signals: list[str]
+    nice_to_have_signals: list[str]
+    preferred_locations: list[str]
+    avoid_signals: list[str]
+    summary: str
+
+
+@dataclass(slots=True)
 class Settings:
     gemini_api_key: str
     candidate_profile: str
