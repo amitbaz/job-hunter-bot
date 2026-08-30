@@ -17,9 +17,9 @@
 - Keep all source failures isolated; one source must never abort the run.
 - Preserve compatibility with existing SQLite state artifacts.
 - Preserve current evaluation caching, cover-letter/PDF generation, Telegram delivery retry, and scheduled-run behavior.
-- `max_jobs_per_run` is applied only after global deterministic ranking of all eligible candidates.
-- Search-derived records must be enriched from the actual posting before Gemini evaluation when possible.
-- No external calls are allowed in tests.
+- Apply `max_jobs_per_run` only after global deterministic ranking of all eligible candidates.
+- Enrich search-derived records from the actual posting before Gemini evaluation when possible.
+- Do not make external network calls in tests.
 - Run `pytest -q` before completion.
 
 ---
@@ -44,7 +44,7 @@
 
 - [ ] **Step 1: Write failing configuration tests**
 
-Extend `tests/test_config.py` with a YAML fixture containing:
+Extend `tests/test_config.py` with YAML containing:
 
 ```yaml
 max_search_queries_per_run: 4
@@ -59,21 +59,32 @@ search_queries:
   - '"Senior Product Engineer" remote'
 ```
 
-Assert the resulting `SearchPolicy` exposes all four values and still exposes `search_queries`.
+Assert:
 
-- [ ] **Step 2: Run the config test and verify failure**
+```python
+assert settings.policy.max_search_queries_per_run == 4
+assert settings.policy.role_families == [
+    "staff product engineer",
+    "senior software engineer frontend",
+]
+assert settings.policy.search_query_templates == [
+    '"{role}" React TypeScript remote Europe'
+]
+assert settings.policy.search_domains == ["jobs.ashbyhq.com"]
+assert settings.policy.search_queries == ['"Senior Product Engineer" remote']
+```
 
-Run:
+- [ ] **Step 2: Run the config test and verify it fails**
 
 ```bash
 pytest tests/test_config.py -q
 ```
 
-Expected: failure because the new `SearchPolicy` fields are not defined/loaded yet.
+Expected: failure because the new `SearchPolicy` fields are not defined or loaded.
 
-- [ ] **Step 3: Add the new policy fields and loader support**
+- [ ] **Step 3: Add policy fields and loader support**
 
-Update the dataclass in `models.py`:
+Update `SearchPolicy` in `models.py`:
 
 ```python
 @dataclass(slots=True)
@@ -92,35 +103,50 @@ class SearchPolicy:
     max_search_queries_per_run: int = 30
 ```
 
-Load each field explicitly in `config.py` with the same defaults.
+Load the four new values explicitly in `config.py`.
 
 - [ ] **Step 4: Write failing query-generation tests**
 
-Create `tests/test_discovery_queries.py` covering:
+Create `tests/test_discovery_queries.py` with a complete policy factory and these assertions:
 
 ```python
-def test_generate_search_queries_combines_roles_templates_domains_and_legacy_queries():
-    ...
-    queries = generate_search_queries(policy)
+from job_hunter.discovery_queries import generate_search_queries
+from job_hunter.models import SearchPolicy
+
+
+def make_policy(limit: int = 10) -> SearchPolicy:
+    return SearchPolicy(
+        target_titles=[],
+        positive_keywords=[],
+        blocked_title_keywords=[],
+        salary_floor_eur=90000,
+        thresholds={"package": 75, "possible": 65},
+        search_queries=['"Senior Product Engineer" remote'],
+        role_families=["staff product engineer", "senior software engineer frontend"],
+        search_query_templates=['"{role}" React TypeScript remote Europe'],
+        search_domains=["jobs.ashbyhq.com"],
+        max_search_queries_per_run=limit,
+    )
+
+
+def test_generate_search_queries_is_deterministic():
+    queries = generate_search_queries(make_policy())
     assert queries == [
         '"staff product engineer" React TypeScript remote Europe',
         'site:jobs.ashbyhq.com "staff product engineer" React TypeScript remote Europe',
         '"senior software engineer frontend" React TypeScript remote Europe',
         'site:jobs.ashbyhq.com "senior software engineer frontend" React TypeScript remote Europe',
+        '"Senior Product Engineer" remote',
     ]
+
+
+def test_generate_search_queries_enforces_limit():
+    assert len(generate_search_queries(make_policy(limit=3))) == 3
 ```
 
-Also add a separate test proving:
-
-```python
-assert len(generate_search_queries(policy_with_limit_3)) == 3
-```
-
-and a test proving legacy explicit queries are used when role/template lists are empty.
+Add one more test constructing a policy with empty role/template/domain lists and asserting explicit `search_queries` are returned unchanged.
 
 - [ ] **Step 5: Run query tests and verify failure**
-
-Run:
 
 ```bash
 pytest tests/test_discovery_queries.py -q
@@ -130,7 +156,7 @@ Expected: import/function failure.
 
 - [ ] **Step 6: Implement deterministic capped query generation**
 
-Create `src/job_hunter/discovery_queries.py` with:
+Create `src/job_hunter/discovery_queries.py`:
 
 ```python
 from job_hunter.models import SearchPolicy
@@ -159,15 +185,11 @@ def generate_search_queries(policy: SearchPolicy) -> list[str]:
     return queries[: policy.max_search_queries_per_run]
 ```
 
-Keep ordering deterministic and do not create an unbounded Cartesian product beyond the configured cap.
+- [ ] **Step 7: Update `config/search.yml`**
 
-- [ ] **Step 7: Update `config/search.yml` with the v2 role/query families**
-
-Add the role families from the spec, a finite set of query templates, ATS domains, and `max_search_queries_per_run: 30`. Retain useful explicit `search_queries` only when they add coverage not already generated.
+Add `max_search_queries_per_run: 30`, the role families from the spec, a finite list of query templates, and the ATS search domains `jobs.ashbyhq.com`, `jobs.lever.co`, and `boards.greenhouse.io`. Keep explicit search queries only when they add coverage.
 
 - [ ] **Step 8: Run focused tests**
-
-Run:
 
 ```bash
 pytest tests/test_config.py tests/test_discovery_queries.py -q
@@ -197,42 +219,75 @@ git commit -m "feat: add configurable discovery query families"
 
 - [ ] **Step 1: Write failing ranking tests**
 
-Create `tests/test_ranking.py` with focused tests:
+Create `tests/test_ranking.py` with a local policy fixture and these concrete cases:
 
 ```python
-def test_product_engineer_outranks_generic_react_role(policy):
-    strong = Job(source="ashby", title="Staff Product Engineer", company="A", location="Remote Europe", remote=True, description="React TypeScript product ownership architecture")
-    generic = Job(source="remotive", title="React Developer", company="B", location="Worldwide", remote=True, description="React React React React React")
+from job_hunter.models import Job, SearchPolicy
+from job_hunter.ranking import priority_score, rank_jobs, source_quality
+
+
+def make_policy() -> SearchPolicy:
+    return SearchPolicy(
+        target_titles=["senior product engineer", "staff product engineer", "senior frontend engineer"],
+        positive_keywords=["react", "typescript", "next.js", "product ownership", "design system"],
+        blocked_title_keywords=["junior"],
+        salary_floor_eur=90000,
+        thresholds={"package": 75, "possible": 65},
+    )
+
+
+def test_product_engineer_outranks_generic_react_role():
+    policy = make_policy()
+    strong = Job(
+        source="ashby",
+        title="Staff Product Engineer",
+        company="A",
+        location="Remote Europe",
+        remote=True,
+        description="React TypeScript product ownership architecture end-to-end ownership",
+    )
+    generic = Job(
+        source="remotive",
+        title="React Developer",
+        company="B",
+        location="Worldwide",
+        remote=True,
+        description="React React React React React",
+    )
     assert priority_score(strong, policy) > priority_score(generic, policy)
-```
 
-```python
-def test_explicit_europe_remote_outranks_unknown_location(policy):
-    ...
-```
 
-```python
-def test_ats_url_gets_higher_source_quality_than_general_search_result():
+def test_explicit_europe_remote_outranks_unknown_location():
+    policy = make_policy()
+    europe = Job(source="remotive", title="Senior Frontend Engineer", location="Remote Europe", remote=True, description="React TypeScript")
+    unknown = Job(source="remotive", title="Senior Frontend Engineer", location="", remote=True, description="React TypeScript")
+    assert priority_score(europe, policy) > priority_score(unknown, policy)
+
+
+def test_ats_url_gets_higher_source_quality_than_general_web_result():
     ats = Job(source="duckduckgo", title="Senior Product Engineer", url="https://jobs.ashbyhq.com/acme/123")
     web = Job(source="duckduckgo", title="Senior Product Engineer", url="https://example.com/jobs/123")
     assert source_quality(ats) > source_quality(web)
-```
 
-```python
-def test_keyword_repetition_is_capped(policy):
-    normal = Job(..., description="React TypeScript product ownership")
-    spammy = Job(..., description="React " * 100)
+
+def test_keyword_repetition_is_capped():
+    policy = make_policy()
+    normal = Job(source="remotive", title="React Developer", description="React TypeScript product ownership")
+    spammy = Job(source="remotive", title="React Developer", description="React " * 100)
     assert priority_score(spammy, policy) < priority_score(normal, policy) + 20
-```
 
-```python
-def test_rank_jobs_is_stable_for_equal_scores(policy):
-    ...
+
+def test_rank_jobs_is_stable_for_equal_scores():
+    policy = make_policy()
+    jobs = [
+        (2, Job(source="remotive", title="Senior Frontend Engineer", company="Beta", description="React TypeScript")),
+        (1, Job(source="remotive", title="Senior Frontend Engineer", company="Acme", description="React TypeScript")),
+    ]
+    ranked = rank_jobs(jobs, policy)
+    assert [job_id for job_id, _job, _score in ranked] == [1, 2]
 ```
 
 - [ ] **Step 2: Run ranking tests and verify failure**
-
-Run:
 
 ```bash
 pytest tests/test_ranking.py -q
@@ -240,16 +295,17 @@ pytest tests/test_ranking.py -q
 
 Expected: import failure.
 
-- [ ] **Step 3: Implement bounded signal helpers**
+- [ ] **Step 3: Implement bounded scoring helpers**
 
-In `ranking.py`, keep the score transparent and additive:
+In `ranking.py`, define source quality exactly as:
 
 ```python
 _ATS_HOSTS = ("jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io")
 
 
 def source_quality(job: Job) -> int:
-    if any(host in (job.url or "") for host in _ATS_HOSTS):
+    url = (job.url or "").lower()
+    if any(host in url for host in _ATS_HOSTS):
         return 10
     if job.source in {"ashby", "lever", "greenhouse"}:
         return 10
@@ -260,24 +316,25 @@ def source_quality(job: Job) -> int:
     return 3
 ```
 
-Implement title-fit, candidate-strength, career-direction, and location helpers using capped matches. `priority_score()` must return a bounded integer from 0 to 100.
+Implement title fit as 0-40, strength evidence as 0-25, career-direction evidence as 0-15, location evidence as 0-10, and source quality as 0-10. Count unique matched signals rather than occurrences. Clamp the total to 0-100.
 
 - [ ] **Step 4: Implement stable global ordering**
-
-Implement:
 
 ```python
 def rank_jobs(jobs: list[tuple[int, Job]], policy: SearchPolicy) -> list[tuple[int, Job, int]]:
     scored = [(job_id, job, priority_score(job, policy)) for job_id, job in jobs]
     return sorted(
         scored,
-        key=lambda item: (-item[2], (item[1].company or "").lower(), (item[1].title or "").lower(), item[0]),
+        key=lambda item: (
+            -item[2],
+            (item[1].company or "").lower(),
+            (item[1].title or "").lower(),
+            item[0],
+        ),
     )
 ```
 
 - [ ] **Step 5: Run ranking tests**
-
-Run:
 
 ```bash
 pytest tests/test_ranking.py -q
@@ -307,22 +364,34 @@ git commit -m "feat: rank discovery candidates before Gemini"
 **Interfaces:**
 - Produces: `DiscoveryStats`
 - Produces: `DiscoveryResult`
-- Produces: `collect_candidates(sources, store, http, policy) -> DiscoveryResult`
-- `DiscoveryResult.eligible` contains only unique jobs that currently need Gemini evaluation and passed deterministic prefilter.
-- `DiscoveryResult.rediscovered_job_ids` contains already-evaluated jobs encountered during discovery so existing delivery retry behavior can still be invoked by the pipeline.
+- Produces: `collect_candidates(sources: list, store: JobStore, http: HttpClient, policy: SearchPolicy) -> DiscoveryResult`
 
 - [ ] **Step 1: Write failing aggregation tests**
 
-Create tests proving:
+Create `tests/test_discovery.py` with fake sources. Cover these exact behaviors:
 
-1. All sources are called even if one raises.
-2. A search result with only URL/title is enriched before eligibility.
-3. Two records with the same canonical URL collapse to one candidate.
-4. When duplicate records differ in richness, the record with company/description/original ATS URL is preferred.
-5. Prefilter-rejected jobs are counted but not returned in `eligible`.
-6. Already-evaluated unchanged jobs are excluded from `eligible` and included in `rediscovered_job_ids`.
+```python
+def test_collect_candidates_continues_after_source_failure():
+    broken = BrokenSource()
+    good = FakeSource([Job(source="x", source_job_id="1", title="Senior Product Engineer", description="React TypeScript", remote=True)])
+    result = collect_candidates([broken, good], store, http, policy)
+    assert result.stats.raw == 1
+    assert len(result.eligible) == 1
+```
 
-Use fake sources and fake HTTP only.
+```python
+def test_collect_candidates_collapses_same_canonical_url():
+    jobs = [
+        Job(source="duckduckgo", title="Senior Product Engineer", url="https://jobs.ashbyhq.com/acme/1?utm_source=x"),
+        Job(source="ashby", source_job_id="1", title="Senior Product Engineer", company="Acme", url="https://jobs.ashbyhq.com/acme/1", description="React TypeScript", remote=True),
+    ]
+    result = collect_candidates([FakeSource(jobs)], store, http, policy)
+    assert result.stats.unique == 1
+    assert len(result.eligible) == 1
+    assert result.eligible[0][1].company == "Acme"
+```
+
+Add concrete tests for enrichment of a URL-only result, prefilter rejection counting, and exclusion of an already-evaluated unchanged job from `eligible`.
 
 - [ ] **Step 2: Run discovery tests and verify failure**
 
@@ -332,14 +401,9 @@ pytest tests/test_discovery.py -q
 
 Expected: import failure.
 
-- [ ] **Step 3: Define focused result dataclasses**
-
-In `discovery.py`:
+- [ ] **Step 3: Define result dataclasses**
 
 ```python
-from dataclasses import dataclass, field
-
-
 @dataclass(slots=True)
 class DiscoveryStats:
     raw: int = 0
@@ -358,50 +422,26 @@ class DiscoveryResult:
 
 - [ ] **Step 4: Implement in-run duplicate identity**
 
-Use canonical URL first, with normalized company/title/location fallback. Do not modify persisted fingerprint semantics in this task.
+Use canonical URL as the primary key. Maintain a second exact normalized company/title/location key to collapse aggregator/original records when URLs differ but job identity matches.
 
 ```python
-def _candidate_key(job: Job) -> str:
-    if job.url:
-        return f"url:{canonicalize_url(job.url)}"
-    return "identity:" + "|".join(normalize_text(v) for v in (job.company, job.title, job.location))
+def candidate_url_key(job: Job) -> str | None:
+    if not job.url:
+        return None
+    return canonicalize_url(job.url)
+
+
+def candidate_identity_key(job: Job) -> str:
+    return "|".join(normalize_text(value) for value in (job.company, job.title, job.location))
 ```
 
-Additionally maintain a normalized company/title/location lookup so two records with different aggregator/original URLs can collapse when their identity matches exactly.
+- [ ] **Step 5: Implement deterministic richer-record preference**
 
-- [ ] **Step 5: Implement richer-record preference**
-
-Prefer records with:
-
-1. original ATS URL;
-2. non-empty description;
-3. non-empty company;
-4. explicit location/remote information.
-
-Keep this deterministic.
+Rank duplicates by these booleans in order: ATS URL, has description, has company, has location, has explicit remote value. Keep the richer record and preserve any non-empty fields from the weaker record when doing so cannot overwrite better data.
 
 - [ ] **Step 6: Implement collection flow**
 
-For each source:
-
-```text
-try discover
-count raw/per-source
-for each job:
-    enrich only when URL exists and description is missing
-    collapse duplicate candidates
-```
-
-After all sources finish:
-
-```text
-upsert each unique job
-if needs_evaluation:
-    run prefilter
-    eligible -> return for ranking
-else:
-    record job_id for delivery retry path
-```
+For every source, catch exceptions, update per-source/raw counts, enrich only jobs with URL and missing description, collapse duplicates, then upsert unique jobs. Run `store.needs_evaluation(job_id)` and `prefilter_job(job, policy)` only after aggregation. Return only jobs needing evaluation and passing prefilter in `eligible`.
 
 - [ ] **Step 7: Run discovery tests**
 
@@ -432,12 +472,12 @@ git commit -m "feat: aggregate and dedupe discovery candidates"
 - Endpoint: `https://remoteok.com/api`
 - Source name: `remoteok`
 
-- [ ] **Step 1: Write failing Remote OK normalization test**
+- [ ] **Step 1: Write failing normalization test**
 
-Add a fixture where the JSON array begins with the non-job legal metadata object, followed by a job:
+Add this fake response:
 
 ```python
-[
+fake_http.json_data = [
     {"last_updated": 1, "legal": "terms"},
     {
         "id": "123",
@@ -447,14 +487,14 @@ Add a fixture where the JSON array begins with the non-job legal metadata object
         "location": "Europe",
         "url": "https://remoteok.com/remote-jobs/123",
         "description": "<p>React TypeScript product ownership</p>",
-        "tags": ["react", "typescript"]
-    }
+        "tags": ["react", "typescript"],
+    },
 ]
 ```
 
-Assert metadata row is skipped, HTML is stripped, `remote=True`, and source/source ID are set.
+Assert one job is returned, the metadata row is skipped, description is plain text, `remote is True`, and `source_job_id == "123"`.
 
-- [ ] **Step 2: Run the test and verify failure**
+- [ ] **Step 2: Run focused test and verify failure**
 
 ```bash
 pytest tests/test_sources.py -q -k remoteok
@@ -464,13 +504,9 @@ Expected: import/class failure.
 
 - [ ] **Step 3: Implement adapter**
 
-Use existing `HttpClient.get_json()` and `strip_html()`. Treat records without a position/title as non-job metadata and skip them.
+Use `HttpClient.get_json()` and existing `strip_html()`. Skip any array entry with no `position` value. Map `position`, `company`, `location`, `url`, `description`, and `id` to `Job` and set `remote=True`.
 
-- [ ] **Step 4: Export the adapter**
-
-Add `RemoteOKSource` to `sources/__init__.py` exports, but defer default `build_sources()` wiring to Task 7.
-
-- [ ] **Step 5: Run source tests**
+- [ ] **Step 4: Export adapter and test**
 
 ```bash
 pytest tests/test_sources.py -q -k remoteok
@@ -478,7 +514,7 @@ pytest tests/test_sources.py -q -k remoteok
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/job_hunter/sources/remoteok.py src/job_hunter/sources/__init__.py tests/test_sources.py
@@ -495,7 +531,7 @@ git commit -m "feat: add Remote OK discovery source"
 - Modify: `tests/test_sources.py`
 
 **Interfaces:**
-- Produces: `WeWorkRemotelySource(http, feed_urls=None).discover() -> list[Job]`
+- Produces: `WeWorkRemotelySource(http, feed_urls: list[str] | None = None).discover() -> list[Job]`
 - Default feeds:
   - `https://weworkremotely.com/categories/remote-front-end-programming-jobs.rss`
   - `https://weworkremotely.com/categories/remote-full-stack-programming-jobs.rss`
@@ -504,15 +540,22 @@ git commit -m "feat: add Remote OK discovery source"
 
 - [ ] **Step 1: Write failing RSS parsing test**
 
-Use an RSS fixture containing an `<item>` with title, link, description, and category fields. Assert:
+Use this RSS body:
 
-- company/title are split when the feed title uses a `Company: Role` form;
-- URL is preserved;
-- description HTML is stripped;
-- `remote=True`;
-- malformed items are skipped without aborting the feed.
+```xml
+<rss><channel>
+  <item>
+    <title>Acme: Senior Product Engineer</title>
+    <link>https://weworkremotely.com/remote-jobs/acme-senior-product-engineer</link>
+    <description><![CDATA[<p>React TypeScript product ownership</p>]]></description>
+    <category>Full-Stack Programming</category>
+  </item>
+</channel></rss>
+```
 
-- [ ] **Step 2: Run the test and verify failure**
+Assert company is `Acme`, title is `Senior Product Engineer`, description is stripped, URL is preserved, and `remote=True`. Add a second malformed `<item>` without title/link and assert it is ignored.
+
+- [ ] **Step 2: Run focused test and verify failure**
 
 ```bash
 pytest tests/test_sources.py -q -k weworkremotely
@@ -520,11 +563,11 @@ pytest tests/test_sources.py -q -k weworkremotely
 
 Expected: import/class failure.
 
-- [ ] **Step 3: Implement with standard-library XML parsing**
+- [ ] **Step 3: Implement adapter with `xml.etree.ElementTree`**
 
-Use `xml.etree.ElementTree.fromstring()` to avoid adding a dependency. Fetch each configured feed independently and continue if one feed fails.
+Fetch each feed independently. Parse `<item>` nodes, split `Company: Role` on the first colon, strip description HTML through `strip_html()`, and continue when a feed request or single item is malformed.
 
-- [ ] **Step 4: Export adapter and run focused tests**
+- [ ] **Step 4: Export adapter and run tests**
 
 ```bash
 pytest tests/test_sources.py -q -k weworkremotely
@@ -553,32 +596,45 @@ git commit -m "feat: add We Work Remotely RSS discovery"
 - Uses public HN Algolia API.
 - Source name: `hackernews`
 
-- [ ] **Step 1: Write failing tests for thread discovery and comments**
+- [ ] **Step 1: Write failing thread/comment test**
 
-Mock two API responses:
+Mock a search response:
 
-1. Search response locating the newest story titled `Ask HN: Who is hiring? (August 2026)`.
-2. Item response containing comment children.
-
-Use comments such as:
-
-```text
-Acme | Senior Product Engineer | Remote EU | React, TypeScript | https://jobs.ashbyhq.com/acme/123
+```python
+{
+    "hits": [
+        {
+            "objectID": "999",
+            "title": "Ask HN: Who is hiring? (August 2026)",
+            "created_at_i": 1788200000,
+        }
+    ]
+}
 ```
 
-Assert a normalized `Job` is created with:
+Mock the item response:
 
-- title containing `Senior Product Engineer`;
-- company `Acme`;
-- location `Remote EU`;
-- URL extracted from the comment;
-- description containing the comment text;
-- `remote=True` when the text explicitly says remote;
-- comment ID as `source_job_id`.
+```python
+{
+    "id": 999,
+    "children": [
+        {
+            "id": 1001,
+            "text": "Acme | Senior Product Engineer | Remote EU | React, TypeScript | https://jobs.ashbyhq.com/acme/123",
+            "children": [],
+        },
+        {
+            "id": 1002,
+            "text": "Discussion reply with no job opening",
+            "children": [],
+        },
+    ],
+}
+```
 
-Add a test proving unrelated/non-job comments are ignored.
+Assert only comment `1001` becomes a job, with company `Acme`, title `Senior Product Engineer`, location `Remote EU`, extracted URL, full comment text as description, `remote=True`, and `source_job_id == "1001"`.
 
-- [ ] **Step 2: Run focused tests and verify failure**
+- [ ] **Step 2: Run focused test and verify failure**
 
 ```bash
 pytest tests/test_sources.py -q -k hackernews
@@ -588,11 +644,11 @@ Expected: import/class failure.
 
 - [ ] **Step 3: Implement latest-thread lookup**
 
-Search Algolia for `Ask HN: Who is hiring?` restricted to stories, choose the newest exact monthly hiring thread, then fetch the item tree.
+Query the Algolia search endpoint for `Ask HN: Who is hiring?`, restrict to stories, sort candidate hits by `created_at_i` descending, choose the newest title beginning with `Ask HN: Who is hiring?`, then fetch `/api/v1/items/{objectID}`.
 
 - [ ] **Step 4: Implement conservative comment normalization**
 
-Only emit comments that contain enough evidence to be a job posting: role text plus company-like first segment or URL. Extract the first HTTP(S) URL when present. Preserve the full stripped comment text as the description so later enrichment/ranking has context.
+Strip HTML from comment text, split pipe-delimited comments, require at least company and role segments, extract the first HTTP(S) URL by regular expression, and infer remote only when the text explicitly contains `remote`.
 
 - [ ] **Step 5: Export adapter and run tests**
 
@@ -611,12 +667,10 @@ git commit -m "feat: add Hacker News hiring discovery"
 
 ---
 
-### Task 7: Wire v2 source construction and generated web-search queries
+### Task 7: Wire expanded default source construction
 
 **Files:**
 - Modify: `src/job_hunter/sources/__init__.py`
-- Modify: `src/job_hunter/discovery_queries.py`
-- Modify: `config/search.yml`
 - Modify: `tests/test_sources.py`
 
 **Interfaces:**
@@ -624,45 +678,42 @@ git commit -m "feat: add Hacker News hiring discovery"
 
 - [ ] **Step 1: Update failing `build_sources` test**
 
-Change the existing test so expected source types include:
+Assert the built source class names contain:
 
 ```python
-assert "RemoteOKSource" in kinds
-assert "WeWorkRemotelySource" in kinds
-assert "HackerNewsHiringSource" in kinds
+expected = {
+    "RemotiveSource",
+    "ArbeitnowSource",
+    "RemoteOKSource",
+    "WeWorkRemotelySource",
+    "HackerNewsHiringSource",
+    "DuckDuckGoSource",
+    "AshbySource",
+    "LeverSource",
+    "GreenhouseSource",
+}
+assert expected.issubset(set(kinds))
 ```
 
-Also inspect the built `DuckDuckGoSource` through a test seam or factor a helper so the test can assert it receives `generate_search_queries(settings.policy)` rather than only `policy.search_queries`.
+Add a small public property or constructor seam on `DuckDuckGoSource` if required so the test can assert generated queries equal `generate_search_queries(settings.policy)`.
 
-- [ ] **Step 2: Run the test and verify failure**
+- [ ] **Step 2: Run focused test and verify failure**
 
 ```bash
 pytest tests/test_sources.py -q -k build_sources
 ```
 
-Expected: FAIL because new sources/query generation are not wired.
+Expected: FAIL because the new default sources and generated queries are not wired.
 
-- [ ] **Step 3: Wire the default sources**
+- [ ] **Step 3: Wire the source registry**
 
-Update `build_sources()` to instantiate:
+Instantiate the five always-on structured/community sources, then `DuckDuckGoSource(http, generate_search_queries(settings.policy))`, then configured Ashby/Lever/Greenhouse boards.
 
-```text
-RemotiveSource
-ArbeitnowSource
-RemoteOKSource
-WeWorkRemotelySource
-HackerNewsHiringSource
-DuckDuckGoSource(generate_search_queries(policy))
-configured Ashby/Lever/Greenhouse sources
-```
+- [ ] **Step 4: Keep ATS configuration public-only**
 
-Keep each adapter independent.
+Retain `ats.ashby`, `ats.lever`, and `ats.greenhouse` lists in YAML. Do not add secrets or authenticated endpoints.
 
-- [ ] **Step 4: Keep ATS seeds config-compatible**
-
-Retain `ats.ashby`, `ats.lever`, and `ats.greenhouse` lists. Do not invent private credentials. Public company board slugs can be added later by editing YAML only.
-
-- [ ] **Step 5: Run source/query tests**
+- [ ] **Step 5: Run source/query/config tests**
 
 ```bash
 pytest tests/test_sources.py tests/test_discovery_queries.py tests/test_config.py -q
@@ -673,7 +724,7 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/job_hunter/sources/__init__.py src/job_hunter/discovery_queries.py config/search.yml tests/test_sources.py
+git add src/job_hunter/sources/__init__.py tests/test_sources.py
 git commit -m "feat: expand default discovery coverage"
 ```
 
@@ -690,59 +741,53 @@ git commit -m "feat: expand default discovery coverage"
 - Use: `src/job_hunter/ranking.py`
 
 **Interfaces:**
-- Consumes: `collect_candidates(...) -> DiscoveryResult`
-- Consumes: `rank_jobs(...) -> list[tuple[int, Job, int]]`
-- Produces: same public `run_pipeline(...) -> RunSummary` signature.
-- Adds store helper: `pending_delivery_job_ids() -> list[int]` so pending Telegram retries remain independent of fresh discovery.
+- Consumes: `collect_candidates(sources: list, store: JobStore, http: HttpClient, policy: SearchPolicy) -> DiscoveryResult`
+- Consumes: `rank_jobs(jobs: list[tuple[int, Job]], policy: SearchPolicy) -> list[tuple[int, Job, int]]`
+- Preserves: `run_pipeline(settings, sources=None, store=None, gemini=None, telegram=None, http=None) -> RunSummary`
+- Adds: `JobStore.pending_delivery_job_ids() -> list[int]`
 
 - [ ] **Step 1: Write the critical failing source-order regression test**
 
-In `tests/test_pipeline.py`, set `max_jobs_per_run=1`.
+Set `max_jobs_per_run=1`. Use an early fake source returning three jobs titled `React Developer` with only `React` evidence. Use a late fake source returning `Staff Product Engineer` with `React TypeScript product ownership architecture` and `Remote Europe`.
 
-Create:
+Enhance `FakeGemini` so JSON-mode calls append the prompt to `self.eval_prompts`.
 
-- `EarlyNoiseSource` returning several mediocre-but-prefilter-eligible React roles.
-- `LateStrongSource` returning one `Staff Product Engineer` with React/TypeScript/product ownership/Remote Europe.
+Assert after the run:
 
-Run once with noise first and strong second.
+```python
+assert gemini.eval_calls == 1
+assert len(gemini.eval_prompts) == 1
+assert "Staff Product Engineer" in gemini.eval_prompts[0]
+```
 
-Assert Gemini evaluates exactly one job and it is the strong job.
+Repeat with source order reversed and assert the same strong title is evaluated.
 
-Repeat with source order reversed and assert the same job is evaluated.
-
-Fake Gemini should record the evaluation prompt or expose the evaluated job title so the assertion is direct.
-
-- [ ] **Step 2: Run the regression test and verify failure**
+- [ ] **Step 2: Run regression test and verify failure**
 
 ```bash
 pytest tests/test_pipeline.py -q -k global_ranked_budget
 ```
 
-Expected: FAIL under the current source-by-source evaluation loop.
+Expected: FAIL under source-by-source evaluation.
 
 - [ ] **Step 3: Write store test for pending delivery IDs**
 
-Add a test:
+Create jobs/evaluations using existing store helpers and assert:
 
 ```python
-def test_pending_delivery_job_ids_returns_evaluated_jobs_missing_a_delivery(tmp_path):
-    ...
+assert ready_without_delivery_id in store.pending_delivery_job_ids()
+assert possible_without_message_id in store.pending_delivery_job_ids()
+assert fully_delivered_ready_id not in store.pending_delivery_job_ids()
+assert ready_with_message_but_no_document_id in store.pending_delivery_job_ids()
 ```
-
-Cover:
-
-- evaluation/material exists and no delivery -> returned;
-- both Telegram message/document exist -> not returned;
-- possible match only needs message delivery;
-- ready decision with message sent but document missing -> returned.
 
 - [ ] **Step 4: Implement `pending_delivery_job_ids()`**
 
-Use existing evaluations/materials/deliveries tables without schema reset. Base readiness on latest evaluation decision and delivery type presence.
+Query the latest evaluation decision for each job. A `possible_match` is pending when `telegram_message` is missing. A `high_priority` or `package_match` is pending when either `telegram_message` or `telegram_document` is missing. Do not change the schema.
 
 - [ ] **Step 5: Refactor discovery/evaluation phase**
 
-Replace the source-local Gemini loop with:
+Replace the source-local evaluation loop with:
 
 ```python
 discovery = collect_candidates(sources, store, http, settings.policy)
@@ -750,25 +795,22 @@ ranked = rank_jobs(discovery.eligible, settings.policy)
 selected = ranked[: settings.policy.max_jobs_per_run]
 ```
 
-Then evaluate only `selected`.
+Loop over `selected`, preserving current evaluation exception handling, `save_evaluation()`, material generation, PDF rendering, and summary decisions.
 
-Preserve the existing per-job evaluation exception handling and material-generation logic.
+- [ ] **Step 6: Preserve pending delivery retries independent of fresh discovery**
 
-- [ ] **Step 6: Preserve/strengthen pending delivery retries**
-
-Before Telegram delivery, requeue pending jobs from:
+Build retry IDs using:
 
 ```python
-set(discovery.rediscovered_job_ids) | set(store.pending_delivery_job_ids())
+retry_ids = set(discovery.rediscovered_job_ids)
+retry_ids.update(store.pending_delivery_job_ids())
 ```
 
-Call the existing `_requeue_pending_delivery()` for each ID, excluding current-run jobs already queued for fresh delivery.
-
-This ensures source outages do not suppress previously pending Telegram delivery.
+Exclude jobs already queued by a fresh current-run evaluation, then call `_requeue_pending_delivery()` for the remaining IDs.
 
 - [ ] **Step 7: Keep `RunSummary` semantics unchanged**
 
-`ready_to_apply`, `possible_matches`, and `skipped` continue to describe current-run processing, not historical delivery retries. Do not count ranking rejection as Gemini evaluation output.
+Historical retries must not increment `ready_to_apply`, `possible_matches`, or `skipped`. Those counters continue to represent current-run processing.
 
 - [ ] **Step 8: Run pipeline/store tests**
 
@@ -776,7 +818,7 @@ This ensures source outages do not suppress previously pending Telegram delivery
 pytest tests/test_pipeline.py tests/test_store.py -q
 ```
 
-Expected: PASS, including existing Telegram retry tests.
+Expected: PASS, including existing delivery retry coverage.
 
 - [ ] **Step 9: Commit**
 
@@ -787,7 +829,7 @@ git commit -m "feat: globally rank jobs before Gemini evaluation"
 
 ---
 
-### Task 9: Discovery funnel logging and regression documentation
+### Task 9: Discovery funnel logging and documentation
 
 **Files:**
 - Modify: `src/job_hunter/pipeline.py`
@@ -802,15 +844,7 @@ git commit -m "feat: globally rank jobs before Gemini evaluation"
 
 - [ ] **Step 1: Write failing logging test**
 
-Use `caplog` around a fake multi-source pipeline run and assert logs contain a summary matching:
-
-```text
-discovery: raw=... unique=... eligible=... selected=...
-```
-
-and a selected-source distribution line.
-
-Do not assert exact timestamps or logger prefixes.
+Use `caplog` with a multi-source fake run. Assert one message starts with `discovery: raw=` and contains each of `unique=`, `prefilter_rejected=`, `eligible=`, and `selected=`. Assert another message starts with `selected sources:`.
 
 - [ ] **Step 2: Run logging test and verify failure**
 
@@ -818,11 +852,11 @@ Do not assert exact timestamps or logger prefixes.
 pytest tests/test_pipeline.py -q -k discovery_logging
 ```
 
-Expected: FAIL because the funnel summary is not logged yet.
+Expected: FAIL because the funnel summary is not logged.
 
 - [ ] **Step 3: Add concise run-level logging**
 
-Log after ranking/selection:
+After ranking/selection:
 
 ```python
 logger.info(
@@ -835,29 +869,21 @@ logger.info(
 )
 ```
 
-Build selected source counts from selected jobs and log them without descriptions or secrets.
+Build selected-source counts from the selected `Job.source` values and emit one stable sorted line such as `selected sources: ashby=4 remoteok=2 weworkremotely=1`.
 
 - [ ] **Step 4: Update README**
 
-Document:
-
-- v2 source list;
-- public-only/no-auth discovery boundary;
-- query-family configuration;
-- global ranking before Gemini;
-- `max_jobs_per_run` semantics;
-- how to add public Ashby/Lever/Greenhouse board slugs;
-- how to inspect discovery funnel logs.
+Document the v2 source list, public-only discovery boundary, query-family configuration, global ranking before Gemini, new `max_jobs_per_run` semantics, ATS board configuration, and discovery-funnel logs.
 
 - [ ] **Step 5: Update AGENTS.md**
 
-Change the architecture overview from source-by-source evaluation to:
+Change the architecture overview to:
 
 ```text
 all sources -> enrich/dedupe -> deterministic rank -> top-N Gemini -> materials -> Telegram
 ```
 
-Add `discovery.py`, `ranking.py`, and the new source adapters to the module map.
+Add `discovery.py`, `discovery_queries.py`, `ranking.py`, `remoteok.py`, `weworkremotely.py`, and `hackernews.py` to the module map.
 
 - [ ] **Step 6: Run the full test suite**
 
@@ -869,8 +895,6 @@ Expected: all tests PASS.
 
 - [ ] **Step 7: Verify no private source material was committed**
 
-Run:
-
 ```bash
 git grep -n "CANDIDATE_PROFILE_B64=" -- ':!docs/superpowers/*' || true
 git grep -n "COVER_LETTER_TEMPLATE_B64=" -- ':!docs/superpowers/*' || true
@@ -878,16 +902,7 @@ git grep -n "COVER_LETTER_TEMPLATE_B64=" -- ':!docs/superpowers/*' || true
 
 Expected: no secret values; documentation may mention variable names only.
 
-- [ ] **Step 8: Inspect final diff**
-
-```bash
-git status --short
-git diff --stat HEAD~1..HEAD
-```
-
-Confirm scope is limited to v2 discovery quality and its docs/tests.
-
-- [ ] **Step 9: Commit**
+- [ ] **Step 8: Commit documentation/logging changes**
 
 ```bash
 git add src/job_hunter/pipeline.py src/job_hunter/discovery.py tests/test_pipeline.py README.md AGENTS.md
@@ -898,9 +913,7 @@ git commit -m "docs: document v2 discovery pipeline"
 
 ## Final verification
 
-After all tasks are complete:
-
-- [ ] Run:
+- [ ] Run the complete test suite:
 
 ```bash
 pytest -q
@@ -908,16 +921,26 @@ pytest -q
 
 Expected: PASS.
 
-- [ ] Run a local dry run with test credentials/config if available:
+- [ ] Run a local dry run with configured test credentials/profile:
 
 ```bash
 JOB_HUNTER_DRY_RUN=1 python -m job_hunter run
 ```
 
-Expected behavior: all configured sources are attempted, discovery funnel counts are logged, only globally top-ranked eligible jobs consume Gemini budget, and Telegram is skipped.
+Expected: all configured sources are attempted, discovery-funnel counts are logged, only globally top-ranked eligible jobs consume Gemini budget, and Telegram sending is skipped.
+
+- [ ] Inspect scope:
+
+```bash
+git status --short
+git log --oneline --max-count=12
+git diff --stat main...HEAD
+```
+
+Expected: changes are limited to v2 discovery quality, tests, configuration, and related documentation.
 
 - [ ] Push the implementation branch and confirm `.github/workflows/ci.yml` passes before merging.
 
 ## Implementation success check
 
-The implementation is successful when a test with `max_jobs_per_run=1` proves a high-signal job from the last source is selected over many earlier mediocre jobs, additional Remote OK/WWR/Hacker News discovery is active, cross-source duplicates are evaluated once per run, and the existing state/delivery test suite remains green.
+The implementation is successful when a test with `max_jobs_per_run=1` proves that a high-signal job from the last source is selected over many earlier mediocre jobs, Remote OK/We Work Remotely/Hacker News discovery is active, cross-source duplicates are evaluated once per run, discovery funnel metrics are visible, and the existing persistence/evaluation/material/delivery test suite remains green.
