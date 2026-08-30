@@ -1,6 +1,8 @@
 timezone: Europe/Berlin
 scheduled_hour: 9
-max_jobs_per_run: 75
+max_jobs_per_run: 35
+source_minimum_per_run: 2
+source_max_share: 0.5
 thresholds:
   package: 75
   possible: 65

@@ -95,7 +95,9 @@ class SearchPolicy:
     blocked_title_keywords: list
     salary_floor_eur: int
     thresholds: dict
-    max_jobs_per_run: int = 75
+    max_jobs_per_run: int = 35
+    source_minimum_per_run: int = 2
+    source_max_share: float = 0.5
     search_queries: list = field(default_factory=list)
     ats: dict = field(default_factory=dict)
     role_families: list[str] = field(default_factory=list)

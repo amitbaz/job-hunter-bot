@@ -121,3 +121,22 @@ def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
     ]
     assert settings.policy.search_domains == ["jobs.ashbyhq.com"]
     assert settings.policy.search_queries == ['"Senior Product Engineer" remote']
+
+
+def test_load_settings_uses_profile_discovery_defaults(monkeypatch, tmp_path: Path):
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "timezone: Europe/Berlin\nscheduled_hour: 9\n"
+        "thresholds:\n  package: 75\n  possible: 65\nsalary_floor_eur: 90000\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "search_queries: []\nats:\n  ashby: []\n  lever: []\n  greenhouse: []\n"
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("CANDIDATE_PROFILE_B64", base64.b64encode(b"profile").decode())
+    monkeypatch.setenv("COVER_LETTER_TEMPLATE_B64", base64.b64encode(b"template").decode())
+    monkeypatch.setenv("JOB_HUNTER_DRY_RUN", "1")
+    settings = load_settings(cfg)
+
+    assert settings.policy.max_jobs_per_run == 35
+    assert settings.policy.source_minimum_per_run == 2
+    assert settings.policy.source_max_share == 0.5

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from job_hunter.models import Job, SearchPolicy
+import math
+from collections import defaultdict
+
+from job_hunter.models import CandidatePreferences, Job, SearchPolicy
 from job_hunter.normalize import normalize_text
 
 _ATS_HOSTS = ("jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io")
@@ -23,6 +26,8 @@ _REGION_WORDS = frozenset({
     "poland", "france", "italy", "austria", "ireland", "switzerland", "uk",
 })
 
+_REMOTE_FRIENDLY_WORDS = frozenset({"remote", "worldwide", "global", "anywhere", "distributed"})
+
 
 def source_quality(job: Job) -> int:
     url = (job.url or "").lower()
@@ -35,6 +40,21 @@ def source_quality(job: Job) -> int:
     if job.source == "hackernews":
         return 5
     return 3
+
+
+def _normalized_words(text: str) -> set[str]:
+    return set(normalize_text(text or "").split())
+
+
+def _normalized_phrases(values: list[str]) -> list[str]:
+    normalized = []
+    seen = set()
+    for value in values:
+        phrase = normalize_text(value or "")
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            normalized.append(phrase)
+    return normalized
 
 
 def _title_fit(title: str, policy: SearchPolicy) -> int:
@@ -83,6 +103,79 @@ def _location_evidence(job: Job) -> int:
     return 5
 
 
+def _role_seniority_fit(job: Job, preferences: CandidatePreferences) -> int:
+    normalized_title = normalize_text(job.title or "")
+    title_words = set(normalized_title.split())
+
+    best_role_ratio = 0.0
+    for role in _normalized_phrases(preferences.preferred_roles):
+        if role == normalized_title:
+            best_role_ratio = 1.0
+            break
+        role_words = set(role.split())
+        if not role_words:
+            continue
+        best_role_ratio = max(best_role_ratio, len(title_words & role_words) / len(role_words))
+
+    role_score = round(25 * best_role_ratio)
+    seniority_words = _normalized_phrases(preferences.preferred_seniority)
+    seniority_score = 10 if any(word in title_words for word in seniority_words) else 0
+    return min(35, role_score + seniority_score)
+
+
+def _signal_coverage(job: Job, preferences: CandidatePreferences) -> int:
+    haystack = normalize_text(" ".join([job.title or "", job.description or ""]))
+    must_have = _normalized_phrases(preferences.must_have_signals)
+    nice_to_have = _normalized_phrases(preferences.nice_to_have_signals)
+    must_matches = {signal for signal in must_have if signal in haystack}
+    nice_matches = {signal for signal in nice_to_have if signal in haystack}
+    must_score = round(20 * len(must_matches) / len(must_have)) if must_have else 0
+    nice_score = round(10 * len(nice_matches) / len(nice_to_have)) if nice_to_have else 0
+    return min(30, must_score + nice_score)
+
+
+def _profile_location_fit(job: Job, preferences: CandidatePreferences) -> int:
+    if not job.remote:
+        return 0
+
+    preferred_locations = _normalized_phrases(preferences.preferred_locations)
+    if not preferred_locations:
+        return 15
+
+    location_text = normalize_text(" ".join([job.location or "", job.description or ""]))
+    if any(location in location_text for location in preferred_locations):
+        return 15
+    if not location_text:
+        return 8
+
+    location_words = set(location_text.split())
+    if location_words & _REMOTE_FRIENDLY_WORDS:
+        return 10
+    return 5
+
+
+def _avoid_signal_penalty(job: Job, preferences: CandidatePreferences) -> int:
+    avoid_signals = _normalized_phrases(preferences.avoid_signals)
+    if not avoid_signals:
+        return 0
+
+    haystack = normalize_text(" ".join([job.title or "", job.location or "", job.description or ""]))
+    matches = {signal for signal in avoid_signals if signal in haystack}
+    return round(10 * len(matches) / len(avoid_signals))
+
+
+def profile_priority_score(job: Job, preferences: CandidatePreferences, policy: SearchPolicy) -> int:
+    del policy
+    total = (
+        _role_seniority_fit(job, preferences)
+        + _signal_coverage(job, preferences)
+        + _profile_location_fit(job, preferences)
+        + source_quality(job)
+        - _avoid_signal_penalty(job, preferences)
+    )
+    return max(0, min(100, total))
+
+
 def priority_score(job: Job, policy: SearchPolicy) -> int:
     total = (
         _title_fit(job.title, policy)
@@ -94,8 +187,13 @@ def priority_score(job: Job, policy: SearchPolicy) -> int:
     return max(0, min(100, total))
 
 
-def rank_jobs(jobs: list[tuple[int, Job]], policy: SearchPolicy) -> list[tuple[int, Job, int]]:
-    scored = [(job_id, job, priority_score(job, policy)) for job_id, job in jobs]
+def rank_jobs(
+    jobs: list[tuple[int, Job]],
+    policy: SearchPolicy,
+    preferences: CandidatePreferences | None = None,
+) -> list[tuple[int, Job, int]]:
+    scorer = priority_score if preferences is None else lambda job, current_policy: profile_priority_score(job, preferences, current_policy)
+    scored = [(job_id, job, scorer(job, policy)) for job_id, job in jobs]
     return sorted(
         scored,
         key=lambda item: (
@@ -105,3 +203,58 @@ def rank_jobs(jobs: list[tuple[int, Job]], policy: SearchPolicy) -> list[tuple[i
             item[0],
         ),
     )
+
+
+def _source_share_cap(limit: int, minimum_per_source: int, max_share: float) -> int:
+    if limit <= 0:
+        return 0
+    if max_share >= 1:
+        share_cap = limit
+    else:
+        share_cap = max(1, math.floor(limit * max_share))
+    return min(limit, max(minimum_per_source, share_cap))
+
+
+def select_diverse_candidates(
+    ranked: list[tuple[int, Job, int]],
+    limit: int,
+    minimum_per_source: int,
+    max_share: float,
+) -> list[tuple[int, Job, int]]:
+    if limit <= 0 or not ranked:
+        return []
+
+    per_source_limit = _source_share_cap(limit, max(0, minimum_per_source), max_share)
+    grouped: dict[str, list[tuple[int, Job, int]]] = defaultdict(list)
+    source_order: list[str] = []
+    for item in ranked:
+        source = item[1].source
+        if source not in grouped:
+            source_order.append(source)
+        grouped[source].append(item)
+
+    selected: list[tuple[int, Job, int]] = []
+    selected_ids: set[int] = set()
+    source_counts: dict[str, int] = defaultdict(int)
+
+    for source in source_order:
+        for item in grouped[source][: min(max(0, minimum_per_source), per_source_limit)]:
+            if len(selected) >= limit:
+                return selected
+            selected.append(item)
+            selected_ids.add(item[0])
+            source_counts[source] += 1
+
+    for item in ranked:
+        if len(selected) >= limit:
+            break
+        job_id, job, _score = item
+        if job_id in selected_ids:
+            continue
+        if source_counts[job.source] >= per_source_limit:
+            continue
+        selected.append(item)
+        selected_ids.add(job_id)
+        source_counts[job.source] += 1
+
+    return selected
