@@ -147,13 +147,8 @@ class JobStore:
 
             job_id: int = row["id"]
             old_hash: str = row["description_hash"]
-            is_new: bool = old_hash == "" and row["first_seen_at"] == now  # freshly inserted
+            is_new: bool = row["first_seen_at"] == now
             description_changed: bool = False
-
-            # A cleaner is_new check: compare rowcount of the INSERT
-            # Re-derive is_new by seeing if the stored first_seen_at == now
-            # (only true when we just inserted)
-            is_new = row["first_seen_at"] == now
 
             if not is_new:
                 description_changed = old_hash != desc_hash

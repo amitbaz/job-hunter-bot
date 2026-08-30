@@ -9,7 +9,7 @@ The bot **never submits applications**. It prepares material for you to review a
 ```
 sources (Remotive, Arbeitnow, DuckDuckGo search, Ashby/Lever/Greenhouse boards)
   -> normalize + dedupe (SQLite)
-  -> prefilter (deterministic hard blockers: title, salary floor, remote-only)
+  -> prefilter (deterministic hard blockers: title, remote-only)
   -> Gemini evaluation (scored fit against candidate profile + policy)
   -> cover letter generation + PDF rendering (strong matches only)
   -> Telegram digest + PDF delivery
@@ -129,7 +129,7 @@ The pipeline does not implement a Gemini-quota circuit breaker. If you hit Gemin
 
 ### Telegram delivery errors
 
-A failed Telegram send (bad token, bot not started, wrong chat id, message too large) is logged and does not crash the run or discard evaluation results — the job stays evaluated and marked undelivered in SQLite, and delivery is not automatically retried. Verify `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are correct and that you've sent at least one message to the bot (see [Telegram bot setup](#telegram-bot-setup)).
+A failed Telegram send (bad token, bot not started, wrong chat id, message too large) is logged and does not crash the run or discard evaluation results — the job stays evaluated and marked undelivered in SQLite, and delivery is not automatically retried. Verify `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are correct and that you've sent at least one message to the bot (see [Telegram bot setup](#telegram-bot-setup)). Note that such a job is not resurfaced in a later digest either: since it was already successfully evaluated, it won't be re-evaluated on subsequent runs, so a job that fails delivery this way stays undelivered until you intervene manually. This is a known v1 limitation.
 
 ### Flaky web sources
 

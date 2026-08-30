@@ -15,7 +15,7 @@ def load_settings(config_path: Path) -> Settings:
     gemini_api_key = _require_env("GEMINI_API_KEY")
     candidate_profile = base64.b64decode(_require_env("CANDIDATE_PROFILE_B64")).decode("utf-8")
     cover_letter_template = base64.b64decode(_require_env("COVER_LETTER_TEMPLATE_B64")).decode("utf-8")
-    dry_run = bool(os.environ.get("JOB_HUNTER_DRY_RUN", ""))
+    dry_run = os.environ.get("JOB_HUNTER_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
     if not dry_run:
         telegram_bot_token = _require_env("TELEGRAM_BOT_TOKEN")
