@@ -20,8 +20,8 @@ This release tightens candidate gating, raises the Gemini safety ceiling to 75, 
 
 ### In scope
 
-- Add a strict engineering-profession gate before deterministic ranking and Gemini evaluation.
-- Reject clearly non-engineering titles even when their descriptions contain React, TypeScript, SaaS, product, roadmap, ownership, or other positive keywords.
+- Add a strict software/product-engineering profession gate before deterministic ranking and Gemini evaluation.
+- Reject clearly non-engineering and clearly off-target engineering titles even when their descriptions contain React, TypeScript, SaaS, product, roadmap, ownership, or other positive keywords.
 - Keep the existing broad discovery sources and v2 cross-source aggregation.
 - Raise the default `max_jobs_per_run` from 25 to 75.
 - Preserve the cap as a configurable safety ceiling rather than a target number of evaluations.
@@ -74,48 +74,59 @@ The relevant v2.1 flow becomes:
 all discovery sources
     -> enrich + cross-source dedupe
     -> existing remote / blocked-title checks
-    -> engineering-profession title gate
+    -> software/product-engineering profession gate
     -> deterministic ranking
     -> top N eligible jobs, N <= max_jobs_per_run (default 75)
     -> Gemini evaluation
     -> decision handling
          high_priority/package_match -> Telegram + PDF
          possible_match              -> Telegram
-         blocked                     -> Telegram only when explicitly useful for review
+         blocked                     -> Telegram / Needs review
          skip                        -> persist only, never Telegram
     -> sort each Telegram section by final Gemini score descending
 ```
 
 The broad discovery layer remains unchanged.
 
-## 5. Engineering-profession title gate
+## 5. Software/product-engineering profession gate
 
 ### Core rule
 
-A job must have clear evidence in its **title** that the role is an engineering/software-development profession before it may consume a Gemini evaluation call.
+A job must have clear evidence in its **title** that the role belongs to the candidate’s software/product-engineering profession before it may consume a Gemini evaluation call.
 
-Description keywords are supporting evidence only. They must never convert a clearly non-engineering profession into an engineering candidate.
+Description keywords are supporting evidence only. They must never convert a clearly different profession into a software-engineering candidate.
+
+### Evaluation order
+
+The title gate uses this precedence:
+
+1. Existing hard blocked-title rules.
+2. Explicit off-target profession phrases.
+3. Accepted software-engineering occupation markers/phrases.
+4. Positive description/title keywords only after profession validity has been established.
+
+A blocked/off-target profession phrase always wins over a generic word such as `engineer`.
 
 ### Accepted engineering title evidence
 
-A title qualifies when at least one of the following is true:
+A title qualifies when at least one of the following is true and no off-target profession rule matched first:
 
-1. It contains an engineering occupation marker:
+1. It contains a software-engineering occupation marker:
    - `engineer`
    - `developer`
-   - `software architect`
-   - `frontend architect`
-   - `front-end architect`
-   - `web architect`
 
-2. It contains an explicitly accepted engineering-lead phrase:
+2. It contains an explicitly accepted engineering phrase:
    - `technical lead`
    - `frontend lead`
    - `front-end lead`
    - `software lead`
    - `engineering lead`
+   - `software architect`
+   - `frontend architect`
+   - `front-end architect`
+   - `web architect`
 
-3. It matches or contains a configured target title that itself contains accepted engineering evidence.
+3. It matches or contains a configured target title that itself contains accepted software-engineering evidence.
 
 Examples that must pass:
 
@@ -132,9 +143,9 @@ Examples that must pass:
 - Technical Lead, Web Platform
 - Frontend Architect
 
-### Explicit non-engineering professions
+### Explicit off-target professions
 
-The following title families must fail the profession gate even when the description contains strong technical keywords:
+The following title families fail the profession gate even when they contain `engineer` or their descriptions contain strong technical keywords:
 
 - Product Manager
 - Platform Product Manager
@@ -147,16 +158,23 @@ The following title families must fail the profession gate even when the descrip
 - Project Manager
 - Customer Success Manager
 - Solutions Consultant
-- Sales Engineer when the role is primarily sales/pre-sales rather than software engineering
-- Data Scientist / ML Researcher when not a software/product-engineering role
+- Sales Engineer
+- Solutions Engineer
+- Support Engineer
+- Data Engineer
+- Machine Learning Engineer
+- ML Engineer
+- Data Scientist
+- ML Researcher
+- Machine Learning Researcher
+- iOS Engineer
+- Android Engineer
+- Mobile Engineer
+- Embedded Engineer
 
-The implementation should use explicit configurable blocked profession phrases where ambiguity is common, especially for `manager`, `designer`, `marketing`, `sales`, and `research` titles.
+Existing `blocked_title_keywords` remains responsible for already-established families such as junior, QA, SRE, DevOps, security engineering, and engineering management.
 
-### Precedence
-
-Profession rejection happens before positive description-keyword logic.
-
-For example:
+### Precedence examples
 
 ```text
 Senior Product Manager
@@ -165,17 +183,24 @@ Description: React, TypeScript, SaaS, product ownership, architecture
 
 must be rejected before ranking and Gemini evaluation.
 
+```text
+Senior Sales Engineer
+Description: React, TypeScript, customer integrations
+```
+
+must also be rejected because `sales engineer` is explicitly off-target even though the generic `engineer` marker is present.
+
 Conversely:
 
 ```text
 Senior Software Engineer, Product Platform
 ```
 
-must remain eligible despite containing the words `product` and `platform` because the title clearly identifies an engineering profession.
+must remain eligible because the title clearly identifies a software-engineering profession.
 
 ## 6. Configuration
 
-Add explicit configuration for title-profession gating rather than hard-coding all policy in Python.
+Add explicit configuration for title-profession gating rather than hard-coding the policy in Python.
 
 Recommended `config/search.yml` additions:
 
@@ -206,15 +231,27 @@ blocked_profession_title_phrases:
   - program manager
   - project manager
   - customer success manager
+  - solutions consultant
+  - sales engineer
+  - solutions engineer
+  - support engineer
+  - data engineer
+  - machine learning engineer
+  - ml engineer
+  - data scientist
+  - ml researcher
+  - machine learning researcher
+  - ios engineer
+  - android engineer
+  - mobile engineer
+  - embedded engineer
 ```
 
-Existing `blocked_title_keywords` remains responsible for role families such as junior, QA, SRE, DevOps, security engineering, and engineering management.
-
-The profession gate is an additional concern: whether the title belongs to the candidate’s profession at all.
+The profession gate is distinct from `target_titles`: `target_titles` influences relevance/ranking, while the new fields answer the more fundamental question of whether the job belongs to the candidate’s profession.
 
 ## 7. Deterministic ranking interaction
 
-The ranker must operate only on jobs that pass the engineering-profession gate.
+The ranker must operate only on jobs that pass the software/product-engineering profession gate.
 
 The ranker therefore no longer needs to distinguish Product Manager from Product Engineer through word-overlap scoring; the former never reaches ranking.
 
@@ -269,7 +306,7 @@ Telegram must reflect final Gemini decisions, not every evaluated job.
 
 `blocked`
 - Section: `Needs review / blockers`
-- Include only when Gemini explicitly returns `blocked` and the pipeline intentionally treats it as something useful for user review.
+- Include in the digest, preserving the existing explicit-blocker review behavior.
 
 `skip`
 - Do not include in Telegram.
@@ -310,7 +347,7 @@ Possible matches
 
 The order in which jobs were discovered, ranked before Gemini, or evaluated must not affect final Telegram ordering.
 
-PDF send order for ready-to-apply jobs should follow the same final Gemini-score order when practical, so the digest and documents appear consistently.
+PDF send order for ready-to-apply jobs must follow the same final Gemini-score order so the digest and documents appear consistently.
 
 ## 11. Run summary and diagnostics
 
@@ -326,14 +363,14 @@ Exact counts will vary.
 
 Required diagnostics:
 
-- `profession_rejected`: number removed specifically by the engineering-profession gate.
+- `profession_rejected`: number removed specifically by the software/product-engineering profession gate.
 - `eligible`: jobs valid for deterministic ranking/Gemini after all deterministic gates.
 - `selected`: jobs chosen for Gemini this run.
 - `deferred_by_budget`: eligible jobs not evaluated because the safety ceiling was reached.
 
 Do not log full descriptions, CV content, cover-letter content, API keys, Telegram credentials, or other secrets.
 
-`RunSummary.ready_to_apply`, `possible_matches`, `skipped`, and `errors` retain their existing semantic meaning unless a small adjustment is necessary to count profession rejections consistently with current skipped behavior.
+`RunSummary.ready_to_apply`, `possible_matches`, `skipped`, and `errors` retain their existing semantic meaning. Profession rejections count toward deterministic skipped/rejected work in the same way as existing prefilter rejections; they do not become Gemini decisions.
 
 ## 12. Persistence and retry compatibility
 
@@ -349,15 +386,15 @@ Existing Telegram retry behavior remains unchanged for previously eligible deliv
 
 A historical `skip` evaluation that was incorrectly delivered under old behavior does not need a migration. The new delivery rules apply to future digest construction and retries.
 
-Pending delivery retry queries must not newly treat `skip` evaluations as Telegram-pending work.
+Pending delivery retry queries must not treat `skip` evaluations as Telegram-pending work.
 
 ## 13. Error handling
 
-- Profession gating is deterministic and must not raise on empty/missing titles; such jobs fail the profession gate unless another exact accepted-title rule applies.
-- Unknown Gemini decision values are persisted if the existing evaluation parser permits them, but are not delivered.
-- A Telegram sorting/filtering failure must be covered by tests; delivery behavior should remain fail-open per existing Telegram semantics.
+- Profession gating is deterministic and must not raise on empty/missing titles; such jobs fail the profession gate.
+- Unknown Gemini decision values are omitted from delivery and logged as warnings.
 - Raising the Gemini ceiling must not alter current per-job evaluation exception handling.
 - One Gemini evaluation failure must still allow later selected jobs to be evaluated.
+- Telegram filtering and sorting must be deterministic and side-effect free before the send operation.
 
 ## 14. Testing strategy
 
@@ -378,11 +415,15 @@ Required regression coverage:
 - `Technical Product Manager` fails.
 - `Senior Product Designer` fails.
 - `Product Designer, AI` fails.
-- Existing blocked title rules still win.
+- `Senior Sales Engineer` fails.
+- `Senior Data Engineer` fails.
+- `Machine Learning Engineer` fails.
+- `Senior iOS Engineer` fails.
+- Existing blocked-title rules still win.
 
 ### Ranking/pipeline
 
-- Profession-rejected jobs never reach `rank_jobs()` / Gemini selection.
+- Profession-rejected jobs never reach ranking/Gemini selection.
 - A batch with 60 valid engineering candidates and default limit 75 evaluates all 60.
 - A batch with 90 valid engineering candidates evaluates exactly 75.
 - The selected 75 remain the globally highest deterministic-ranked candidates.
@@ -424,6 +465,7 @@ src/job_hunter/config.py
 src/job_hunter/prefilter.py
 src/job_hunter/discovery.py
 src/job_hunter/pipeline.py
+src/job_hunter/store.py
 src/job_hunter/telegram.py
 ```
 
@@ -434,6 +476,7 @@ tests/test_config.py
 tests/test_prefilter.py
 tests/test_discovery.py
 tests/test_pipeline.py
+tests/test_store.py
 tests/test_telegram.py
 ```
 
@@ -443,15 +486,16 @@ Documentation updates may include `README.md` and `AGENTS.md` if configuration o
 
 v2.1 is complete when all of the following are true:
 
-1. Product Manager, Product Designer, and similar non-engineering roles do not consume Gemini calls solely because their descriptions contain positive technical/product keywords.
-2. Relevant engineering titles such as Product Engineer, Software Engineer, Frontend Engineer, Developer, Founding Engineer, Technical Lead, and supported Architect variants remain eligible.
+1. Product Manager, Product Designer, Sales Engineer, Data Engineer, ML Engineer, mobile/embedded engineering, and similar off-target roles do not consume Gemini calls solely because their titles contain `engineer` or descriptions contain positive keywords.
+2. Relevant software/product-engineering titles such as Product Engineer, Software Engineer, Frontend Engineer, Developer, Founding Engineer, Technical Lead, and supported Architect variants remain eligible.
 3. The default Gemini evaluation ceiling is 75.
-4. Runs with fewer than 75 valid engineering candidates evaluate all of them.
-5. Runs with more than 75 valid engineering candidates evaluate only the globally highest-ranked 75 and log how many were deferred.
+4. Runs with fewer than 75 valid candidates evaluate all of them.
+5. Runs with more than 75 valid candidates evaluate only the globally highest-ranked 75 and log how many were deferred.
 6. Telegram omits every `skip` decision.
 7. Unknown decision values are omitted rather than routed to “Needs review / blockers.”
 8. Every Telegram section is sorted by final Gemini score descending with deterministic tie-breakers.
-9. Existing delivery retry behavior remains functional and does not retry `skip` evaluations.
-10. Existing SQLite artifacts remain usable without reset/migration loss.
-11. `pytest -q` passes in CI.
-12. No changes are made to the Gemini model or v2 discovery-source coverage as part of this release.
+9. Ready-to-apply PDF send order follows final Gemini score descending.
+10. Existing delivery retry behavior remains functional and does not retry `skip` evaluations.
+11. Existing SQLite artifacts remain usable without reset/migration loss.
+12. `pytest -q` passes in CI.
+13. No changes are made to the Gemini model or v2 discovery-source coverage as part of this release.
