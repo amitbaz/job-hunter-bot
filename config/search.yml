@@ -45,12 +45,7 @@ search_domains:
   - jobs.ashbyhq.com
   - jobs.lever.co
   - boards.greenhouse.io
-search_queries:
-  - '"Senior Product Engineer" remote React TypeScript'
-  - '"Senior Frontend Engineer" remote React TypeScript Europe'
-  - 'site:jobs.ashbyhq.com "Product Engineer" remote TypeScript'
-  - 'site:boards.greenhouse.io "Senior Frontend Engineer" remote'
-  - 'site:jobs.lever.co "Senior Product Engineer" remote'
+search_queries: []
 ats:
   ashby: []
   lever: []
