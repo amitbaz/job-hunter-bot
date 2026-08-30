@@ -135,6 +135,21 @@ def test_send_document_truncates_long_caption(tmp_path):
     assert len(kwargs["data"]["caption"]) < 1024
 
 
+def test_send_document_sends_bytes_not_open_file_handle(tmp_path):
+    doc_path = tmp_path / "letter.pdf"
+    doc_path.write_bytes(b"%PDF-1.4 fake content")
+    http = FakeHttp()
+    client = TelegramClient("token123", "chat456", http)
+
+    client.send_document(doc_path, "caption")
+
+    _, kwargs = http.calls[0]
+    filename, content = kwargs["files"]["document"]
+    assert filename == "letter.pdf"
+    assert isinstance(content, bytes)
+    assert content == b"%PDF-1.4 fake content"
+
+
 def test_send_document_returns_none_on_failure(tmp_path):
     doc_path = tmp_path / "letter.pdf"
     doc_path.write_bytes(b"%PDF-1.4 fake")

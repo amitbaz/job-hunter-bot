@@ -111,12 +111,12 @@ class TelegramClient:
         path = Path(path)
         caption = _truncate_caption(caption)
 
-        with open(path, "rb") as fh:
-            response = self._http.post(
-                f"{self._base_url}/sendDocument",
-                data={"chat_id": self._chat_id, "caption": caption},
-                files={"document": (path.name, fh)},
-            )
+        content = path.read_bytes()
+        response = self._http.post(
+            f"{self._base_url}/sendDocument",
+            data={"chat_id": self._chat_id, "caption": caption},
+            files={"document": (path.name, content)},
+        )
 
         if response.status_code >= 400:
             logger.warning("telegram sendDocument failed: %s", response.text)
