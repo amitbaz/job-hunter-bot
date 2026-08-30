@@ -7,6 +7,8 @@ from .ashby import AshbySource
 from .base import JobSource
 from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
+from .himalayas import HimalayasSource
+from .jobicy import JobicySource
 from .lever import LeverSource
 from .remotive import RemotiveSource
 from .remoteok import RemoteOKSource
@@ -18,6 +20,8 @@ __all__ = [
     "JobSource",
     "RemotiveSource",
     "ArbeitnowSource",
+    "JobicySource",
+    "HimalayasSource",
     "DuckDuckGoSource",
     "AshbySource",
     "LeverSource",
@@ -31,6 +35,8 @@ def build_sources(settings: Settings, http) -> list[JobSource]:
     sources: list[JobSource] = [
         RemotiveSource(http),
         ArbeitnowSource(http),
+        JobicySource(http),
+        HimalayasSource(http),
         RemoteOKSource(http),
         WeWorkRemotelySource(http),
         HackerNewsHiringSource(http),

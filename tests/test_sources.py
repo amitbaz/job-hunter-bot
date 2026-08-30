@@ -6,6 +6,8 @@ from job_hunter.sources import (
     AshbySource,
     DuckDuckGoSource,
     GreenhouseSource,
+    HimalayasSource,
+    JobicySource,
     LeverSource,
     RemotiveSource,
     build_sources,
@@ -204,6 +206,180 @@ def test_greenhouse_maps_public_posting(fake_http):
     assert jobs[0].description == "React TypeScript"
 
 
+def test_jobicy_maps_public_posting_and_paginates():
+    pages = [
+        {
+            "jobs": [
+                {
+                    "id": 152035,
+                    "url": "https://jobicy.com/jobs/152035-senior-front-end-developer-react-typescript-market-research",
+                    "jobSlug": "152035-senior-front-end-developer-react-typescript-market-research",
+                    "jobTitle": "Senior Front-End Developer (React / TypeScript) - Market Research",
+                    "companyName": "Truelogic",
+                    "jobGeo": "LATAM",
+                    "jobDescription": "<p>React <strong>TypeScript</strong></p>",
+                }
+            ]
+        },
+        {
+            "jobs": [
+                {
+                    "id": 152036,
+                    "url": "https://jobicy.com/jobs/152036-staff-frontend-engineer?utm_source=jobicy",
+                    "jobSlug": "152036-staff-frontend-engineer",
+                    "jobTitle": "Staff Frontend Engineer",
+                    "companyName": "Example Co",
+                    "jobGeo": "Europe",
+                    "jobDescription": "<div>Design systems</div>",
+                }
+            ]
+        },
+    ]
+
+    class PaginatingHttp(FakeHttp):
+        def __init__(self):
+            super().__init__()
+            self.index = 0
+
+        def get_json(self, url, **kwargs):
+            self.calls.append(("get_json", url, kwargs))
+            page = pages[self.index]
+            self.index += 1
+            return page
+
+    http = PaginatingHttp()
+
+    jobs = JobicySource(http, max_pages=2).discover()
+
+    assert len(jobs) == 2
+    assert http.calls == [
+        ("get_json", "https://jobicy.com/api/v2/remote-jobs", {"params": {"page": 1}}),
+        ("get_json", "https://jobicy.com/api/v2/remote-jobs", {"params": {"page": 2}}),
+    ]
+    assert jobs[0].source == "jobicy"
+    assert jobs[0].source_job_id == "152035"
+    assert jobs[0].title == "Senior Front-End Developer (React / TypeScript) - Market Research"
+    assert jobs[0].company == "Truelogic"
+    assert jobs[0].location == "LATAM"
+    assert jobs[0].url == "https://jobicy.com/jobs/152035-senior-front-end-developer-react-typescript-market-research"
+    assert jobs[0].description == "React TypeScript"
+    assert jobs[0].remote is True
+    assert jobs[1].url == "https://jobicy.com/jobs/152036-staff-frontend-engineer"
+
+
+def test_jobicy_skips_malformed_records(fake_http):
+    fake_http.json_data = {
+        "jobs": [
+            {
+                "id": 152035,
+                "url": "https://jobicy.com/jobs/152035-senior-front-end-developer-react-typescript-market-research",
+                "jobTitle": "Senior Front-End Developer",
+                "companyName": "Truelogic",
+                "jobGeo": "LATAM",
+                "jobDescription": "<p>React</p>",
+            },
+            {
+                "id": None,
+                "url": "",
+                "jobTitle": "",
+                "companyName": "Broken Co",
+                "jobDescription": "<p>Missing core fields</p>",
+            },
+        ]
+    }
+
+    jobs = JobicySource(fake_http).discover()
+
+    assert len(jobs) == 1
+    assert jobs[0].company == "Truelogic"
+
+
+def test_himalayas_maps_public_posting_and_uses_cursor_pagination():
+    pages = [
+        {
+            "jobs": [
+                {
+                    "guid": "https://himalayas.app/companies/acme/jobs/senior-product-engineer",
+                    "title": "Senior Product Engineer",
+                    "companyName": "Acme",
+                    "locationRestrictions": ["Europe", "UK"],
+                    "description": "<p>React <strong>TypeScript</strong></p>",
+                    "applicationLink": "https://boards.greenhouse.io/acme/jobs/123?gh_src=tracker#apply",
+                }
+            ],
+            "nextCursor": "cursor-2",
+        },
+        {
+            "jobs": [
+                {
+                    "guid": "https://himalayas.app/companies/acme/jobs/staff-frontend-engineer",
+                    "title": "Staff Frontend Engineer",
+                    "companyName": "Acme",
+                    "locationRestrictions": [],
+                    "description": "<div>Design systems</div>",
+                    "applicationLink": "https://jobs.ashbyhq.com/acme/staff?utm_source=himalayas",
+                }
+            ]
+        },
+    ]
+
+    class CursorHttp(FakeHttp):
+        def __init__(self):
+            super().__init__()
+            self.index = 0
+
+        def get_json(self, url, **kwargs):
+            self.calls.append(("get_json", url, kwargs))
+            page = pages[self.index]
+            self.index += 1
+            return page
+
+    http = CursorHttp()
+
+    jobs = HimalayasSource(http, max_pages=2).discover()
+
+    assert len(jobs) == 2
+    assert http.calls == [
+        ("get_json", "https://himalayas.app/jobs/api", {}),
+        ("get_json", "https://himalayas.app/jobs/api", {"params": {"cursor": "cursor-2"}}),
+    ]
+    assert jobs[0].source == "himalayas"
+    assert jobs[0].source_job_id == "https://himalayas.app/companies/acme/jobs/senior-product-engineer"
+    assert jobs[0].company == "Acme"
+    assert jobs[0].title == "Senior Product Engineer"
+    assert jobs[0].location == "Europe, UK"
+    assert jobs[0].url == "https://boards.greenhouse.io/acme/jobs/123"
+    assert jobs[0].description == "React TypeScript"
+    assert jobs[0].remote is True
+    assert jobs[1].url == "https://jobs.ashbyhq.com/acme/staff"
+
+
+def test_himalayas_skips_malformed_records(fake_http):
+    fake_http.json_data = {
+        "jobs": [
+            {
+                "guid": "https://himalayas.app/companies/acme/jobs/senior-product-engineer",
+                "title": "Senior Product Engineer",
+                "companyName": "Acme",
+                "description": "<p>React</p>",
+                "applicationLink": "https://boards.greenhouse.io/acme/jobs/123",
+            },
+            {
+                "guid": "",
+                "title": "Broken Job",
+                "companyName": "",
+                "description": "<p>Missing fields</p>",
+                "applicationLink": "",
+            },
+        ]
+    }
+
+    jobs = HimalayasSource(fake_http).discover()
+
+    assert len(jobs) == 1
+    assert jobs[0].source_job_id == "https://himalayas.app/companies/acme/jobs/senior-product-engineer"
+
+
 def test_build_sources_includes_always_on_and_configured_ats(fake_http, policy):
     settings = Settings(
         gemini_api_key="g",
@@ -217,6 +393,8 @@ def test_build_sources_includes_always_on_and_configured_ats(fake_http, policy):
     kinds = [type(s).__name__ for s in sources]
     assert "RemotiveSource" in kinds
     assert "ArbeitnowSource" in kinds
+    assert "JobicySource" in kinds
+    assert "HimalayasSource" in kinds
     assert "DuckDuckGoSource" in kinds
     assert "AshbySource" in kinds
     assert "LeverSource" in kinds
