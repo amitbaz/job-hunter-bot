@@ -53,6 +53,10 @@ class SearchPolicy:
     max_jobs_per_run: int = 25
     search_queries: list = field(default_factory=list)
     ats: dict = field(default_factory=dict)
+    role_families: list[str] = field(default_factory=list)
+    search_query_templates: list[str] = field(default_factory=list)
+    search_domains: list[str] = field(default_factory=list)
+    max_search_queries_per_run: int = 30
 
 
 @dataclass(slots=True)

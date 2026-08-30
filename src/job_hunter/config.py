@@ -33,6 +33,10 @@ def load_settings(config_path: Path) -> Settings:
         max_jobs_per_run=data.get("max_jobs_per_run", 25),
         search_queries=data.get("search_queries", []),
         ats=data.get("ats", {}),
+        role_families=data.get("role_families", []),
+        search_query_templates=data.get("search_query_templates", []),
+        search_domains=data.get("search_domains", []),
+        max_search_queries_per_run=data.get("max_search_queries_per_run", 30),
     )
 
     return Settings(
