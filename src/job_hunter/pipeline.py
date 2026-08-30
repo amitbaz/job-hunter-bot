@@ -60,7 +60,7 @@ def run_pipeline(
             continue
 
         for job in jobs:
-            if job.url:
+            if job.url and not job.description:
                 enrich_job(job, http)
 
             job_id, _is_new, _description_changed = store.upsert_job(job)

@@ -193,6 +193,32 @@ def test_pipeline_prefilters_non_matching_jobs(settings):
     assert gemini.eval_calls == 0
 
 
+class ExplodingHttp:
+    def get(self, url, **kwargs):
+        raise AssertionError(f"unexpected enrichment fetch for {url!r}")
+
+    def post(self, url, **kwargs):
+        raise AssertionError(f"unexpected post to {url!r}")
+
+
+def test_pipeline_does_not_reenrich_job_with_existing_description(settings):
+    job = _job(url="https://acme.example/jobs/1")
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([job])],
+        store=store,
+        gemini=gemini,
+        telegram=telegram,
+        http=ExplodingHttp(),
+    )
+
+    assert summary.ready_to_apply == 1
+
+
 def test_should_run_scheduled_matches_local_hour():
     now = datetime(2026, 8, 30, 7, 0, tzinfo=timezone.utc)  # 09:00 in Europe/Berlin (CEST, UTC+2)
     assert should_run_scheduled(now, "Europe/Berlin", 9) is True
