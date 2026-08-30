@@ -4,7 +4,7 @@ Date: 2026-08-30
 Task: Candidate preference extraction
 Status: completed
 Branch: main
-Commit: pending
+Commit: 7883275ea26b6f2e2eea80b0abdb50198c31d645 (implementation)
 
 ## Delivered
 
