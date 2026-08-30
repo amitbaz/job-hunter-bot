@@ -7,15 +7,14 @@ The bot **never submits applications**. It prepares material for you to review a
 ## Architecture
 
 ```
-sources (Remotive, Arbeitnow, DuckDuckGo search, Ashby/Lever/Greenhouse boards)
-  -> normalize + dedupe (SQLite)
-  -> prefilter (deterministic hard blockers: title, remote-only)
-  -> Gemini evaluation (scored fit against candidate profile + policy)
+all public sources (Remotive, Arbeitnow, Remote OK, We Work Remotely, Hacker News, DuckDuckGo, ATS boards)
+  -> enrich + dedupe -> deterministic global ranking -> top-N Gemini evaluation
   -> cover letter generation + PDF rendering (strong matches only)
   -> Telegram digest + PDF delivery
 ```
 
-- `src/job_hunter/sources/` — job discovery adapters. Each source fails open: if one adapter errors, the run continues with the rest.
+- `src/job_hunter/sources/` — public job discovery adapters. Each source fails open: if one adapter errors, the run continues with the rest.
+- `config/search.yml` supports role families, query templates, ATS domains, and `max_search_queries_per_run`; all eligible candidates are ranked globally before `max_jobs_per_run` Gemini calls.
 - `src/job_hunter/prefilter.py` — cheap deterministic filtering before spending Gemini calls.
 - `src/job_hunter/evaluation.py` / `gemini.py` — Gemini-based scoring and rationale.
 - `src/job_hunter/cover_letter.py` / `pdf.py` — cover letter drafting and PDF rendering for jobs that clear the bar.

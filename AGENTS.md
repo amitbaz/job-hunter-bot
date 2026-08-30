@@ -27,19 +27,18 @@ CI (`.github/workflows/ci.yml`) runs `pytest -q` on Python 3.12 for every push/P
 
 ## Architecture
 
-Pipeline, in `pipeline.py::run_pipeline`, one source at a time:
+Pipeline, in `pipeline.py::run_pipeline`:
 
 ```
-sources (Remotive, Arbeitnow, DuckDuckGo search, Ashby/Lever/Greenhouse boards)
-  -> normalize + dedupe (SQLite, store.py)
-  -> prefilter (deterministic hard blockers: title, remote-only — prefilter.py)
-  -> Gemini evaluation (scored fit against candidate profile + policy — evaluation.py/gemini.py)
+all sources -> enrich/dedupe -> deterministic rank -> top-N Gemini
   -> cover letter generation + PDF rendering, strong matches only (cover_letter.py/pdf.py)
   -> Telegram digest + PDF delivery (telegram.py)
 ```
 
 Key modules:
 - `src/job_hunter/sources/` — one adapter per job source, all implementing a common `discover()` interface (`base.py`). Each source **fails open**: an exception during discovery is caught in `run_pipeline`, logged, and that source is skipped — the rest of the run continues.
+- `src/job_hunter/discovery.py`, `discovery_queries.py`, `ranking.py` — aggregate, generate queries, and rank candidates before Gemini.
+- `src/job_hunter/sources/remoteok.py`, `weworkremotely.py`, `hackernews.py` — additional public discovery adapters.
 - `src/job_hunter/store.py` — SQLite persistence: job dedup (`upsert_job`), re-evaluation gating (`needs_evaluation` — a job is only re-evaluated if it hasn't been evaluated before or its description changed), evaluation caching, delivery tracking (`mark_delivered`). DB path defaults to `var/job_hunter.sqlite3`, overridable via `JOB_HUNTER_DB_PATH`.
 - `src/job_hunter/config.py` — loads `config/search.yml` + required env vars into a `Settings`/`SearchPolicy` (see `models.py`). Candidate profile and cover letter template are base64-encoded secrets (`CANDIDATE_PROFILE_B64`, `COVER_LETTER_TEMPLATE_B64`), decoded in memory only — never write decoded plaintext to the repo or logs.
 - `src/job_hunter/cli.py` — `python -m job_hunter run` entrypoint. `--scheduled` gates execution on `should_run_scheduled` (pipeline.py), comparing current local hour in `settings.timezone` against `settings.scheduled_hour`.

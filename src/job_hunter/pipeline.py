@@ -98,6 +98,11 @@ def run_pipeline(
     summary.skipped += discovery.stats.prefilter_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy)
     selected = ranked[: settings.policy.max_jobs_per_run]
+    logger.info("discovery: raw=%s unique=%s prefilter_rejected=%s eligible=%s selected=%s", discovery.stats.raw, discovery.stats.unique, discovery.stats.prefilter_rejected, discovery.stats.eligible, len(selected))
+    source_counts = {}
+    for _id, job, _score in selected:
+        source_counts[job.source] = source_counts.get(job.source, 0) + 1
+    logger.info("selected sources: %s", " ".join(f"{k}={source_counts[k]}" for k in sorted(source_counts)))
     queued_job_ids = {job_id for job_id, _job, _score in selected}
     for job_id in discovery.rediscovered_job_ids:
         _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
