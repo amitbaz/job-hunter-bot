@@ -1,0 +1,46 @@
+name: Daily Job Hunter
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '5 7 * * *'
+    - cron: '5 8 * * *'
+permissions:
+  contents: read
+  actions: read
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - run: pip install -e .
+      - name: Restore prior state
+        run: python scripts/restore_state.py --repo ${{ github.repository }} --token ${{ secrets.GITHUB_TOKEN }} --dest var/job_hunter.sqlite3
+      - name: Run job hunter (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CANDIDATE_PROFILE_B64: ${{ secrets.CANDIDATE_PROFILE_B64 }}
+          COVER_LETTER_TEMPLATE_B64: ${{ secrets.COVER_LETTER_TEMPLATE_B64 }}
+        run: python -m job_hunter run
+      - name: Run job hunter (scheduled)
+        if: github.event_name == 'schedule'
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CANDIDATE_PROFILE_B64: ${{ secrets.CANDIDATE_PROFILE_B64 }}
+          COVER_LETTER_TEMPLATE_B64: ${{ secrets.COVER_LETTER_TEMPLATE_B64 }}
+        run: python -m job_hunter run --scheduled
+      - name: Upload state artifact
+        if: always() && hashFiles('var/job_hunter.sqlite3') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: job-hunter-state
+          path: var/job_hunter.sqlite3
+          retention-days: 90
