@@ -206,56 +206,35 @@ def test_greenhouse_maps_public_posting(fake_http):
     assert jobs[0].description == "React TypeScript"
 
 
-def test_jobicy_maps_public_posting_and_paginates():
-    pages = [
-        {
-            "jobs": [
-                {
-                    "id": 152035,
-                    "url": "https://jobicy.com/jobs/152035-senior-front-end-developer-react-typescript-market-research",
-                    "jobSlug": "152035-senior-front-end-developer-react-typescript-market-research",
-                    "jobTitle": "Senior Front-End Developer (React / TypeScript) - Market Research",
-                    "companyName": "Truelogic",
-                    "jobGeo": "LATAM",
-                    "jobDescription": "<p>React <strong>TypeScript</strong></p>",
-                }
-            ]
-        },
-        {
-            "jobs": [
-                {
-                    "id": 152036,
-                    "url": "https://jobicy.com/jobs/152036-staff-frontend-engineer?utm_source=jobicy",
-                    "jobSlug": "152036-staff-frontend-engineer",
-                    "jobTitle": "Staff Frontend Engineer",
-                    "companyName": "Example Co",
-                    "jobGeo": "Europe",
-                    "jobDescription": "<div>Design systems</div>",
-                }
-            ]
-        },
-    ]
-
-    class PaginatingHttp(FakeHttp):
-        def __init__(self):
-            super().__init__()
-            self.index = 0
-
-        def get_json(self, url, **kwargs):
-            self.calls.append(("get_json", url, kwargs))
-            page = pages[self.index]
-            self.index += 1
-            return page
-
-    http = PaginatingHttp()
+def test_jobicy_maps_public_posting_from_single_feed():
+    http = FakeHttp()
+    http.json_data = {
+        "jobs": [
+            {
+                "id": 152035,
+                "url": "https://jobicy.com/jobs/152035-senior-front-end-developer-react-typescript-market-research",
+                "jobSlug": "152035-senior-front-end-developer-react-typescript-market-research",
+                "jobTitle": "Senior Front-End Developer (React / TypeScript) - Market Research",
+                "companyName": "Truelogic",
+                "jobGeo": "LATAM",
+                "jobDescription": "<p>React <strong>TypeScript</strong></p>",
+            },
+            {
+                "id": 152036,
+                "url": "https://jobicy.com/jobs/152036-staff-frontend-engineer?utm_source=jobicy",
+                "jobSlug": "152036-staff-frontend-engineer",
+                "jobTitle": "Staff Frontend Engineer",
+                "companyName": "Example Co",
+                "jobGeo": "Europe",
+                "jobDescription": "<div>Design systems</div>",
+            },
+        ]
+    }
 
     jobs = JobicySource(http, max_pages=2).discover()
 
     assert len(jobs) == 2
-    assert http.calls == [
-        ("get_json", "https://jobicy.com/api/v2/remote-jobs", {"params": {"page": 1}}),
-        ("get_json", "https://jobicy.com/api/v2/remote-jobs", {"params": {"page": 2}}),
-    ]
+    assert http.calls == [("get_json", "https://jobicy.com/api/v2/remote-jobs", {})]
     assert jobs[0].source == "jobicy"
     assert jobs[0].source_job_id == "152035"
     assert jobs[0].title == "Senior Front-End Developer (React / TypeScript) - Market Research"

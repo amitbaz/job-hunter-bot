@@ -14,19 +14,24 @@ class JobicySource:
         self._max_pages = max_pages
 
     def discover(self) -> list[Job]:
+        # Jobicy's v2 feed returns the current public catalogue in one
+        # response and rejects pagination parameters. Keep ``max_pages`` in
+        # the constructor for a stable source interface, but do not send it
+        # to the API or manufacture duplicate requests.
+        if self._max_pages <= 0:
+            return []
+
+        try:
+            data = self._http.get_json(_URL)
+        except Exception:
+            logger.warning("jobicy discovery failed", exc_info=True)
+            return []
+
         jobs: list[Job] = []
-        for page in range(1, self._max_pages + 1):
-            try:
-                data = self._http.get_json(_URL, params={"page": page})
-            except Exception:
-                logger.warning("jobicy discovery failed", exc_info=True)
-                break
-
-            for item in data.get("jobs", []):
-                job = self._to_job(item)
-                if job is not None:
-                    jobs.append(job)
-
+        for item in data.get("jobs", []) if isinstance(data, dict) else []:
+            job = self._to_job(item)
+            if job is not None:
+                jobs.append(job)
         return jobs
 
     def _to_job(self, item) -> Job | None:
