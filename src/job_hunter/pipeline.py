@@ -7,12 +7,12 @@ from zoneinfo import ZoneInfo
 
 from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.evaluation import evaluate_job
-from job_hunter.fetching import enrich_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
 from job_hunter.models import DigestItem, Material, RunSummary, Settings
 from job_hunter.pdf import render_cover_letter_pdf
-from job_hunter.prefilter import prefilter_job
+from job_hunter.discovery import collect_candidates
+from job_hunter.ranking import rank_jobs
 from job_hunter.sources import build_sources
 from job_hunter.store import JobStore
 from job_hunter.telegram import TelegramClient, build_digest
@@ -93,39 +93,16 @@ def run_pipeline(
     summary = RunSummary()
     digest_items: list[DigestItem] = []
     pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
-    evaluated_count = 0
     out_dir = cover_letter_output_dir(settings)
-    queued_job_ids: set[int] = set()
+    discovery = collect_candidates(sources, store, http, settings.policy)
+    summary.skipped += discovery.stats.prefilter_rejected
+    ranked = rank_jobs(discovery.eligible, settings.policy)
+    selected = ranked[: settings.policy.max_jobs_per_run]
+    queued_job_ids = {job_id for job_id, _job, _score in selected}
+    for job_id in discovery.rediscovered_job_ids:
+        _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
 
-    for source in sources:
-        try:
-            jobs = source.discover()
-        except Exception:
-            logger.exception("source discovery failed: %r", source)
-            continue
-
-        for job in jobs:
-            if job.url and not job.description:
-                enrich_job(job, http)
-
-            job_id, _is_new, _description_changed = store.upsert_job(job)
-
-            if job_id in queued_job_ids:
-                continue
-            queued_job_ids.add(job_id)
-
-            if not store.needs_evaluation(job_id):
-                _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
-                continue
-
-            prefilter_result = prefilter_job(job, settings.policy)
-            if not prefilter_result.should_evaluate:
-                summary.skipped += 1
-                continue
-
-            if evaluated_count >= settings.policy.max_jobs_per_run:
-                continue
-            evaluated_count += 1
+    for job_id, job, _score in selected:
 
             try:
                 evaluation = evaluate_job(job, settings.candidate_profile, settings.policy, gemini)
@@ -170,6 +147,9 @@ def run_pipeline(
                 except Exception:
                     logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
                     summary.errors += 1
+
+    for job_id in set(store.pending_delivery_job_ids()) - queued_job_ids - set(discovery.rediscovered_job_ids):
+        _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
 
     if not settings.dry_run:
         if digest_items:

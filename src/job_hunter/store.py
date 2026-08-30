@@ -305,6 +305,15 @@ class JobStore:
             ).fetchone()
         return row is not None
 
+    def pending_delivery_job_ids(self) -> list[int]:
+        rows = self._conn.execute("""
+            SELECT j.id, e.decision,
+                   EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id=j.id AND d.delivery_type='telegram_message') AS msg,
+                   EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id=j.id AND d.delivery_type='telegram_document') AS doc
+            FROM jobs j JOIN evaluations e ON e.id=(SELECT MAX(id) FROM evaluations WHERE job_id=j.id)
+        """).fetchall()
+        return [r['id'] for r in rows if (r['decision']=='possible_match' and not r['msg']) or (r['decision'] in ('high_priority','package_match') and (not r['msg'] or not r['doc']))]
+
     # ------------------------------------------------------------------
     # Retrieval for delivery-retry (avoid re-calling Gemini)
     # ------------------------------------------------------------------
