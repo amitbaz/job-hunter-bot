@@ -20,6 +20,7 @@ class DiscoveryStats:
     raw: int = 0
     unique: int = 0
     prefilter_rejected: int = 0
+    profession_rejected: int = 0
     eligible: int = 0
     per_source: dict[str, int] = field(default_factory=dict)
 
@@ -172,7 +173,10 @@ def collect_candidates(
 
         prefilter_result = prefilter_job(job, policy)
         if not prefilter_result.should_evaluate:
-            stats.prefilter_rejected += 1
+            if prefilter_result.reason_code == "off_target_profession":
+                stats.profession_rejected += 1
+            else:
+                stats.prefilter_rejected += 1
             continue
 
         eligible.append((job_id, job))

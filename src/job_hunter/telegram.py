@@ -21,6 +21,23 @@ _GROUP_HEADERS = {
     "blocked": "Needs review / blockers",
 }
 _GROUP_ORDER = ("Ready to apply", "Possible matches", "Needs review / blockers")
+_DELIVERABLE_DECISIONS = frozenset(_GROUP_HEADERS)
+
+
+def select_deliverable_items(items: Sequence[DigestItem]) -> list[DigestItem]:
+    selected = []
+    for item in items:
+        if item.decision == "skip":
+            continue
+        if item.decision not in _DELIVERABLE_DECISIONS:
+            logger.warning("omitting unknown Telegram decision=%s job_id=%s", item.decision, item.job_id)
+            continue
+        selected.append(item)
+    return selected
+
+
+def _item_sort_key(item: DigestItem) -> tuple[int, str, str, int]:
+    return (-item.score, (item.company or "").lower(), (item.title or "").lower(), item.job_id)
 
 
 def _digest_line(item: DigestItem) -> str:
@@ -34,8 +51,8 @@ def _digest_line(item: DigestItem) -> str:
 
 def build_digest(items: Sequence[DigestItem]) -> str:
     grouped: dict[str, list[DigestItem]] = {header: [] for header in _GROUP_ORDER}
-    for item in items:
-        header = _GROUP_HEADERS.get(item.decision, "Needs review / blockers")
+    for item in select_deliverable_items(items):
+        header = _GROUP_HEADERS[item.decision]
         grouped[header].append(item)
 
     sections = []
@@ -43,7 +60,7 @@ def build_digest(items: Sequence[DigestItem]) -> str:
         group_items = grouped[header]
         if not group_items:
             continue
-        sections.append("\n".join([header, *(_digest_line(item) for item in group_items)]))
+        sections.append("\n".join([header, *(_digest_line(item) for item in sorted(group_items, key=_item_sort_key))]))
 
     return "\n\n".join(sections) if sections else "No matching jobs today."
 

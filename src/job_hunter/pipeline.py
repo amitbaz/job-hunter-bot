@@ -16,6 +16,7 @@ from job_hunter.ranking import rank_jobs
 from job_hunter.sources import build_sources
 from job_hunter.store import JobStore
 from job_hunter.telegram import TelegramClient, build_digest
+from job_hunter.telegram import select_deliverable_items
 
 logger = logging.getLogger(__name__)
 
@@ -95,10 +96,11 @@ def run_pipeline(
     pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
     out_dir = cover_letter_output_dir(settings)
     discovery = collect_candidates(sources, store, http, settings.policy)
-    summary.skipped += discovery.stats.prefilter_rejected
+    summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy)
     selected = ranked[: settings.policy.max_jobs_per_run]
-    logger.info("discovery: raw=%s unique=%s prefilter_rejected=%s eligible=%s selected=%s", discovery.stats.raw, discovery.stats.unique, discovery.stats.prefilter_rejected, discovery.stats.eligible, len(selected))
+    deferred_by_budget = max(0, len(ranked) - len(selected))
+    logger.info("discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s", discovery.stats.raw, discovery.stats.unique, discovery.stats.prefilter_rejected, discovery.stats.profession_rejected, discovery.stats.eligible, len(selected), deferred_by_budget)
     source_counts = {}
     for _id, job, _score in selected:
         source_counts[job.source] = source_counts.get(job.source, 0) + 1
@@ -157,13 +159,15 @@ def run_pipeline(
         _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
 
     if not settings.dry_run:
-        if digest_items:
-            digest_text = build_digest(digest_items)
+        deliverable_items = select_deliverable_items(digest_items)
+        if deliverable_items:
+            digest_text = build_digest(deliverable_items)
             message_id = telegram.send_message(digest_text)
             if message_id is not None:
-                for item in digest_items:
+                for item in deliverable_items:
                     store.mark_delivered(item.job_id, "telegram_message", message_id)
 
+        pdf_deliveries.sort(key=lambda entry: (-entry[2].score, (entry[2].company or "").lower(), (entry[2].title or "").lower(), entry[0]))
         for job_id, pdf_path, item in pdf_deliveries:
             caption = f"{item.company} - {item.title} - {item.score} - {item.url}"
             document_id = telegram.send_document(pdf_path, caption)

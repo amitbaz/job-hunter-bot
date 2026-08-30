@@ -8,13 +8,15 @@ The bot **never submits applications**. It prepares material for you to review a
 
 ```
 all public sources (Remotive, Arbeitnow, Remote OK, We Work Remotely, Hacker News, DuckDuckGo, ATS boards)
-  -> enrich + dedupe -> deterministic global ranking -> top-N Gemini evaluation
+  -> enrich + dedupe -> profession gate + prefilter -> deterministic global ranking -> top-N Gemini evaluation
   -> cover letter generation + PDF rendering (strong matches only)
   -> Telegram digest + PDF delivery
 ```
 
 - `src/job_hunter/sources/` — public job discovery adapters. Each source fails open: if one adapter errors, the run continues with the rest.
 - `config/search.yml` supports role families, query templates, ATS domains, and `max_search_queries_per_run`; all eligible candidates are ranked globally before `max_jobs_per_run` Gemini calls.
+- Only software/product-engineering professions reach Gemini. The default safety ceiling is 75 valid jobs per run; blocked profession phrases take precedence over generic `engineer`/`developer` markers.
+- `skip` evaluations are persisted but never sent to Telegram. Telegram sections are ordered by final Gemini score descending, and unknown decisions are omitted.
 - `src/job_hunter/prefilter.py` — cheap deterministic filtering before spending Gemini calls.
 - `src/job_hunter/evaluation.py` / `gemini.py` — Gemini-based scoring and rationale.
 - `src/job_hunter/cover_letter.py` / `pdf.py` — cover letter drafting and PDF rendering for jobs that clear the bar.
