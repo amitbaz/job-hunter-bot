@@ -21,6 +21,7 @@ from job_hunter.telegram import select_deliverable_items
 logger = logging.getLogger(__name__)
 
 _READY_DECISIONS = {"high_priority", "package_match"}
+_MIN_DELIVERABLE_SCORE = 61
 
 
 def cover_letter_output_dir(settings: Settings) -> Path:
@@ -46,6 +47,9 @@ def _requeue_pending_delivery(
     """
     evaluation = store.get_evaluation(job_id)
     if evaluation is None:
+        return
+
+    if evaluation.total_score < _MIN_DELIVERABLE_SCORE:
         return
 
     job = store.get_job(job_id)

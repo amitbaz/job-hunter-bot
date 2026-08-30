@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from job_hunter.models import DigestItem
-from job_hunter.telegram import TelegramClient, build_digest, chunk_message
+from job_hunter.telegram import TelegramClient, build_digest, chunk_message, select_deliverable_items
 
 
 class FakeResponse:
@@ -55,7 +55,7 @@ def test_build_digest_groups_by_decision():
         _item(decision="high_priority", company="Acme", score=90),
         _item(decision="package_match", company="Beta", score=80),
         _item(decision="possible_match", company="Gamma", score=70),
-        _item(decision="blocked", company="Delta", score=50, hard_blockers=["visa"]),
+        _item(decision="blocked", company="Delta", score=61, hard_blockers=["visa"]),
     ]
     digest = build_digest(items)
     assert "Ready to apply" in digest
@@ -72,6 +72,25 @@ def test_build_digest_groups_by_decision():
 def test_build_digest_empty_items_returns_placeholder():
     digest = build_digest([])
     assert digest
+
+
+def test_build_digest_omits_scores_at_or_below_sixty():
+    digest = build_digest([
+        _item(company="Keep", score=61, decision="possible_match"),
+        _item(company="Drop60", score=60, decision="possible_match"),
+        _item(company="DropLow", score=40, decision="blocked"),
+    ])
+    assert "Keep" in digest
+    assert "Drop60" not in digest
+    assert "DropLow" not in digest
+
+
+def test_select_deliverable_items_keeps_only_scores_above_sixty():
+    selected = select_deliverable_items([
+        _item(company="Keep", score=61),
+        _item(company="Drop", score=60),
+    ])
+    assert [item.company for item in selected] == ["Keep"]
 
 
 def test_send_message_posts_to_send_message_endpoint():
