@@ -128,7 +128,7 @@ On the very first run (or if the `job-hunter-state` artifact has expired past it
 
 ### Gemini quota / rate limits
 
-The pipeline does not implement a Gemini-quota circuit breaker. If you hit Gemini API quota or rate limits partway through a run, each remaining job's evaluation is still attempted individually and fails independently (the failure is caught per job, so the run completes and other jobs aren't blocked), rather than the run stopping immediately. In the worst case this wastes up to `max_jobs_per_run` (default 35) API calls on a single run, but it is harmless — those jobs simply aren't evaluated and will be retried on the next run. If you see repeated Gemini failures in the Actions log, check your API key's quota/rate limit in Google AI Studio.
+The pipeline does not implement a Gemini-quota circuit breaker. Each run uses one compact profile-extraction call, then up to `max_jobs_per_run` (default 35) independent evaluation calls; strong matches can also use a cover-letter call. If quota or rate limits interrupt the run, each affected job fails independently and can be retried on the next run without blocking the rest. If you see repeated Gemini failures in the Actions log, check your API key's quota/rate limit in Google AI Studio.
 
 ### Telegram delivery errors
 
