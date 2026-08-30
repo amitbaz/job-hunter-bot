@@ -75,3 +75,45 @@ def test_count_and_delivery(tmp_path):
     assert store.has_delivery(job_id) is False
     store.mark_delivered(job_id, "telegram_message")
     assert store.has_delivery(job_id) is True
+
+
+def test_has_delivery_filters_by_type(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
+    job_id, _, _ = store.upsert_job(job)
+
+    assert store.has_delivery(job_id, "telegram_message") is False
+    assert store.has_delivery(job_id, "telegram_document") is False
+
+    store.mark_delivered(job_id, "telegram_message")
+
+    assert store.has_delivery(job_id, "telegram_message") is True
+    assert store.has_delivery(job_id, "telegram_document") is False
+    assert store.has_delivery(job_id) is True
+
+
+def test_get_evaluation_and_material_roundtrip(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer", company="Acme", description="React")
+    job_id, _, _ = store.upsert_job(job)
+
+    assert store.get_evaluation(job_id) is None
+    assert store.get_material(job_id) is None
+
+    store.save_evaluation(job_id, _evaluation(job_id, hard_blockers=["visa"], strengths=["React"]))
+    evaluation = store.get_evaluation(job_id)
+    assert evaluation is not None
+    assert evaluation.decision == "high_priority"
+    assert evaluation.hard_blockers == ["visa"]
+    assert evaluation.strengths == ["React"]
+
+    from job_hunter.models import Material
+
+    store.save_material(job_id, Material(job_id=job_id, cover_letter_text="Dear Hiring Team,"))
+    material = store.get_material(job_id)
+    assert material is not None
+    assert material.cover_letter_text == "Dear Hiring Team,"
+
+    fetched_job = store.get_job(job_id)
+    assert fetched_job is not None
+    assert fetched_job.company == "Acme"

@@ -55,6 +55,30 @@ class FakeTelegram:
         return "doc-1"
 
 
+class FlakyTelegram:
+    """Simulates transient Telegram failures: the Nth calls fail, then succeed."""
+
+    def __init__(self, fail_message_times=0, fail_document_times=0):
+        self.messages = []
+        self.documents = []
+        self._fail_message_times = fail_message_times
+        self._fail_document_times = fail_document_times
+
+    def send_message(self, text):
+        if self._fail_message_times > 0:
+            self._fail_message_times -= 1
+            return None
+        self.messages.append(text)
+        return f"msg-{len(self.messages)}"
+
+    def send_document(self, path, caption):
+        if self._fail_document_times > 0:
+            self._fail_document_times -= 1
+            return None
+        self.documents.append((path, caption))
+        return f"doc-{len(self.documents)}"
+
+
 class FakeSource:
     def __init__(self, jobs):
         self._jobs = jobs
@@ -217,6 +241,91 @@ def test_pipeline_does_not_reenrich_job_with_existing_description(settings):
     )
 
     assert summary.ready_to_apply == 1
+
+
+def test_pipeline_retries_failed_telegram_delivery_on_next_run(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FlakyTelegram(fail_message_times=1, fail_document_times=1)
+
+    # Run 1: evaluation + material generation succeed, both Telegram sends fail.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    job_id, _, _ = store.upsert_job(job)
+    assert store.has_delivery(job_id, "telegram_message") is False
+    assert store.has_delivery(job_id, "telegram_document") is False
+    assert len(telegram.messages) == 0
+    assert len(telegram.documents) == 0
+
+    # Run 2: same job rediscovered, Telegram now works -> retry succeeds.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+    assert store.has_delivery(job_id, "telegram_message") is True
+    assert store.has_delivery(job_id, "telegram_document") is True
+
+
+def test_pipeline_retry_does_not_call_gemini_again(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FlakyTelegram(fail_message_times=1, fail_document_times=1)
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+    assert gemini.eval_calls == 1
+    assert gemini.cover_letter_calls == 1
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    # Retry must reuse the persisted evaluation/cover letter, not call Gemini again.
+    assert gemini.eval_calls == 1
+    assert gemini.cover_letter_calls == 1
+
+
+def test_pipeline_no_duplicate_sends_after_successful_delivery(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+
+    # Job rediscovered on a later run after delivery already succeeded.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+    assert gemini.eval_calls == 1
+    assert gemini.cover_letter_calls == 1
+
+
+def test_pipeline_retries_only_missing_pdf_when_digest_already_sent(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FlakyTelegram(fail_message_times=0, fail_document_times=1)
+
+    # Run 1: digest message succeeds, PDF document delivery fails.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    job_id, _, _ = store.upsert_job(job)
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 0
+    assert store.has_delivery(job_id, "telegram_message") is True
+    assert store.has_delivery(job_id, "telegram_document") is False
+
+    # Run 2: only the missing PDF should be retried, no duplicate digest message.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+    assert store.has_delivery(job_id, "telegram_document") is True
+    assert gemini.eval_calls == 1
+    assert gemini.cover_letter_calls == 1
 
 
 def test_should_run_scheduled_matches_local_hour():

@@ -292,12 +292,88 @@ class JobStore:
                 (job_id, delivery_type, _now_iso(), telegram_id),
             )
 
-    def has_delivery(self, job_id: int) -> bool:
+    def has_delivery(self, job_id: int, delivery_type: str | None = None) -> bool:
+        if delivery_type is None:
+            row = self._conn.execute(
+                "SELECT 1 FROM deliveries WHERE job_id = ? LIMIT 1",
+                (job_id,),
+            ).fetchone()
+        else:
+            row = self._conn.execute(
+                "SELECT 1 FROM deliveries WHERE job_id = ? AND delivery_type = ? LIMIT 1",
+                (job_id, delivery_type),
+            ).fetchone()
+        return row is not None
+
+    # ------------------------------------------------------------------
+    # Retrieval for delivery-retry (avoid re-calling Gemini)
+    # ------------------------------------------------------------------
+
+    def get_job(self, job_id: int) -> Job | None:
         row = self._conn.execute(
-            "SELECT 1 FROM deliveries WHERE job_id = ? LIMIT 1",
+            """
+            SELECT source, title, company, location, url, description,
+                   source_job_id, remote
+            FROM jobs WHERE id = ?
+            """,
             (job_id,),
         ).fetchone()
-        return row is not None
+        if row is None:
+            return None
+        return Job(
+            source=row["source"],
+            title=row["title"],
+            company=row["company"],
+            location=row["location"],
+            url=row["url"],
+            description=row["description"],
+            source_job_id=row["source_job_id"],
+            remote=None if row["remote"] is None else bool(row["remote"]),
+        )
+
+    def get_evaluation(self, job_id: int) -> Evaluation | None:
+        row = self._conn.execute(
+            """
+            SELECT total_score, scores_json, decision, hard_blockers_json,
+                   strengths_json, gaps_json, salary_note, location_note,
+                   rationale, model, status
+            FROM evaluations
+            WHERE job_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Evaluation(
+            job_id=job_id,
+            total_score=row["total_score"],
+            scores=json.loads(row["scores_json"]),
+            decision=row["decision"],
+            hard_blockers=json.loads(row["hard_blockers_json"]),
+            strengths=json.loads(row["strengths_json"]),
+            gaps=json.loads(row["gaps_json"]),
+            salary_note=row["salary_note"],
+            location_note=row["location_note"],
+            rationale=row["rationale"],
+            model=row["model"],
+            status=row["status"],
+        )
+
+    def get_material(self, job_id: int) -> Material | None:
+        row = self._conn.execute(
+            """
+            SELECT cover_letter_text FROM materials
+            WHERE job_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return Material(job_id=job_id, cover_letter_text=row["cover_letter_text"])
 
     # ------------------------------------------------------------------
     # Cleanup

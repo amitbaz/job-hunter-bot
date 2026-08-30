@@ -31,6 +31,50 @@ def should_run_scheduled(now: datetime, timezone: str, scheduled_hour: int) -> b
     return local_hour == scheduled_hour
 
 
+def _requeue_pending_delivery(
+    job_id: int,
+    store: JobStore,
+    out_dir: Path,
+    digest_items: list[DigestItem],
+    pdf_deliveries: list[tuple[int, Path, DigestItem]],
+    summary: RunSummary,
+) -> None:
+    """
+    Re-queue an already-evaluated job for delivery if a prior Telegram send
+    failed. Never calls Gemini; reuses the persisted evaluation/cover letter.
+    """
+    evaluation = store.get_evaluation(job_id)
+    if evaluation is None:
+        return
+
+    job = store.get_job(job_id)
+    if job is None:
+        return
+
+    item = DigestItem(
+        job_id=job_id,
+        company=job.company,
+        title=job.title,
+        score=evaluation.total_score,
+        decision=evaluation.decision,
+        url=job.url,
+        hard_blockers=evaluation.hard_blockers,
+    )
+
+    if not store.has_delivery(job_id, "telegram_message"):
+        digest_items.append(item)
+
+    if evaluation.decision in _READY_DECISIONS and not store.has_delivery(job_id, "telegram_document"):
+        material = store.get_material(job_id)
+        if material is not None:
+            try:
+                pdf_path = render_cover_letter_pdf(material.cover_letter_text, job.company, job.title, out_dir)
+                pdf_deliveries.append((job_id, pdf_path, item))
+            except Exception:
+                logger.exception("cover letter PDF re-render failed for job_id=%s", job_id)
+                summary.errors += 1
+
+
 def run_pipeline(
     settings: Settings,
     sources=None,
@@ -51,6 +95,7 @@ def run_pipeline(
     pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
     evaluated_count = 0
     out_dir = cover_letter_output_dir(settings)
+    queued_job_ids: set[int] = set()
 
     for source in sources:
         try:
@@ -65,7 +110,12 @@ def run_pipeline(
 
             job_id, _is_new, _description_changed = store.upsert_job(job)
 
+            if job_id in queued_job_ids:
+                continue
+            queued_job_ids.add(job_id)
+
             if not store.needs_evaluation(job_id):
+                _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
                 continue
 
             prefilter_result = prefilter_job(job, settings.policy)
@@ -121,12 +171,13 @@ def run_pipeline(
                     logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
                     summary.errors += 1
 
-    if not settings.dry_run and digest_items:
-        digest_text = build_digest(digest_items)
-        message_id = telegram.send_message(digest_text)
-        if message_id is not None:
-            for item in digest_items:
-                store.mark_delivered(item.job_id, "telegram_message", message_id)
+    if not settings.dry_run:
+        if digest_items:
+            digest_text = build_digest(digest_items)
+            message_id = telegram.send_message(digest_text)
+            if message_id is not None:
+                for item in digest_items:
+                    store.mark_delivered(item.job_id, "telegram_message", message_id)
 
         for job_id, pdf_path, item in pdf_deliveries:
             caption = f"{item.company} - {item.title} - {item.score} - {item.url}"
