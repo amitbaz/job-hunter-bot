@@ -29,20 +29,21 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 _CREATE_EVALUATIONS = """
 CREATE TABLE IF NOT EXISTS evaluations (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id             INTEGER NOT NULL REFERENCES jobs(id),
-    total_score        INTEGER NOT NULL DEFAULT 0,
-    scores_json        TEXT    NOT NULL DEFAULT '{}',
-    decision           TEXT    NOT NULL DEFAULT '',
-    hard_blockers_json TEXT    NOT NULL DEFAULT '[]',
-    strengths_json     TEXT    NOT NULL DEFAULT '[]',
-    gaps_json          TEXT    NOT NULL DEFAULT '[]',
-    salary_note        TEXT    NOT NULL DEFAULT '',
-    location_note      TEXT    NOT NULL DEFAULT '',
-    rationale          TEXT    NOT NULL DEFAULT '',
-    model              TEXT    NOT NULL DEFAULT '',
-    status             TEXT    NOT NULL DEFAULT 'ok',
-    evaluated_at       TEXT    NOT NULL
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                 INTEGER NOT NULL REFERENCES jobs(id),
+    total_score            INTEGER NOT NULL DEFAULT 0,
+    scores_json            TEXT    NOT NULL DEFAULT '{}',
+    decision               TEXT    NOT NULL DEFAULT '',
+    hard_blockers_json     TEXT    NOT NULL DEFAULT '[]',
+    strengths_json         TEXT    NOT NULL DEFAULT '[]',
+    gaps_json              TEXT    NOT NULL DEFAULT '[]',
+    salary_note            TEXT    NOT NULL DEFAULT '',
+    location_note          TEXT    NOT NULL DEFAULT '',
+    rationale              TEXT    NOT NULL DEFAULT '',
+    model                  TEXT    NOT NULL DEFAULT '',
+    status                 TEXT    NOT NULL DEFAULT 'ok',
+    description_hash_at_eval TEXT NOT NULL DEFAULT '',
+    evaluated_at           TEXT    NOT NULL
 )
 """
 
@@ -200,11 +201,11 @@ class JobStore:
         Conditions:
         - No evaluation row exists, OR
         - Most recent evaluation has status == 'failed', OR
-        - The job description changed after the most recent evaluation.
+        - The job description changed since the most recent evaluation.
         """
         row = self._conn.execute(
             """
-            SELECT e.status, e.evaluated_at, j.last_seen_at, j.description_hash
+            SELECT e.status, e.description_hash_at_eval, j.description_hash
             FROM   evaluations e
             JOIN   jobs j ON j.id = e.job_id
             WHERE  e.job_id = ?
@@ -220,8 +221,8 @@ class JobStore:
         if row["status"] == "failed":
             return True
 
-        # If description was updated after the last evaluation
-        if row["last_seen_at"] > row["evaluated_at"]:
+        # Re-evaluate only if the content actually changed since the last evaluation.
+        if row["description_hash_at_eval"] != row["description_hash"]:
             return True
 
         return False
@@ -229,13 +230,18 @@ class JobStore:
     def save_evaluation(self, job_id: int, evaluation: Evaluation) -> None:
         with self._conn:
             self._conn.execute("PRAGMA foreign_keys = ON")
+            row = self._conn.execute(
+                "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            description_hash = row["description_hash"] if row else ""
             self._conn.execute(
                 """
                 INSERT INTO evaluations
                     (job_id, total_score, scores_json, decision,
                      hard_blockers_json, strengths_json, gaps_json,
-                     salary_note, location_note, rationale, model, status, evaluated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     salary_note, location_note, rationale, model, status,
+                     description_hash_at_eval, evaluated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -250,6 +256,7 @@ class JobStore:
                     evaluation.rationale,
                     evaluation.model,
                     evaluation.status,
+                    description_hash,
                     _now_iso(),
                 ),
             )

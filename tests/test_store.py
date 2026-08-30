@@ -1,5 +1,23 @@
-from job_hunter.models import Job
+from job_hunter.models import Evaluation, Job
 from job_hunter.store import JobStore
+
+
+def _evaluation(job_id, **overrides):
+    defaults = dict(
+        job_id=job_id,
+        total_score=90,
+        scores={},
+        decision="high_priority",
+        hard_blockers=[],
+        strengths=[],
+        gaps=[],
+        salary_note="",
+        location_note="",
+        rationale="",
+        model="m",
+    )
+    defaults.update(overrides)
+    return Evaluation(**defaults)
 
 
 def test_upsert_dedupes_and_detects_description_change(tmp_path):
@@ -21,6 +39,31 @@ def test_needs_evaluation_new_job(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
     job_id, _, _ = store.upsert_job(job)
+    assert store.needs_evaluation(job_id) is True
+
+
+def test_needs_evaluation_false_after_rediscovering_unchanged_job(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer", description="React")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id))
+    assert store.needs_evaluation(job_id) is False
+
+    # Simulate a later run rediscovering the same, unchanged job.
+    same_id, is_new, changed = store.upsert_job(job)
+    assert (is_new, changed) == (False, False)
+    assert store.needs_evaluation(same_id) is False
+
+
+def test_needs_evaluation_true_after_description_changes_post_evaluation(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer", description="React")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id))
+    assert store.needs_evaluation(job_id) is False
+
+    job.description = "React and TypeScript"
+    store.upsert_job(job)
     assert store.needs_evaluation(job_id) is True
 
 
