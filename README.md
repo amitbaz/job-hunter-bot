@@ -7,16 +7,18 @@ The bot **never submits applications**. It prepares material for you to review a
 ## Architecture
 
 ```
-all public sources (Remotive, Arbeitnow, Remote OK, We Work Remotely, Hacker News, DuckDuckGo, ATS boards)
-  -> enrich + dedupe -> profession gate + prefilter -> deterministic global ranking -> top-N Gemini evaluation
+all public sources (Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work Remotely, Hacker News, DuckDuckGo, ATS boards)
+  -> enrich + dedupe -> profession gate + prefilter -> deterministic ranking or profile-aware ranking
+  -> diversity-constrained top-N shortlist (stable-ranking fallback on error) -> Gemini evaluation
   -> cover letter generation + PDF rendering (strong matches only)
   -> Telegram digest + PDF delivery
 ```
 
-- `src/job_hunter/sources/` — public job discovery adapters. Each source fails open: if one adapter errors, the run continues with the rest.
-- `config/search.yml` supports role families, query templates, ATS domains, and `max_search_queries_per_run`; all eligible candidates are ranked globally before `max_jobs_per_run` Gemini calls.
-- Only software/product-engineering professions reach Gemini. The default safety ceiling is 75 valid jobs per run; blocked profession phrases take precedence over generic `engineer`/`developer` markers.
-- `skip` evaluations are persisted but never sent to Telegram. Telegram sections are ordered by final Gemini score descending, and unknown decisions are omitted.
+- `src/job_hunter/sources/` — public job discovery adapters: Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work Remotely, Hacker News, DuckDuckGo query expansion, plus optional Ashby/Lever/Greenhouse ATS boards. Each source fails open: if one adapter errors, the run continues with the rest.
+- `config/search.yml` supports role families, query templates, ATS domains, and `max_search_queries_per_run`; DuckDuckGo queries expand each role/template pair across the configured ATS domains before deduping.
+- Only software/product-engineering professions reach Gemini. The default evaluation budget is 35 jobs per run, with source-diverse selection (`source_minimum_per_run: 2`, `source_max_share: 0.5`) when profile extraction succeeds.
+- `src/job_hunter/preferences.py` extracts a compact preference profile from `CANDIDATE_PROFILE_B64`; `src/job_hunter/ranking.py` then uses preferred roles, seniority, must-have signals, location fit, avoid signals, and source quality to rank eligible jobs before Gemini. If profile extraction or diversity selection fails, the pipeline falls back to the stable deterministic global ranking and logs the fallback without exposing private profile text.
+- `skip` evaluations are persisted but never sent to Telegram. Telegram sections are ordered by final Gemini score descending, unknown decisions are omitted, and only scores strictly greater than 60 are eligible for digest or retry delivery.
 - `src/job_hunter/prefilter.py` — cheap deterministic filtering before spending Gemini calls.
 - `src/job_hunter/evaluation.py` / `gemini.py` — Gemini-based scoring and rationale.
 - `src/job_hunter/cover_letter.py` / `pdf.py` — cover letter drafting and PDF rendering for jobs that clear the bar.
@@ -77,7 +79,7 @@ set -a; source .env; set +a
 python -m job_hunter run
 ```
 
-This runs discovery, evaluation, and cover letter/PDF generation against the local SQLite database at `var/job_hunter.sqlite3` (override with `JOB_HUNTER_DB_PATH`) without sending anything to Telegram.
+This runs discovery, profile extraction, source-diverse shortlisting, evaluation, and cover letter/PDF generation against the local SQLite database at `var/job_hunter.sqlite3` (override with `JOB_HUNTER_DB_PATH`) without sending anything to Telegram.
 
 ## Manual GitHub Actions dispatch
 
@@ -126,11 +128,11 @@ On the very first run (or if the `job-hunter-state` artifact has expired past it
 
 ### Gemini quota / rate limits
 
-The pipeline does not implement a Gemini-quota circuit breaker. If you hit Gemini API quota or rate limits partway through a run, each remaining job's evaluation is still attempted individually and fails independently (the failure is caught per job, so the run completes and other jobs aren't blocked), rather than the run stopping immediately. In the worst case this wastes up to `max_jobs_per_run` (default 25) API calls on a single run, but it is harmless — those jobs simply aren't evaluated and will be retried on the next run. If you see repeated Gemini failures in the Actions log, check your API key's quota/rate limit in Google AI Studio.
+The pipeline does not implement a Gemini-quota circuit breaker. If you hit Gemini API quota or rate limits partway through a run, each remaining job's evaluation is still attempted individually and fails independently (the failure is caught per job, so the run completes and other jobs aren't blocked), rather than the run stopping immediately. In the worst case this wastes up to `max_jobs_per_run` (default 35) API calls on a single run, but it is harmless — those jobs simply aren't evaluated and will be retried on the next run. If you see repeated Gemini failures in the Actions log, check your API key's quota/rate limit in Google AI Studio.
 
 ### Telegram delivery errors
 
-A failed Telegram send (bad token, bot not started, wrong chat id, message too large) is logged and does not crash the run or discard evaluation results — the job stays evaluated and marked undelivered in SQLite, and delivery is not automatically retried. Verify `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are correct and that you've sent at least one message to the bot (see [Telegram bot setup](#telegram-bot-setup)). Note that such a job is not resurfaced in a later digest either: since it was already successfully evaluated, it won't be re-evaluated on subsequent runs, so a job that fails delivery this way stays undelivered until you intervene manually. This is a known v1 limitation.
+A failed Telegram send (bad token, bot not started, wrong chat id, message too large) is logged and does not crash the run or discard evaluation results. The job stays evaluated and marked undelivered in SQLite, and later runs retry only the missing Telegram deliveries without re-calling Gemini. Retry eligibility follows the same score floor as the digest: only jobs with final score `>60` are retried, and ready-to-apply jobs retry both the digest message and PDF until both succeed. Verify `TELEGRAM_BOT_TOKEN`/`TELEGRAM_CHAT_ID` are correct and that you've sent at least one message to the bot (see [Telegram bot setup](#telegram-bot-setup)).
 
 ### Flaky web sources
 

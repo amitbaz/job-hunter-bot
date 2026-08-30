@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS deliveries (
 )
 """
 
+_DELIVERABLE_SCORE_FLOOR = 60
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -312,7 +314,18 @@ class JobStore:
                    EXISTS (SELECT 1 FROM deliveries d WHERE d.job_id=j.id AND d.delivery_type='telegram_document') AS doc
             FROM jobs j JOIN evaluations e ON e.id=(SELECT MAX(id) FROM evaluations WHERE job_id=j.id)
         """).fetchall()
-        return [r['id'] for r in rows if r['total_score'] >= 61 and ((r['decision']=='possible_match' and not r['msg']) or (r['decision'] in ('high_priority','package_match') and (not r['msg'] or not r['doc'])))]
+        return [
+            r["id"]
+            for r in rows
+            if r["total_score"] > _DELIVERABLE_SCORE_FLOOR
+            and (
+                (r["decision"] == "possible_match" and not r["msg"])
+                or (
+                    r["decision"] in ("high_priority", "package_match")
+                    and (not r["msg"] or not r["doc"])
+                )
+            )
+        ]
 
     # ------------------------------------------------------------------
     # Retrieval for delivery-retry (avoid re-calling Gemini)

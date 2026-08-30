@@ -92,6 +92,51 @@ def test_has_delivery_filters_by_type(tmp_path):
     assert store.has_delivery(job_id) is True
 
 
+def test_pending_delivery_job_ids_excludes_score_sixty_possible_match(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=60, decision="possible_match"))
+
+    assert store.pending_delivery_job_ids() == []
+
+
+def test_pending_delivery_job_ids_excludes_score_sixty_ready_match(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=60, decision="high_priority"))
+
+    assert store.pending_delivery_job_ids() == []
+
+
+def test_pending_delivery_job_ids_keeps_score_sixty_one_possible_match_until_message_sent(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=61, decision="possible_match"))
+
+    assert store.pending_delivery_job_ids() == [job_id]
+
+    store.mark_delivered(job_id, "telegram_message")
+    assert store.pending_delivery_job_ids() == []
+
+
+def test_pending_delivery_job_ids_keeps_score_sixty_one_ready_match_until_both_deliveries_sent(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=61, decision="package_match"))
+
+    assert store.pending_delivery_job_ids() == [job_id]
+
+    store.mark_delivered(job_id, "telegram_message")
+    assert store.pending_delivery_job_ids() == [job_id]
+
+    store.mark_delivered(job_id, "telegram_document")
+    assert store.pending_delivery_job_ids() == []
+
+
 def test_get_evaluation_and_material_roundtrip(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job = Job(source="x", source_job_id="1", title="Senior Product Engineer", company="Acme", description="React")

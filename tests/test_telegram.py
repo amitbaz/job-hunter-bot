@@ -87,10 +87,12 @@ def test_build_digest_omits_scores_at_or_below_sixty():
 
 def test_select_deliverable_items_keeps_only_scores_above_sixty():
     selected = select_deliverable_items([
-        _item(company="Keep", score=61),
-        _item(company="Drop", score=60),
+        _item(company="Keep", score=61, decision="high_priority"),
+        _item(company="KeepPossible", score=61, decision="possible_match"),
+        _item(company="DropReady", score=60, decision="high_priority"),
+        _item(company="DropPossible", score=60, decision="possible_match"),
     ])
-    assert [item.company for item in selected] == ["Keep"]
+    assert [item.company for item in selected] == ["Keep", "KeepPossible"]
 
 
 def test_send_message_posts_to_send_message_endpoint():

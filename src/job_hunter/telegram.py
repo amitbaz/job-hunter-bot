@@ -22,13 +22,13 @@ _GROUP_HEADERS = {
 }
 _GROUP_ORDER = ("Ready to apply", "Possible matches", "Needs review / blockers")
 _DELIVERABLE_DECISIONS = frozenset(_GROUP_HEADERS)
-_MIN_DELIVERABLE_SCORE = 61
+_DELIVERABLE_SCORE_FLOOR = 60
 
 
 def select_deliverable_items(items: Sequence[DigestItem]) -> list[DigestItem]:
     selected = []
     for item in items:
-        if item.score < _MIN_DELIVERABLE_SCORE:
+        if item.score <= _DELIVERABLE_SCORE_FLOOR:
             continue
         if item.decision == "skip":
             continue

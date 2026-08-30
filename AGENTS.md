@@ -30,19 +30,20 @@ CI (`.github/workflows/ci.yml`) runs `pytest -q` on Python 3.12 for every push/P
 Pipeline, in `pipeline.py::run_pipeline`:
 
 ```
-all sources -> enrich/dedupe -> profession gate + prefilter -> deterministic rank -> top <=75 Gemini -> decision filter -> score-sorted Telegram
+all sources -> enrich/dedupe -> profession gate + prefilter -> deterministic or profile-aware rank
+  -> source-diverse top <=35 shortlist (stable-ranking fallback on error) -> Gemini -> decision filter -> score-sorted Telegram
   -> cover letter generation + PDF rendering, strong matches only (cover_letter.py/pdf.py)
   -> Telegram digest + PDF delivery (telegram.py)
 ```
 
 Key modules:
-- `src/job_hunter/sources/` — one adapter per job source, all implementing a common `discover()` interface (`base.py`). Each source **fails open**: an exception during discovery is caught in `run_pipeline`, logged, and that source is skipped — the rest of the run continues.
-- `src/job_hunter/discovery.py`, `discovery_queries.py`, `ranking.py` — aggregate, generate queries, and rank candidates before Gemini.
+- `src/job_hunter/sources/` — one adapter per job source, all implementing a common `discover()` interface (`base.py`). Built-ins now include Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work Remotely, Hacker News, and DuckDuckGo query expansion, plus optional Ashby/Lever/Greenhouse ATS boards. Each source **fails open**: an exception during discovery is caught in `run_pipeline`, logged, and that source is skipped — the rest of the run continues.
+- `src/job_hunter/discovery.py`, `discovery_queries.py`, `ranking.py` — aggregate, generate expanded search queries, and rank candidates before Gemini. `generate_search_queries()` expands each role/template across configured ATS domains.
 - `PrefilterResult.reason_code` identifies deterministic rejection causes; `DiscoveryStats.profession_rejected` tracks off-target professions. Telegram delivery fails closed for unknown decisions.
-- `src/job_hunter/sources/remoteok.py`, `weworkremotely.py`, `hackernews.py` — additional public discovery adapters.
-- `src/job_hunter/store.py` — SQLite persistence: job dedup (`upsert_job`), re-evaluation gating (`needs_evaluation` — a job is only re-evaluated if it hasn't been evaluated before or its description changed), evaluation caching, delivery tracking (`mark_delivered`). DB path defaults to `var/job_hunter.sqlite3`, overridable via `JOB_HUNTER_DB_PATH`.
+- `src/job_hunter/store.py` — SQLite persistence: job dedup (`upsert_job`), re-evaluation gating (`needs_evaluation` — a job is only re-evaluated if it hasn't been evaluated before or its description changed), evaluation caching, and delivery tracking (`mark_delivered`). `pending_delivery_job_ids()` retries undelivered Telegram work without re-calling Gemini, but only for jobs scoring `>60`. DB path defaults to `var/job_hunter.sqlite3`, overridable via `JOB_HUNTER_DB_PATH`.
 - `src/job_hunter/config.py` — loads `config/search.yml` + required env vars into a `Settings`/`SearchPolicy` (see `models.py`). Candidate profile and cover letter template are base64-encoded secrets (`CANDIDATE_PROFILE_B64`, `COVER_LETTER_TEMPLATE_B64`), decoded in memory only — never write decoded plaintext to the repo or logs.
 - `src/job_hunter/cli.py` — `python -m job_hunter run` entrypoint. `--scheduled` gates execution on `should_run_scheduled` (pipeline.py), comparing current local hour in `settings.timezone` against `settings.scheduled_hour`.
+- `src/job_hunter/preferences.py` extracts a compact preference profile from the candidate profile. When that succeeds, `pipeline.py` uses `rank_jobs(..., preferences)` plus `select_diverse_candidates()` to enforce profile-aware ranking with per-source diversity (`max_jobs_per_run` default 35, `source_minimum_per_run` default 2, `source_max_share` default 0.5). If preference extraction or shortlist selection fails, the pipeline falls back to the stable deterministic global ranking and logs the fallback without exposing private profile text.
 - Per-job evaluation and cover-letter/PDF generation failures are caught individually inside the loop (not fail-open at the run level) so one bad job doesn't abort the run; each increments `summary.errors`.
 - Only jobs with decision `high_priority` or `package_match` (`pipeline.py::_READY_DECISIONS`) get a cover letter + PDF generated and a `possible_match` decision only counts toward the digest, not material generation.
 
