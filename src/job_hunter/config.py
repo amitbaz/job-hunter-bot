@@ -45,7 +45,7 @@ def load_settings(config_path: Path) -> Settings:
         dry_run=dry_run,
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
-        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
         db_path=os.environ.get("JOB_HUNTER_DB_PATH", "var/job_hunter.sqlite3"),
     )
 

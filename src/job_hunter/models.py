@@ -66,7 +66,7 @@ class Settings:
     dry_run: bool = False
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
-    gemini_model: str = "gemini-2.5-flash-lite"
+    gemini_model: str = "gemini-3.6-flash"
     db_path: str = "var/job_hunter.sqlite3"
 
 
