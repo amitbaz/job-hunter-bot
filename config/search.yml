@@ -1,0 +1,44 @@
+timezone: Europe/Berlin
+scheduled_hour: 9
+max_jobs_per_run: 25
+thresholds:
+  package: 75
+  possible: 65
+salary_floor_eur: 90000
+target_titles:
+  - senior product engineer
+  - senior frontend engineer
+  - frontend technical lead
+  - staff frontend engineer
+  - product engineer
+  - full-stack product engineer
+  - ai product engineer
+positive_keywords:
+  - react
+  - next.js
+  - typescript
+  - design system
+  - graphql
+  - product ownership
+  - b2b
+  - saas
+  - agentic
+  - ai-assisted
+  - monorepo
+blocked_title_keywords:
+  - junior
+  - qa
+  - sre
+  - devops
+  - security engineer
+  - engineering manager
+search_queries:
+  - '"Senior Product Engineer" remote React TypeScript'
+  - '"Senior Frontend Engineer" remote React TypeScript Europe'
+  - 'site:jobs.ashbyhq.com "Product Engineer" remote TypeScript'
+  - 'site:boards.greenhouse.io "Senior Frontend Engineer" remote'
+  - 'site:jobs.lever.co "Senior Product Engineer" remote'
+ats:
+  ashby: []
+  lever: []
+  greenhouse: []
