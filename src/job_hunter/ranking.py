@@ -257,4 +257,12 @@ def select_diverse_candidates(
         selected_ids.add(job_id)
         source_counts[job.source] += 1
 
+    for item in ranked:
+        if len(selected) >= limit:
+            break
+        if item[0] in selected_ids:
+            continue
+        selected.append(item)
+        selected_ids.add(item[0])
+
     return selected

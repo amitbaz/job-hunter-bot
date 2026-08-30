@@ -11,16 +11,17 @@ from job_hunter.store import JobStore
 
 
 class FakeGemini:
-    def __init__(self):
+    def __init__(self, *, preference_payload=None):
         self.model = "gemini-test"
         self.preference_calls = 0
         self.eval_calls = 0
         self.cover_letter_calls = 0
+        self.preference_payload = preference_payload
 
     def generate_text(self, prompt, *, json_mode=False):
         if json_mode and "preferred_roles" in prompt:
             self.preference_calls += 1
-            payload = {
+            payload = self.preference_payload or {
                 "preferred_roles": ["Senior Product Engineer"],
                 "preferred_seniority": ["senior"],
                 "must_have_signals": ["React"],
@@ -120,6 +121,19 @@ def _job(**overrides):
     return Job(**defaults)
 
 
+def _jobs_for_source(source: str, count: int, *, title="Senior Product Engineer", description="React TypeScript remote role"):
+    return [
+        _job(
+            source=source,
+            source_job_id=f"{source}-{index}",
+            company=f"{source.title()} {index:03d}",
+            title=title,
+            description=description,
+        )
+        for index in range(count)
+    ]
+
+
 @pytest.fixture
 def policy():
     return SearchPolicy(
@@ -128,7 +142,7 @@ def policy():
         blocked_title_keywords=["junior"],
         salary_floor_eur=90000,
         thresholds={"package": 75, "possible": 65},
-        max_jobs_per_run=25,
+        max_jobs_per_run=35,
     )
 
 
@@ -372,6 +386,58 @@ def test_pipeline_extracts_preferences_once_without_logging_profile(settings, mo
     assert settings.candidate_profile not in caplog.text
     assert job.description not in caplog.text
     assert gemini.eval_calls == 1
+
+
+def test_pipeline_evaluates_all_eligible_jobs_when_under_budget(settings):
+    jobs = _jobs_for_source("ashby", 18)
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource(jobs)], store=store, gemini=gemini, telegram=telegram)
+
+    assert summary.ready_to_apply == 18
+    assert gemini.eval_calls == 18
+
+
+def test_pipeline_caps_evaluations_at_diverse_shortlist_budget(settings, caplog):
+    ashby_jobs = _jobs_for_source("ashby", 80)
+    remotive_jobs = _jobs_for_source("remotive", 20)
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[FakeSource(ashby_jobs), FakeSource(remotive_jobs)],
+            store=store,
+            gemini=gemini,
+            telegram=telegram,
+        )
+
+    assert summary.ready_to_apply == 35
+    assert gemini.eval_calls == 35
+    assert "deferred_by_budget=65" in caplog.text
+    assert "eligible sources: ashby=80 remotive=20" in caplog.text
+    assert "selected sources: ashby=18 remotive=17" in caplog.text
+
+
+def test_pipeline_logs_profile_fallback_without_private_content(settings, caplog):
+    settings.candidate_profile = "PRIVATE_RESUME_TEXT"
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini(preference_payload="{not-json")
+    telegram = FakeTelegram()
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert "profile extraction: source=fallback" in caplog.text
+    assert "eligible sources: ashby=1" in caplog.text
+    assert "selected sources: ashby=1" in caplog.text
+    assert settings.candidate_profile not in caplog.text
+    assert job.description not in caplog.text
 
 
 def test_should_run_scheduled_matches_local_hour():

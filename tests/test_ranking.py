@@ -189,3 +189,18 @@ def test_select_diverse_candidates_preserves_rank_order_for_ties():
     selected = select_diverse_candidates(ranked, limit=3, minimum_per_source=2, max_share=1.0)
 
     assert [job_id for job_id, _job, _score in selected] == [2, 1, 3]
+
+
+def test_select_diverse_candidates_fills_budget_when_share_cap_blocks_remaining_slots():
+    ranked = [
+        *[(100 + index, Job(source="ashby", title="Role", company=f"A{index:02d}"), 100 - index) for index in range(20)],
+        *[(200 + index, Job(source="remotive", title="Role", company=f"B{index:02d}"), 80 - index) for index in range(20)],
+    ]
+
+    selected = select_diverse_candidates(ranked, limit=35, minimum_per_source=2, max_share=0.5)
+
+    assert len(selected) == 35
+    counts = {}
+    for _job_id, job, _score in selected:
+        counts[job.source] = counts.get(job.source, 0) + 1
+    assert counts == {"ashby": 18, "remotive": 17}
