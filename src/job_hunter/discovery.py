@@ -57,6 +57,8 @@ def _richness_key(job: Job) -> tuple[bool, bool, bool, bool, bool]:
 
 
 def _merge_fields(richer: Job, weaker: Job) -> Job:
+    if not richer.title and weaker.title:
+        richer.title = weaker.title
     if not richer.company and weaker.company:
         richer.company = weaker.company
     if not richer.location and weaker.location:
@@ -105,8 +107,8 @@ def _dedupe(jobs: list[Job]) -> list[Job]:
             else:
                 url_seen[url_key] = i
 
-        if job.company:
-            identity_key = candidate_identity_key(job)
+        identity_key = candidate_identity_key(job)
+        if identity_key != "||":
             if identity_key in identity_seen:
                 union(i, identity_seen[identity_key])
             else:

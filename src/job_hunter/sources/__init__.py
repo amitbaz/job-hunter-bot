@@ -9,6 +9,10 @@ from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
 from .lever import LeverSource
 from .remotive import RemotiveSource
+from .remoteok import RemoteOKSource
+from .weworkremotely import WeWorkRemotelySource
+from .hackernews import HackerNewsHiringSource
+from job_hunter.discovery_queries import generate_search_queries
 
 __all__ = [
     "JobSource",
@@ -18,6 +22,7 @@ __all__ = [
     "AshbySource",
     "LeverSource",
     "GreenhouseSource",
+    "RemoteOKSource", "WeWorkRemotelySource", "HackerNewsHiringSource",
     "build_sources",
 ]
 
@@ -26,7 +31,10 @@ def build_sources(settings: Settings, http) -> list[JobSource]:
     sources: list[JobSource] = [
         RemotiveSource(http),
         ArbeitnowSource(http),
-        DuckDuckGoSource(http, settings.policy.search_queries),
+        RemoteOKSource(http),
+        WeWorkRemotelySource(http),
+        HackerNewsHiringSource(http),
+        DuckDuckGoSource(http, generate_search_queries(settings.policy)),
     ]
 
     ats = settings.policy.ats or {}
