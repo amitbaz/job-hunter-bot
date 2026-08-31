@@ -152,6 +152,39 @@ def test_strong_lookups_find_the_single_matching_job(tmp_path):
     assert store.find_job_by_identity("ACME", "senior frontend engineer", "Berlin") == job_id
 
 
+def test_unresolved_rediscovery_retains_existing_canonical_and_ats_metadata(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(
+            source="greenhouse",
+            source_job_id="posting-1",
+            title="Senior Frontend Engineer",
+            company="Acme GmbH",
+            location="Berlin, Germany",
+            url="https://boards.greenhouse.io/acme/jobs/posting-1?gh_src=feed",
+            canonical_url="https://boards.greenhouse.io/acme/jobs/posting-1",
+            ats_provider="greenhouse",
+            ats_board="acme",
+            ats_job_id="posting-1",
+        )
+    )
+
+    store.upsert_job(
+        Job(
+            source="greenhouse",
+            source_job_id="posting-1",
+            title="Senior Frontend Engineer",
+            company="Acme GmbH",
+            location="Berlin, Germany",
+        )
+    )
+
+    assert store.find_job_by_canonical_url(
+        "https://boards.greenhouse.io/acme/jobs/posting-1?utm_source=email"
+    ) == job_id
+    assert store.find_job_by_ats("greenhouse", "acme", "posting-1") == job_id
+
+
 def test_identity_lookup_rejects_ambiguous_matches(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     for source_job_id in ("1", "2"):

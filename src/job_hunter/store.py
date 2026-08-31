@@ -323,10 +323,10 @@ class JobStore:
                         remote           = ?,
                         description      = ?,
                         description_hash = ?,
-                        canonical_url    = ?,
-                        ats_provider     = ?,
-                        ats_board        = ?,
-                        ats_job_id       = ?,
+                        canonical_url    = COALESCE(NULLIF(?, ''), canonical_url),
+                        ats_provider     = COALESCE(?, ats_provider),
+                        ats_board        = COALESCE(?, ats_board),
+                        ats_job_id       = COALESCE(?, ats_job_id),
                         last_seen_at     = ?
                     WHERE id = ?
                     """,
