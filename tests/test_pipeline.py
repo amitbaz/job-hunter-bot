@@ -5,8 +5,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import CandidatePreferences, Job, RunSummary, SearchPolicy, Settings
 from job_hunter.pipeline import run_pipeline, should_run_scheduled
+from job_hunter.sources import GmailStagedSource
 from job_hunter.store import JobStore
 
 
@@ -226,6 +228,89 @@ def test_pipeline_dry_run_persists_but_does_not_deliver(settings, policy):
     assert len(telegram.documents) == 0
     job_id, _, _ = store.upsert_job(job)
     assert store.has_delivery(job_id) is False
+
+
+def test_pipeline_evaluates_staged_gmail_job_through_normal_discovery(settings):
+    store = JobStore(settings.db_path)
+    store.stage_inbound_job(
+        "message-1",
+        "linkedin:job-1",
+        ExtractedJob(
+            source_platform="linkedin",
+            source_job_id="job-1",
+            url="https://linkedin.example/jobs/1",
+            company="Acme",
+            title="Senior Product Engineer",
+            location="Remote",
+            remote=True,
+            description="React TypeScript remote role",
+        ),
+    )
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(
+        settings,
+        sources=[],
+        store=store,
+        gemini=gemini,
+        telegram=telegram,
+    )
+
+    assert summary.ready_to_apply == 1
+    assert gemini.eval_calls == 1
+    assert store.count_jobs() == 1
+    job = store.get_job(1)
+    assert job is not None
+    assert job.source == "gmail:linkedin"
+    assert job.source_job_id == "linkedin:job-1"
+
+
+def test_pipeline_keeps_richer_public_job_and_filters_staged_gmail_duplicate(settings):
+    store = JobStore(settings.db_path)
+    store.stage_inbound_job(
+        "message-1",
+        "linkedin:job-1",
+        ExtractedJob(
+            source_platform="linkedin",
+            source_job_id="job-1",
+            url="https://jobs.acme.example/roles/1?utm_source=linkedin",
+            company="Acme",
+            title="Senior Product Engineer",
+        ),
+    )
+    public_job = _job(
+        source="ashby",
+        source_job_id="public-1",
+        url="https://jobs.acme.example/roles/1",
+        description="React TypeScript remote role with complete public details",
+    )
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    run_pipeline(
+        settings,
+        sources=[FakeSource([public_job])],
+        store=store,
+        gemini=gemini,
+        telegram=telegram,
+    )
+
+    persisted_job = store.get_job(1)
+    assert persisted_job is not None
+    assert persisted_job.source == "ashby"
+    assert GmailStagedSource(store).discover() == []
+
+    run_pipeline(
+        settings,
+        sources=[],
+        store=store,
+        gemini=gemini,
+        telegram=telegram,
+    )
+
+    assert gemini.eval_calls == 1
+    assert store.count_jobs() == 1
 
 
 def test_pipeline_prefilters_non_matching_jobs(settings):

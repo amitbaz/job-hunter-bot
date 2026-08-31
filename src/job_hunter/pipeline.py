@@ -15,7 +15,7 @@ from job_hunter.preferences import extract_candidate_preferences, preferences_so
 from job_hunter.pdf import render_cover_letter_pdf
 from job_hunter.discovery import collect_candidates
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
-from job_hunter.sources import build_sources
+from job_hunter.sources import GmailStagedSource, build_sources
 from job_hunter.store import JobStore
 from job_hunter.telegram import TelegramClient, build_digest
 from job_hunter.telegram import select_deliverable_items
@@ -119,8 +119,9 @@ def run_pipeline(
     http: HttpClient | None = None,
 ) -> RunSummary:
     http = http or HttpClient()
-    sources = sources if sources is not None else build_sources(settings, http)
     store = store or JobStore(settings.db_path)
+    base_sources = sources if sources is not None else build_sources(settings, http)
+    sources = [*base_sources, GmailStagedSource(store)]
     gemini = gemini or GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
     if telegram is None and not settings.dry_run:
         telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id, http)
