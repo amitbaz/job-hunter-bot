@@ -1,10 +1,67 @@
 # AGENTS.md
 
-This file provides guidance to AI coding agents (Claude Code, etc.) when working with code in this repository.
+This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when working with code in this repository.
 
 ## What this is
 
 A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It discovers public remote job postings, deduplicates them in SQLite, evaluates each against a candidate profile with Gemini, drafts tailored cover letters + PDFs for strong matches, and delivers a digest via Telegram. **It never submits applications** — see "v1 safety boundary" in README.md.
+
+## Project direction and architectural constraints
+
+This repository is part of a larger job-seeking ecosystem together with [`amitbaz/interviewer-app`](https://github.com/amitbaz/interviewer-app).
+
+Current state:
+- Job Hunter Bot uses SQLite for persistence.
+- Interviewer App uses Supabase/Postgres.
+- The two applications do not currently share a backend or database.
+
+Target direction:
+- Gradually migrate Job Hunter Bot persistence and shared domain data to Supabase/Postgres.
+- Both applications should eventually operate within the same Supabase ecosystem.
+- Shared concepts are expected to include candidate/profile data, jobs, evaluations, applications, application status, and related interview-preparation context where appropriate, but the exact shared schema is not defined yet.
+
+Migration rules:
+1. **Do not assume Supabase is currently available in this repository.**
+2. **Do not replace SQLite opportunistically while implementing unrelated features.**
+3. Feature development must continue independently of the migration.
+4. Prefer boundaries that make future persistence replacement easier.
+5. When touching persistence-heavy code, avoid leaking SQLite-specific behavior into new domain/business logic where practical.
+6. A SQLite -> Supabase migration must be treated as an explicit architectural task with its own design and implementation plan.
+7. Maintain backward compatibility with the currently deployed GitHub Actions workflow until a migration phase explicitly replaces it.
+8. Documentation describing the future architecture must not be interpreted as meaning that architecture already exists.
+
+**Current production source of truth:** SQLite at `var/job_hunter.sqlite3` unless overridden by `JOB_HUNTER_DB_PATH`.
+
+**Future source of truth:** Supabase/Postgres, only after the relevant migration phase has been implemented and validated.
+
+Target ecosystem:
+
+```text
+Job Hunter Bot
+  discovery / ranking / job evaluation
+          |
+          | future shared data layer
+          v
+       Supabase
+          ^
+          |
+    Interviewer App
+  interview preparation / practice
+```
+
+## Development workflow
+
+For every non-trivial feature, fix, or architectural change:
+
+1. Understand the existing implementation before proposing changes.
+2. Brainstorm/design the change before implementation.
+3. Write the approved design under `docs/superpowers/specs/`.
+4. Write an implementation plan before modifying production code.
+5. Work on a dedicated feature/fix branch unless the user explicitly instructs otherwise.
+6. Keep unrelated refactoring out of the change.
+7. Run the relevant tests before considering the work complete.
+
+Architectural migration work must never be silently bundled into an unrelated feature.
 
 ## Commands
 
@@ -24,6 +81,23 @@ python -m job_hunter run --config path/to.yml  # alternate config
 Local dry run (skips Telegram, no Telegram creds needed): copy `.env.example` to `.env`, fill in `GEMINI_API_KEY`, `CANDIDATE_PROFILE_B64`, `COVER_LETTER_TEMPLATE_B64`, set `JOB_HUNTER_DRY_RUN=1`, then `set -a; source .env; set +a` before running. `JOB_HUNTER_DRY_RUN` truthy values are `1/true/yes` (case-insensitive); anything else is treated as unset/false.
 
 CI (`.github/workflows/ci.yml`) runs `pytest -q` on Python 3.12 for every push/PR — no lint step configured.
+
+## Testing Guidelines
+
+Pytest is the test runner. Run the full suite with `pytest -q`, a single file with `pytest <path> -q`, or a single test with `pytest <path>::<test_name> -q`.
+
+Follow **red -> green -> refactor**: write a failing test, make it pass minimally, then improve both implementation and test. New behavior and bug fixes should be test-driven whenever practical. Preserve existing behavior with regression tests before changing code that is not already covered.
+
+Before considering a change complete, run the relevant focused tests while iterating and then run the full `pytest -q` suite.
+
+## Source Code Documentation
+
+- Document public modules, exported functions and types, API routes, and complex domain models: state their purpose, inputs and outputs, side effects, failure behavior, and important invariants.
+- Write comments for intent and trade-offs—especially decisions, constraints, edge cases, security, or performance rationale that code alone cannot convey. Prefer clearer code over comments that merely restate it.
+- Keep documentation close to the code it describes and update or remove it in the same change when behavior changes.
+- Use examples for non-obvious APIs or workflows when they make correct usage clearer; keep examples minimal, runnable in context, and aligned with the current interface.
+- Do not leave stale, speculative, or redundant comments. Use actionable TODOs only when they include the reason and a tracked next step.
+- Treat documentation as part of code review: verify it is accurate, necessary, and helpful to a future maintainer.
 
 ## Architecture
 
