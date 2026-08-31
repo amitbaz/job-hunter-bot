@@ -4,9 +4,9 @@
 
 **Goal:** Expand the standalone Job Hunter Bot's automated discovery coverage with a self-expanding company watchlist, canonical employer/ATS resolution, cross-source provenance/deduplication, and a small curated specialist-source layer while preserving the existing SQLite-first, fail-open pipeline.
 
-**Architecture:** Keep all discovered jobs on one pipeline. Existing sources, Gmail-staged jobs, a new YC source, targeted specialist-domain search, and watched-company checks produce normal `Job` candidates; a shared identity/resolution layer attempts to resolve them to employer/ATS postings, persists source provenance, and merges duplicates before the existing profession gate, ranking, Gemini evaluation, material generation, and Telegram delivery. Strong final evaluations (`high_priority` or `package_match`) may promote their companies into a persistent watchlist, whose endpoints are checked on future runs.
+**Architecture:** Every discovery path still produces normal `Job` candidates. Existing sources, Gmail staging, a public YC adapter, specialist-domain search, and watched-company checks feed a shared canonical-resolution and logical-job identity layer before the existing profession gate, ranking, Gemini evaluation, cover-letter generation, and Telegram delivery. Final `high_priority` and `package_match` evaluations can promote a company into the persistent watchlist; later runs check the best known ATS/careers endpoint directly.
 
-**Tech Stack:** Python 3.12, SQLite, `requests`, `beautifulsoup4`, existing DuckDuckGo search adapter, existing Ashby/Lever/Greenhouse adapters, Gemini REST client, pytest, GitHub Actions.
+**Tech Stack:** Python 3.12, SQLite, `requests`, `beautifulsoup4`, existing Ashby/Lever/Greenhouse adapters, existing DuckDuckGo HTML search adapter, Gemini REST client, pytest, GitHub Actions.
 
 **Spec:** `docs/superpowers/specs/2026-08-31-job-hunter-bot-r2-automated-discovery-design.md`
 
@@ -14,19 +14,19 @@
 
 - R2 remains SQLite-first; do not introduce Supabase/Postgres or Relay dependencies.
 - User-driven/Telegram job-URL ingestion remains deferred.
-- No logged-in LinkedIn, Wellfound, Welcome to the Jungle, or other authenticated scraping.
-- No application submission, CAPTCHA/2FA automation, work-authorization attestations, salary commitments, or demographic answers.
-- Canonical resolution is aggressive but best-effort: resolution failure must keep the original usable job candidate.
-- Fuzzy similarity alone must never automatically merge jobs.
-- All source/watch/resolution failures fail open independently.
-- Existing R1 Gmail lifecycle tracking and review behavior must continue unchanged.
+- Do not automate authenticated LinkedIn, Wellfound, Welcome to the Jungle, or other logged-in browsing.
+- Do not submit job applications or automate CAPTCHA, 2FA, work-authorization attestations, salary commitments, or demographic answers.
+- Canonical resolution is aggressive but best-effort: resolution failure preserves the original usable job URL and never drops the candidate.
+- Fuzzy similarity alone never automatically merges jobs.
+- Each source, watched company, targeted search, and canonical-resolution attempt fails open independently.
+- R1 Gmail lifecycle tracking, backfill, staging, and review behavior remain unchanged.
 - Automatic watch promotion occurs only after a final evaluation decision of `high_priority` or `package_match`; `possible_match`, `skip`, and `blocked` never auto-promote.
-- Manual watch entries are persistent and must never be automatically deleted or permanently disabled.
-- Watch health uses a deterministic backoff: after 3 consecutive failed checks, pause an automatic or manual entry for 24 hours; any successful verification/check resets failures and clears the pause. Pausing never deletes an entry.
-- Prefer supported structured ATS targets (Ashby, Lever, Greenhouse) over generic careers URLs; never downgrade a known-good structured endpoint to a weaker guess.
-- Preserve every trustworthy source URL/source ID as provenance even after a canonical employer URL is found.
-- Full evaluation/material/application history must remain attached to the surviving logical job when duplicates collapse.
-- Specialist-source mechanics for R2 are fixed as: YC public pages via a dedicated source adapter; Wellfound, Welcome to the Jungle, VC portfolio boards, and smaller specialist boards via targeted public search. Do not add brittle dedicated scrapers for them in R2.
+- Manual watch entries are never automatically deleted or permanently disabled.
+- Watch health rule is exact: after 3 consecutive failed due checks, set `paused_until` to 24 hours after the third failure; a successful check resets failures to zero and clears the pause.
+- Prefer a verified supported ATS target over a generic careers URL; never replace a working structured endpoint with a weaker guess.
+- Preserve every trustworthy source URL and source ID as provenance after canonicalization.
+- Preserve evaluation, material, delivery, and application-event history when duplicate jobs collapse.
+- R2 source mechanics are fixed: YC uses a public-page adapter; Wellfound, Welcome to the Jungle, VC portfolio boards, and smaller specialist boards use targeted public search plus canonical resolution.
 
 ---
 
@@ -34,45 +34,45 @@
 
 ### New production files
 
-- `src/job_hunter/job_identity.py` — source-independent company/title/location normalization and strong identity keys used by canonical resolution, persistence, and dedupe.
-- `src/job_hunter/canonical.py` — canonical employer/ATS resolver, confidence model, supported ATS URL parsing, redirect/embedded-link handling, and targeted resolution search.
-- `src/job_hunter/watchlist.py` — company promotion rules, watch target upgrades, health/backoff policy, and conversion of watch entries into discovery sources.
-- `src/job_hunter/sources/company_watch.py` — one fail-open `JobSource` that checks active watch entries through supported ATS adapters or public careers-page extraction.
-- `src/job_hunter/sources/yc.py` — public YC jobs adapter.
+- `src/job_hunter/job_identity.py` — conservative company/title/location normalization and strong logical-job identity helpers.
+- `src/job_hunter/canonical.py` — supported ATS URL parsing, canonical resolution, confidence rules, and targeted resolution search interface.
+- `src/job_hunter/watchlist.py` — promotion policy, manual seed sync, endpoint upgrade policy, and health constants.
+- `src/job_hunter/sources/company_watch.py` — fail-open source for due watched companies.
+- `src/job_hunter/sources/yc.py` — public YC job-page source.
 
 ### Modified production files
 
-- `src/job_hunter/models.py` — extend `Job` with optional provenance/canonical fields needed during discovery and add small watch/canonical result dataclasses.
-- `src/job_hunter/config.py` — load manual company-watch seeds and specialist search domains.
-- `config/search.yml` — add R2 specialist-domain search configuration and optional manual watch seeds.
-- `src/job_hunter/discovery_queries.py` — generate targeted Wellfound/Welcome to the Jungle/VC specialist queries without consuming the existing role-search semantics incorrectly.
-- `src/job_hunter/sources/__init__.py` — register YC and allow watched-company source construction after the store exists.
-- `src/job_hunter/discovery.py` — resolve canonical identity before final in-run dedupe/upsert; persist provenance; collect resolution/dedupe statistics.
-- `src/job_hunter/store.py` — backward-compatible schema migration for `canonical_url`, `job_sources`, and `company_watch`; provenance, merge, watch, and health operations.
-- `src/job_hunter/pipeline.py` — add watched-company discovery; promote strong evaluated companies; log R2 metrics.
-- `src/job_hunter/fetching.py` — expose reusable public-page metadata/link extraction helpers if needed by canonical/company-watch code without duplicating fetch logic.
-- `README.md` — document R2 automated discovery, manual watch seeds, source mechanics, and health behavior.
+- `src/job_hunter/models.py` — add R2 job metadata plus `AtsReference`, `CanonicalResolution`, and `CompanyWatchSeed` dataclasses.
+- `src/job_hunter/config.py` — load specialist search settings and manual watch seeds.
+- `config/search.yml` — configure YC pages, specialist domains/templates, and manual watch seeds.
+- `src/job_hunter/discovery_queries.py` — add specialist domain queries within the existing global search-query budget.
+- `src/job_hunter/sources/__init__.py` — register YC; watched-company source remains constructed after `JobStore` exists.
+- `src/job_hunter/fetching.py` — expose deterministic public-page metadata/link extraction used by canonicalization and generic careers pages.
+- `src/job_hunter/store.py` — backward-compatible R2 schema, provenance, logical upsert/merge, and watch persistence.
+- `src/job_hunter/discovery.py` — canonicalize before final dedupe/upsert and collect R2 discovery stats.
+- `src/job_hunter/pipeline.py` — sync manual seeds, add watch discovery, promote strong companies, and log R2 metrics.
+- `README.md` — document R2 behavior and configuration.
 
 ### New tests
 
 - `tests/test_job_identity.py`
 - `tests/test_canonical.py`
+- `tests/test_yc_source.py`
 - `tests/test_watchlist.py`
 - `tests/test_company_watch_source.py`
-- `tests/test_yc_source.py`
 
 ### Existing tests to extend
 
 - `tests/test_store.py`
+- `tests/test_fetching.py`
 - `tests/test_config.py`
 - `tests/test_discovery_queries.py`
 - `tests/test_discovery.py`
 - `tests/test_pipeline.py`
-- `tests/test_sources.py` or the repository's existing per-source test files, following current convention.
 
 ---
 
-### Task 1: Define Source-Independent Job and Company Identity
+### Task 1: Add Source-Independent Identity Types and Normalization
 
 **Files:**
 - Create: `src/job_hunter/job_identity.py`
@@ -80,15 +80,20 @@
 - Test: `tests/test_job_identity.py`
 
 **Interfaces:**
-- Produces: `normalize_company_name(value: str) -> str`
-- Produces: `normalize_job_title(value: str) -> str`
-- Produces: `normalize_location(value: str) -> str`
-- Produces: `company_identity_key(company: str) -> str`
-- Produces: `job_fallback_identity(company: str, title: str, location: str) -> str | None`
-- Produces: `locations_compatible(left: str, right: str) -> bool`
-- Extends `Job` with `original_url: str = ""`, `canonical_url: str = ""`, `ats_provider: str | None = None`, and `ats_job_id: str | None = None`.
+- Produces `normalize_company_name(value: str) -> str`.
+- Produces `normalize_job_title(value: str) -> str`.
+- Produces `normalize_location(value: str) -> str`.
+- Produces `company_identity_key(company: str) -> str`.
+- Produces `job_fallback_identity(company: str, title: str, location: str) -> str | None`.
+- Produces `locations_compatible(left: str, right: str) -> bool`.
+- Adds `AtsReference(provider: str, board: str, job_id: str | None)`.
+- Adds `CanonicalResolution(url: str, ats: AtsReference | None, confidence: float, method: str)`.
+- Adds `CompanyWatchSeed(company_name: str, careers_url: str = "", ats_provider: str | None = None, ats_identifier: str | None = None)`.
+- Extends `Job` with defaulted `original_url`, `canonical_url`, `ats_provider`, `ats_board`, and `ats_job_id` fields.
 
-- [ ] **Step 1: Write failing normalization tests**
+- [ ] **Step 1: Write failing identity tests**
+
+Create `tests/test_job_identity.py` with:
 
 ```python
 from job_hunter.job_identity import (
@@ -96,6 +101,7 @@ from job_hunter.job_identity import (
     job_fallback_identity,
     locations_compatible,
     normalize_company_name,
+    normalize_job_title,
 )
 
 
@@ -105,73 +111,71 @@ def test_company_identity_ignores_safe_legal_suffix_and_punctuation():
     assert company_identity_key("Acme GmbH") == company_identity_key("ACME")
 
 
-def test_company_identity_does_not_remove_meaningful_words():
+def test_company_identity_keeps_meaningful_words():
     assert company_identity_key("Meta Platforms") != company_identity_key("Meta")
 
 
+def test_title_normalization_is_exact_not_fuzzy():
+    assert normalize_job_title(" Senior  Frontend Engineer ") == "senior frontend engineer"
+    assert normalize_job_title("Senior Frontend Engineer") != normalize_job_title("Staff Frontend Engineer")
+
+
 def test_fallback_identity_requires_company_and_title():
-    assert job_fallback_identity("Acme", "Senior Frontend Engineer", "Berlin")
+    assert job_fallback_identity("Acme", "Senior Frontend Engineer", "Berlin") == (
+        "acme|senior frontend engineer|berlin"
+    )
     assert job_fallback_identity("", "Senior Frontend Engineer", "Berlin") is None
 
 
-def test_locations_are_compatible_when_one_side_is_unspecified():
+def test_locations_compatible_allows_missing_or_contained_location():
     assert locations_compatible("", "Berlin") is True
     assert locations_compatible("Berlin, Germany", "Berlin") is True
     assert locations_compatible("Berlin", "New York") is False
 ```
 
-- [ ] **Step 2: Run the tests and verify they fail**
-
-Run:
+- [ ] **Step 2: Verify the test fails**
 
 ```bash
 pytest tests/test_job_identity.py -v
 ```
 
-Expected: FAIL because `job_hunter.job_identity` does not exist.
+Expected: FAIL because `job_hunter.job_identity` is missing.
 
-- [ ] **Step 3: Implement minimal normalization helpers**
+- [ ] **Step 3: Implement conservative normalizers**
 
-Use conservative transformations only: lowercase, trim/collapse whitespace, strip punctuation, and remove a small explicit trailing legal-suffix set (`gmbh`, `ag`, `ltd`, `limited`, `inc`, `incorporated`, `llc`, `corp`, `corporation`) only when it appears as a suffix token. Do not use fuzzy matching here.
+In `job_identity.py`, tokenize using lowercase alphanumeric words and remove only trailing legal suffix tokens from this exact set:
 
 ```python
 _SAFE_LEGAL_SUFFIXES = {
-    "gmbh", "ag", "ltd", "limited", "inc", "incorporated",
-    "llc", "corp", "corporation",
+    "gmbh",
+    "ag",
+    "ltd",
+    "limited",
+    "inc",
+    "incorporated",
+    "llc",
+    "corp",
+    "corporation",
 }
-
-
-def normalize_company_name(value: str) -> str:
-    tokens = _tokenize(value)
-    while tokens and tokens[-1] in _SAFE_LEGAL_SUFFIXES:
-        tokens.pop()
-    return " ".join(tokens)
 ```
 
-Implement `job_fallback_identity()` as the normalized `company|title|location` triple only when company and title are non-empty.
+`job_fallback_identity()` returns a key only when normalized company and title are both non-empty. `locations_compatible()` returns true when either side is empty, exact normalized locations match, or one normalized location string contains the other as a whole phrase.
 
-- [ ] **Step 4: Extend `Job` without breaking existing callers**
+- [ ] **Step 4: Extend `Job` and add R2 dataclasses**
 
-Append optional/defaulted fields to the dataclass so existing positional/keyword construction remains valid:
+Append fields so existing `Job(...)` callers remain source-compatible:
 
 ```python
-@dataclass(slots=True)
-class Job:
-    source: str
-    title: str
-    company: str = ""
-    location: str = ""
-    url: str = ""
-    description: str = ""
-    source_job_id: str | None = None
-    remote: bool | None = None
-    original_url: str = ""
-    canonical_url: str = ""
-    ats_provider: str | None = None
-    ats_job_id: str | None = None
+original_url: str = ""
+canonical_url: str = ""
+ats_provider: str | None = None
+ats_board: str | None = None
+ats_job_id: str | None = None
 ```
 
-- [ ] **Step 5: Run focused and model-dependent tests**
+Add the three dataclasses listed in **Interfaces** to `models.py`.
+
+- [ ] **Step 5: Run focused regressions**
 
 ```bash
 pytest tests/test_job_identity.py tests/test_normalize.py tests/test_discovery.py -v
@@ -188,54 +192,103 @@ git commit -m "feat: add source-independent job identity"
 
 ---
 
-### Task 2: Add Backward-Compatible Provenance and Watch Persistence
+### Task 2: Add Backward-Compatible Provenance and Company-Watch Schema
 
 **Files:**
 - Modify: `src/job_hunter/store.py`
 - Test: `tests/test_store.py`
 
 **Interfaces:**
-- Produces: `JobStore.record_job_source(job_id: int, *, source: str, source_job_id: str | None, source_url: str) -> None`
-- Produces: `JobStore.list_job_sources(job_id: int) -> list[sqlite3.Row]`
-- Produces: `JobStore.find_job_by_canonical_url(url: str) -> int | None`
-- Produces: `JobStore.find_job_by_ats(provider: str, ats_job_id: str) -> int | None`
-- Produces: `JobStore.find_job_by_identity(company: str, title: str, location: str) -> int | None`
-- Produces: `JobStore.merge_jobs(survivor_id: int, duplicate_id: int) -> int`
-- Produces watch CRUD/query methods used in Tasks 6–8.
+- Produces `JobStore.record_job_source(job_id: int, *, source: str, source_job_id: str | None, source_url: str) -> None`.
+- Produces `JobStore.list_job_sources(job_id: int) -> list[sqlite3.Row]`.
+- Produces `JobStore.find_job_by_canonical_url(url: str) -> int | None`.
+- Produces `JobStore.find_job_by_ats(provider: str, board: str, job_id: str | None) -> int | None`.
+- Produces `JobStore.find_job_by_identity(company: str, title: str, location: str) -> int | None`.
 
-- [ ] **Step 1: Write failing schema-upgrade tests against a legacy database**
+- [ ] **Step 1: Add a concrete legacy-schema test helper and failing migration test**
 
-Create a SQLite database containing the current R1 `jobs` schema only, then instantiate `JobStore` and assert the R2 structures appear without data loss:
+Append this helper to `tests/test_store.py`:
 
 ```python
+import sqlite3
+
+
+def _create_r1_jobs_only_db(path):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT '',
+            source_job_id TEXT,
+            url TEXT NOT NULL DEFAULT '',
+            company TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            remote INTEGER,
+            description TEXT NOT NULL DEFAULT '',
+            description_hash TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO jobs
+            (fingerprint, source, url, company, title, description_hash,
+             first_seen_at, last_seen_at)
+        VALUES ('legacy', 'gmail:linkedin', 'https://example.test/job',
+                'Acme', 'Frontend Engineer', '',
+                '2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
 def test_r2_schema_upgrades_legacy_jobs_table(tmp_path):
     db = tmp_path / "state.sqlite3"
-    create_r1_schema_and_one_job(db)
+    _create_r1_jobs_only_db(db)
 
     store = JobStore(db)
 
-    columns = store._conn.execute("PRAGMA table_info(jobs)").fetchall()
-    assert "canonical_url" in {row["name"] for row in columns}
+    columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(jobs)")}
+    assert "canonical_url" in columns
+    assert "ats_provider" in columns
+    assert "ats_board" in columns
+    assert "ats_job_id" in columns
     assert store.count_jobs() == 1
-    assert store._conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='job_sources'"
-    ).fetchone()
-    assert store._conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='company_watch'"
-    ).fetchone()
+    tables = {
+        row["name"]
+        for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "job_sources" in tables
+    assert "company_watch" in tables
 ```
 
-- [ ] **Step 2: Run the legacy schema test**
+- [ ] **Step 2: Verify the migration test fails**
 
 ```bash
 pytest tests/test_store.py::test_r2_schema_upgrades_legacy_jobs_table -v
 ```
 
-Expected: FAIL because the R2 tables/column do not exist.
+Expected: FAIL because the R2 columns/tables are absent.
 
 - [ ] **Step 3: Add idempotent schema migration**
 
-Add:
+Add columns only when absent using `PRAGMA table_info(jobs)`:
+
+```text
+canonical_url TEXT NOT NULL DEFAULT ''
+ats_provider TEXT
+ats_board TEXT
+ats_job_id TEXT
+```
+
+Create:
 
 ```sql
 CREATE TABLE IF NOT EXISTS job_sources (
@@ -271,38 +324,320 @@ CREATE TABLE IF NOT EXISTS company_watch (
 );
 ```
 
-Add `canonical_url TEXT NOT NULL DEFAULT ''` to legacy `jobs` tables only when absent, using `PRAGMA table_info(jobs)` before `ALTER TABLE`.
-
-- [ ] **Step 4: Add provenance idempotency tests**
+- [ ] **Step 4: Write provenance idempotency test**
 
 ```python
-def test_record_job_source_is_idempotent_and_refreshes_last_seen(tmp_path):
+def test_record_job_source_is_idempotent(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
-    job_id, *_ = store.upsert_job(Job(source="yc", title="Frontend", company="Acme", url="https://yc.example/job"))
+    job_id, _, _ = store.upsert_job(
+        Job(source="yc", title="Frontend Engineer", company="Acme", url="https://yc.test/job/123")
+    )
 
-    store.record_job_source(job_id, source="yc", source_job_id="123", source_url="https://yc.example/job")
-    store.record_job_source(job_id, source="yc", source_job_id="123", source_url="https://yc.example/job")
+    store.record_job_source(
+        job_id,
+        source="yc",
+        source_job_id="123",
+        source_url="https://yc.test/job/123",
+    )
+    store.record_job_source(
+        job_id,
+        source="yc",
+        source_job_id="123",
+        source_url="https://yc.test/job/123",
+    )
 
     rows = store.list_job_sources(job_id)
     assert len(rows) == 1
     assert rows[0]["source"] == "yc"
+    assert rows[0]["source_job_id"] == "123"
 ```
 
-- [ ] **Step 5: Add merge-preservation tests before merge implementation**
+- [ ] **Step 5: Implement provenance and strong lookup methods**
 
-Create two duplicate jobs and attach an evaluation/material/delivery/application event to the duplicate plus different `job_sources` to both. Assert after `merge_jobs(primary, duplicate)`:
+`record_job_source()` uses an `identity_key` of `id:<source>:<source_job_id>` when source job ID exists, otherwise `url:<canonicalized source URL>`. `find_job_by_identity()` uses Task 1's exact normalized company/title plus compatible location; it returns a job only when exactly one row matches.
+
+- [ ] **Step 6: Run store tests**
+
+```bash
+pytest tests/test_store.py -v
+```
+
+Expected: PASS, including R1 persistence behavior.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/job_hunter/store.py tests/test_store.py
+git commit -m "feat: persist job provenance and company watches"
+```
+
+---
+
+### Task 3: Implement ATS Parsing and Canonical Resolution
+
+**Files:**
+- Create: `src/job_hunter/canonical.py`
+- Modify: `src/job_hunter/fetching.py`
+- Test: `tests/test_canonical.py`
+- Test: `tests/test_fetching.py`
+
+**Interfaces:**
+- Produces `parse_supported_ats_url(url: str) -> AtsReference | None`.
+- Produces `CanonicalResolver(http, search_candidates: Callable[[Job], list[Job]], watch_target: Callable[[str], AtsReference | None])`.
+- Produces `CanonicalResolver.resolve(job: Job) -> CanonicalResolution | None`.
+- Produces `extract_job_page_links(html: str, base_url: str) -> list[str]` in `fetching.py`.
+
+- [ ] **Step 1: Write failing ATS parsing tests**
+
+Create `tests/test_canonical.py` with:
 
 ```python
-assert store.get_job(duplicate_id) is None
-assert len(store.list_job_sources(primary_id)) == 2
-assert store.get_evaluation(primary_id) is not None
-assert store.get_material(primary_id) is not None
-assert store.current_application_state(primary_id) == "INTERVIEW"
+from job_hunter.canonical import parse_supported_ats_url
+
+
+def test_parse_lever_reference():
+    ref = parse_supported_ats_url("https://jobs.lever.co/acme/abc-123")
+    assert ref is not None
+    assert (ref.provider, ref.board, ref.job_id) == ("lever", "acme", "abc-123")
+
+
+def test_parse_ashby_reference():
+    ref = parse_supported_ats_url("https://jobs.ashbyhq.com/acme/xyz")
+    assert ref is not None
+    assert (ref.provider, ref.board, ref.job_id) == ("ashby", "acme", "xyz")
+
+
+def test_parse_greenhouse_reference():
+    ref = parse_supported_ats_url("https://boards.greenhouse.io/acme/jobs/456")
+    assert ref is not None
+    assert (ref.provider, ref.board, ref.job_id) == ("greenhouse", "acme", "456")
 ```
 
-- [ ] **Step 6: Implement lookup/provenance/merge operations transactionally**
+- [ ] **Step 2: Write deterministic resolver tests without placeholders**
 
-`merge_jobs()` must run in one transaction and re-parent, in this order, rows from:
+Add a tiny response stub inside `tests/test_canonical.py`:
+
+```python
+class _Response:
+    def __init__(self, *, url: str, text: str = "", status_code: int = 200):
+        self.url = url
+        self.text = text
+        self.status_code = status_code
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class _Http:
+    def __init__(self, response):
+        self.response = response
+        self.calls = 0
+
+    def get(self, url, **kwargs):
+        self.calls += 1
+        return self.response
+```
+
+Then add:
+
+```python
+def test_direct_ats_url_wins_without_search():
+    http = _Http(_Response(url="https://unused.test"))
+    resolver = CanonicalResolver(http, search_candidates=lambda job: [], watch_target=lambda company: None)
+    result = resolver.resolve(Job(source="yc", title="Frontend Engineer", company="Acme", url="https://jobs.lever.co/acme/abc"))
+    assert result is not None
+    assert result.url == "https://jobs.lever.co/acme/abc"
+    assert result.confidence == 1.0
+    assert http.calls == 0
+
+
+def test_redirect_to_supported_ats_is_accepted():
+    http = _Http(_Response(url="https://jobs.lever.co/acme/abc"))
+    resolver = CanonicalResolver(http, search_candidates=lambda job: [], watch_target=lambda company: None)
+    result = resolver.resolve(Job(source="board", title="Frontend Engineer", company="Acme", url="https://board.test/job"))
+    assert result is not None
+    assert result.method == "redirect"
+    assert result.confidence == 0.98
+
+
+def test_targeted_search_rejects_wrong_company():
+    http = _Http(_Response(url="https://board.test/job", text="<html></html>"))
+    resolver = CanonicalResolver(
+        http,
+        search_candidates=lambda job: [
+            Job(source="duckduckgo", title="Frontend Engineer", company="Other", url="https://jobs.lever.co/other/abc")
+        ],
+        watch_target=lambda company: None,
+    )
+    result = resolver.resolve(Job(source="board", title="Frontend Engineer", company="Acme", url="https://board.test/job"))
+    assert result is None
+
+
+def test_resolution_failure_is_non_blocking():
+    class _FailingHttp:
+        def get(self, url, **kwargs):
+            raise RuntimeError("network down")
+
+    resolver = CanonicalResolver(_FailingHttp(), search_candidates=lambda job: [], watch_target=lambda company: None)
+    result = resolver.resolve(Job(source="board", title="Frontend Engineer", company="Acme", url="https://board.test/job"))
+    assert result is None
+```
+
+- [ ] **Step 3: Verify resolver tests fail**
+
+```bash
+pytest tests/test_canonical.py -v
+```
+
+Expected: FAIL because `canonical.py` is absent.
+
+- [ ] **Step 4: Add reusable HTML metadata extraction**
+
+In `fetching.py`, implement `extract_job_page_links()` to return absolute URLs found in:
+
+```text
+<link rel="canonical">
+JSON-LD objects with @type == "JobPosting" and a url field
+anchors whose href is on jobs.lever.co, jobs.ashbyhq.com, or boards.greenhouse.io
+```
+
+Keep `enrich_job()` behavior unchanged.
+
+- [ ] **Step 5: Implement resolver order and confidence exactly**
+
+Use:
+
+```text
+1.00 direct supported ATS job URL already on candidate
+0.98 response final URL redirects to supported ATS job URL
+0.95 structured/embedded supported ATS job URL from fetched page
+0.92 known watch ATS board plus exact normalized title match from targeted candidates
+0.90 targeted search result with same normalized company, exact normalized title, and compatible location
+```
+
+Return `None` below `0.90`. No Gemini call is used for canonical resolution.
+
+- [ ] **Step 6: Run canonical/fetching tests**
+
+```bash
+pytest tests/test_canonical.py tests/test_fetching.py -v
+```
+
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add src/job_hunter/canonical.py src/job_hunter/fetching.py tests/test_canonical.py tests/test_fetching.py
+git commit -m "feat: resolve canonical employer job postings"
+```
+
+---
+
+### Task 4: Add Logical Job Upsert, Merge, and Cross-Source Dedupe
+
+**Files:**
+- Modify: `src/job_hunter/store.py`
+- Modify: `src/job_hunter/discovery.py`
+- Test: `tests/test_store.py`
+- Test: `tests/test_discovery.py`
+
+**Interfaces:**
+- Produces `JobStore.upsert_logical_job(job: Job) -> tuple[int, bool, bool]`, retaining the existing `(job_id, is_new, description_changed)` shape.
+- Produces `JobStore.merge_jobs(survivor_id: int, duplicate_id: int) -> int`.
+- Extends `DiscoveryStats` with `canonical_resolved`, `canonical_unresolved`, and `cross_source_duplicates`.
+
+- [ ] **Step 1: Write cross-source logical-upsert tests**
+
+Append to `tests/test_store.py`:
+
+```python
+def test_same_canonical_job_from_two_sources_uses_one_job_id(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    first = Job(
+        source="gmail:linkedin",
+        title="Senior Frontend Engineer",
+        company="Acme",
+        url="https://linkedin.test/1",
+        original_url="https://linkedin.test/1",
+        canonical_url="https://jobs.lever.co/acme/abc",
+        ats_provider="lever",
+        ats_board="acme",
+        ats_job_id="abc",
+    )
+    second = Job(
+        source="yc",
+        title="Senior Frontend Engineer",
+        company="Acme GmbH",
+        url="https://yc.test/2",
+        original_url="https://yc.test/2",
+        canonical_url="https://jobs.lever.co/acme/abc",
+        ats_provider="lever",
+        ats_board="acme",
+        ats_job_id="abc",
+    )
+
+    first_id, _, _ = store.upsert_logical_job(first)
+    second_id, _, _ = store.upsert_logical_job(second)
+
+    assert first_id == second_id
+    assert {row["source"] for row in store.list_job_sources(first_id)} == {
+        "gmail:linkedin",
+        "yc",
+    }
+```
+
+Add false-merge tests:
+
+```python
+def test_different_titles_at_same_company_do_not_merge(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    first_id, _, _ = store.upsert_logical_job(
+        Job(source="a", title="Senior Frontend Engineer", company="Acme", location="Berlin")
+    )
+    second_id, _, _ = store.upsert_logical_job(
+        Job(source="b", title="Staff Frontend Engineer", company="Acme", location="Berlin")
+    )
+    assert first_id != second_id
+
+
+def test_same_title_at_different_companies_does_not_merge(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    first_id, _, _ = store.upsert_logical_job(
+        Job(source="a", title="Senior Frontend Engineer", company="Acme", location="Berlin")
+    )
+    second_id, _, _ = store.upsert_logical_job(
+        Job(source="b", title="Senior Frontend Engineer", company="Beta", location="Berlin")
+    )
+    assert first_id != second_id
+```
+
+- [ ] **Step 2: Verify focused tests fail**
+
+```bash
+pytest tests/test_store.py -k "canonical_job or different_titles or different_companies" -v
+```
+
+Expected: FAIL because `upsert_logical_job()` is absent.
+
+- [ ] **Step 3: Implement logical lookup precedence**
+
+Use exact precedence:
+
+```text
+canonical_url
+supported ATS provider + board + job ID
+unique exact normalized company + title + compatible location
+legacy fingerprint
+insert new job
+```
+
+For a resolved job, persist `jobs.url = canonical_url`; otherwise persist the original URL. Always record the original source/provenance.
+
+- [ ] **Step 4: Implement transactional `merge_jobs()`**
+
+Before deleting duplicate job, re-parent:
 
 ```text
 job_sources
@@ -313,233 +648,54 @@ evaluations
 company_watch.discovered_from_job_id
 ```
 
-Before re-parenting `job_sources`, insert/upsert into the survivor to satisfy uniqueness; then delete duplicate provenance rows. Preserve the survivor row, enrich its blank/weaker fields from the duplicate, and delete the duplicate job last.
+Deduplicate `job_sources` during re-parenting. Preserve richer non-empty job fields and the canonical/ATS identity. Delete the duplicate job last.
 
-Do not merge if `survivor_id == duplicate_id`.
+- [ ] **Step 5: Integrate canonical resolution before in-run dedupe**
 
-- [ ] **Step 7: Run store tests**
-
-```bash
-pytest tests/test_store.py -v
-```
-
-Expected: PASS, including existing R1 Gmail persistence tests.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/job_hunter/store.py tests/test_store.py
-git commit -m "feat: persist job provenance and company watches"
-```
-
----
-
-### Task 3: Implement Supported ATS Parsing and Canonical Resolution
-
-**Files:**
-- Create: `src/job_hunter/canonical.py`
-- Modify: `src/job_hunter/fetching.py`
-- Test: `tests/test_canonical.py`
-
-**Interfaces:**
-- Produces: `CanonicalResolution(url: str, provider: str | None, job_id: str | None, confidence: float, method: str)`
-- Produces: `parse_supported_ats_url(url: str) -> tuple[str, str | None] | None`
-- Produces: `CanonicalResolver(http, search_source=None, watch_lookup=None)`
-- Produces: `CanonicalResolver.resolve(job: Job) -> CanonicalResolution | None`
-
-- [ ] **Step 1: Write failing ATS parsing tests**
-
-```python
-from job_hunter.canonical import parse_supported_ats_url
-
-
-def test_parse_supported_ats_urls():
-    assert parse_supported_ats_url("https://jobs.lever.co/acme/abc-123") == ("lever", "abc-123")
-    assert parse_supported_ats_url("https://jobs.ashbyhq.com/acme/xyz") == ("ashby", "xyz")
-    assert parse_supported_ats_url("https://boards.greenhouse.io/acme/jobs/456") == ("greenhouse", "456")
-```
-
-- [ ] **Step 2: Write failing resolution-order tests**
-
-Use a fake HTTP client and fake targeted-search callback. Cover:
-
-```python
-def test_direct_ats_url_wins_without_search(): ...
-def test_redirect_to_ats_is_accepted(): ...
-def test_embedded_employer_link_is_used_when_company_and_title_match(): ...
-def test_targeted_search_rejects_wrong_company(): ...
-def test_targeted_search_rejects_incompatible_title(): ...
-def test_resolution_exception_returns_none(): ...
-```
-
-The low-confidence/failure expectation is always `None`, leaving the caller's original URL untouched.
-
-- [ ] **Step 3: Run canonical tests**
-
-```bash
-pytest tests/test_canonical.py -v
-```
-
-Expected: FAIL because the resolver does not exist.
-
-- [ ] **Step 4: Add reusable public-page metadata extraction**
-
-In `fetching.py`, expose a helper that can inspect fetched HTML for:
-
-- `<link rel="canonical" href="...">`
-- JSON-LD `JobPosting` URL fields
-- outbound links to supported ATS domains
-
-Keep the current enrichment behavior unchanged.
-
-- [ ] **Step 5: Implement deterministic confidence scoring**
-
-Use explicit confidence bands rather than an LLM call:
-
-```text
-1.00 direct supported ATS URL already on job
-0.98 HTTP redirect ending on supported ATS URL
-0.95 structured canonical/JSON-LD URL on supported ATS/employer domain with compatible company/title
-0.92 known watch ATS target + exact/near-exact normalized title match
-0.90 targeted search result with company identity match + normalized title equality + compatible location
-<0.90 unresolved; do not replace URL
-```
-
-The resolver returns only candidates at `>= 0.90`.
-
-- [ ] **Step 6: Implement targeted search as an injected callback**
-
-Do not couple `canonical.py` to DuckDuckGo internals. The resolver accepts a callable like:
-
-```python
-SearchCanonical = Callable[[Job], list[Job]]
-```
-
-and evaluates returned public search candidates using the same company/title/location rules.
-
-- [ ] **Step 7: Run canonical and fetching tests**
-
-```bash
-pytest tests/test_canonical.py tests/test_fetching.py -v
-```
-
-Expected: PASS.
-
-- [ ] **Step 8: Commit**
-
-```bash
-git add src/job_hunter/canonical.py src/job_hunter/fetching.py tests/test_canonical.py tests/test_fetching.py
-git commit -m "feat: resolve canonical employer job postings"
-```
-
----
-
-### Task 4: Replace Fingerprint-Only Upsert With Cross-Source Logical Job Upsert
-
-**Files:**
-- Modify: `src/job_hunter/store.py`
-- Modify: `src/job_hunter/discovery.py`
-- Test: `tests/test_store.py`
-- Test: `tests/test_discovery.py`
-
-**Interfaces:**
-- Consumes: `CanonicalResolver.resolve(job)`
-- Produces: `JobStore.upsert_logical_job(job: Job) -> tuple[int, bool, bool, bool]` where the fourth value is `merged_existing_duplicate`.
-- Produces additional `DiscoveryStats.canonical_resolved`, `canonical_unresolved`, and `cross_source_duplicates` counters.
-
-- [ ] **Step 1: Write failing cross-source upsert tests**
-
-```python
-def test_same_canonical_url_from_different_sources_is_one_job(tmp_path):
-    store = JobStore(tmp_path / "state.sqlite3")
-    a = Job(source="gmail:linkedin", title="Senior Frontend Engineer", company="Acme", url="https://linkedin.example/1", canonical_url="https://jobs.lever.co/acme/abc", ats_provider="lever", ats_job_id="abc")
-    b = Job(source="yc", title="Senior Frontend Engineer", company="Acme GmbH", url="https://yc.example/2", canonical_url="https://jobs.lever.co/acme/abc", ats_provider="lever", ats_job_id="abc")
-
-    first_id, *_ = store.upsert_logical_job(a)
-    second_id, *_ = store.upsert_logical_job(b)
-
-    assert first_id == second_id
-    assert len(store.list_job_sources(first_id)) == 2
-```
-
-Also test ATS ID match with differing canonical URL tracking params and exact company/title/location fallback.
-
-- [ ] **Step 2: Add explicit false-merge tests**
-
-```python
-def test_similar_titles_at_same_company_do_not_merge_without_strong_identity(tmp_path):
-    # "Senior Frontend Engineer" and "Staff Frontend Engineer" stay separate.
-    ...
-
-
-def test_same_title_at_different_companies_never_merges(tmp_path): ...
-```
-
-- [ ] **Step 3: Run focused tests and verify failure**
-
-```bash
-pytest tests/test_store.py -k "logical_job or canonical or merge" -v
-```
-
-Expected: FAIL because `upsert_logical_job` is missing.
-
-- [ ] **Step 4: Implement identity lookup precedence**
-
-Inside `upsert_logical_job()`:
-
-```text
-1. canonical_url
-2. ats_provider + ats_job_id
-3. strong company/title/location fallback
-4. existing fingerprint fallback for backward compatibility
-5. insert new row
-```
-
-Set `jobs.url` to canonical URL when present, otherwise original URL. Set `jobs.canonical_url` only when resolved. Always call `record_job_source()` with the original source URL.
-
-Do not use fuzzy title similarity to merge.
-
-- [ ] **Step 5: Integrate canonical resolution before final in-run dedupe**
-
-In `collect_candidates()`, resolve each raw candidate before `_dedupe()`. On success:
+Change `collect_candidates()` to accept an optional resolver argument; pipeline supplies the real resolver, tests can inject a fake. For each candidate with a URL:
 
 ```python
 job.original_url = job.original_url or job.url
-job.canonical_url = resolution.url
-job.url = resolution.url
-job.ats_provider = resolution.provider
-job.ats_job_id = resolution.job_id
+resolution = resolver.resolve(job)
+if resolution is not None:
+    job.canonical_url = resolution.url
+    job.url = resolution.url
+    if resolution.ats is not None:
+        job.ats_provider = resolution.ats.provider
+        job.ats_board = resolution.ats.board
+        job.ats_job_id = resolution.ats.job_id
 ```
 
-On failure, preserve `job.url` and increment `canonical_unresolved` only for candidates that had a usable original URL.
+If resolver returns `None`, keep `job.url` unchanged.
 
-- [ ] **Step 6: Make in-run dedupe use strong cross-source keys**
+- [ ] **Step 6: Update `_dedupe()` strong keys**
 
-Update `_dedupe()` to union candidates when any of these exact keys match:
+Union only on:
 
 ```text
-canonical URL
-ATS provider + job ID
-fallback employer/title/location identity
+canonical URL equality
+ATS provider + board + non-empty job ID equality
+exact fallback identity from Task 1
 ```
 
-Keep the existing richness merge behavior, but preserve original/provenance metadata from each raw candidate by passing each candidate to store provenance after the logical upsert.
+Set `cross_source_duplicates = raw - unique` after in-run dedupe.
 
-- [ ] **Step 7: Add end-to-end discovery collapse test**
+- [ ] **Step 7: Add end-to-end multi-source collapse test**
 
-Provide three fake sources representing Gmail/YC/ATS copies of the same job and a fake resolver returning the same Lever URL. Assert:
+In `tests/test_discovery.py`, create three existing simple fake sources returning the same company/title/location with different URLs. Inject a resolver stub whose `resolve()` always returns:
 
 ```python
-assert result.stats.raw == 3
-assert result.stats.unique == 1
-assert result.stats.cross_source_duplicates == 2
-assert store.count_jobs() == 1
-assert {r["source"] for r in store.list_job_sources(result.eligible[0][0])} == {
-    "gmail:linkedin", "yc", "lever"
-}
+CanonicalResolution(
+    url="https://jobs.lever.co/acme/abc",
+    ats=AtsReference(provider="lever", board="acme", job_id="abc"),
+    confidence=1.0,
+    method="test",
+)
 ```
 
-- [ ] **Step 8: Run discovery/store regression suite**
+Assert `stats.raw == 3`, `stats.unique == 1`, `stats.cross_source_duplicates == 2`, `store.count_jobs() == 1`, and three provenance records exist.
+
+- [ ] **Step 8: Run discovery/store/Gmail staging regressions**
 
 ```bash
 pytest tests/test_store.py tests/test_discovery.py tests/test_gmail_staged_source.py -v
@@ -556,7 +712,7 @@ git commit -m "feat: dedupe jobs across discovery sources"
 
 ---
 
-### Task 5: Add Curated Specialist Search Domains and YC Public Source
+### Task 5: Add YC and Specialist-Domain Discovery
 
 **Files:**
 - Create: `src/job_hunter/sources/yc.py`
@@ -570,28 +726,32 @@ git commit -m "feat: dedupe jobs across discovery sources"
 - Test: `tests/test_discovery_queries.py`
 
 **Interfaces:**
-- Produces: `YCSource(http, urls: list[str])`
-- Extends `SearchPolicy` with `specialist_search_domains: list[str]`, `specialist_query_templates: list[str]`, and `yc_job_pages: list[str]`.
+- Produces `YCSource(http, urls: list[str])`.
+- Extends `SearchPolicy` with `specialist_search_domains`, `specialist_query_templates`, `yc_job_pages`, and `manual_company_watch`.
 
-- [ ] **Step 1: Write failing config/query tests**
+- [ ] **Step 1: Add specialist query test**
+
+In `tests/test_discovery_queries.py`, construct `SearchPolicy` with the existing required fields plus:
 
 ```python
-def test_specialist_queries_are_generated_separately_from_ats_queries():
-    policy = make_policy(
-        role_families=["senior frontend engineer"],
-        specialist_search_domains=["wellfound.com", "app.welcometothejungle.com"],
-        specialist_query_templates=['"{role}" remote Europe'],
-    )
-    queries = generate_search_queries(policy)
-    assert 'site:wellfound.com "senior frontend engineer" remote Europe' in queries
-    assert 'site:app.welcometothejungle.com "senior frontend engineer" remote Europe' in queries
+specialist_search_domains=["wellfound.com", "app.welcometothejungle.com"],
+specialist_query_templates=['"{role}" remote Europe'],
+yc_job_pages=[],
+manual_company_watch=[],
 ```
 
-Ensure the global `max_search_queries_per_run` cap still applies after dedupe.
+Assert generated queries include:
 
-- [ ] **Step 2: Add R2 config values**
+```text
+site:wellfound.com "senior frontend engineer" remote Europe
+site:app.welcometothejungle.com "senior frontend engineer" remote Europe
+```
 
-Use:
+and total query count never exceeds `max_search_queries_per_run`.
+
+- [ ] **Step 2: Add exact R2 configuration**
+
+Append to `config/search.yml`:
 
 ```yaml
 specialist_search_domains:
@@ -606,37 +766,36 @@ yc_job_pages:
 manual_company_watch: []
 ```
 
-VC portfolio domains are user-extensible by adding them to `specialist_search_domains`; do not hard-code a speculative VC catalog.
+VC portfolio domains remain user-extensible through `specialist_search_domains`; do not hard-code a VC list.
 
-- [ ] **Step 3: Write YC fixture tests**
+- [ ] **Step 3: Add public YC fixture test**
 
-Build a minimal saved HTML fixture matching public YC page structure and assert extraction of company, title, location, URL, and stable source ID where the page exposes one.
+Create `tests/test_yc_source.py` with a fake HTTP response whose HTML contains two job links with explicit data attributes used by the adapter contract:
 
-```python
-def test_yc_source_extracts_public_jobs(http_stub):
-    jobs = YCSource(http_stub, ["https://www.ycombinator.com/jobs/role"]).discover()
-    assert jobs[0].source == "yc"
-    assert jobs[0].company == "Acme"
-    assert jobs[0].title == "Senior Product Engineer"
+```html
+<a class="ycdc-card" href="/companies/acme/jobs/abc"
+   data-company="Acme"
+   data-title="Senior Product Engineer"
+   data-location="Berlin, Germany">Senior Product Engineer</a>
 ```
 
-Also test malformed HTML and HTTP failure return `[]`/partial successes rather than raising.
+The adapter may also support current YC page markup, but the parser must normalize this fixture into one `Job` with source `yc`, company `Acme`, title `Senior Product Engineer`, location `Berlin, Germany`, and absolute URL `https://www.ycombinator.com/companies/acme/jobs/abc`.
 
-- [ ] **Step 4: Implement YC adapter using public HTML only**
+Add a second test where the first configured page returns HTTP 500 and the second returns a valid fixture; discovery returns jobs from the second page rather than raising.
 
-Use BeautifulSoup, no login/session impersonation, and no internal/private API assumptions. Parse job links and nearby company/title/location text defensively. Each configured YC page fails independently.
+- [ ] **Step 4: Implement YC public-page adapter**
 
-- [ ] **Step 5: Register YC in `build_sources()`**
+Use `BeautifulSoup` and public HTML only. Support the explicit fixture contract plus current public job-card anchors/links. Never call an authenticated/private YC endpoint.
 
-Append `YCSource(http, settings.policy.yc_job_pages)` when pages are configured. Wellfound and Welcome to the Jungle remain DuckDuckGo/domain-search inputs rather than dedicated source classes.
+- [ ] **Step 5: Register YC and specialist settings**
+
+`build_sources()` appends `YCSource` when `yc_job_pages` is non-empty. Wellfound and Welcome to the Jungle remain DuckDuckGo targeted-domain search; no new source classes are created for them.
 
 - [ ] **Step 6: Run source/config/query tests**
 
 ```bash
-pytest tests/test_yc_source.py tests/test_config.py tests/test_discovery_queries.py tests/test_sources.py -v
+pytest tests/test_yc_source.py tests/test_config.py tests/test_discovery_queries.py -v
 ```
-
-If `tests/test_sources.py` does not exist, run the repository's per-source tests instead; do not create an unrelated aggregate test file solely for this command.
 
 Expected: PASS.
 
@@ -649,73 +808,106 @@ git commit -m "feat: expand specialist job discovery"
 
 ---
 
-### Task 6: Implement Company Watch CRUD, Promotion, and Endpoint Upgrade Rules
+### Task 6: Implement Watch Promotion, Manual Seeds, and Endpoint Upgrades
 
 **Files:**
 - Create: `src/job_hunter/watchlist.py`
 - Modify: `src/job_hunter/store.py`
-- Modify: `src/job_hunter/models.py`
 - Modify: `src/job_hunter/config.py`
 - Test: `tests/test_watchlist.py`
 - Test: `tests/test_store.py`
 - Test: `tests/test_config.py`
 
 **Interfaces:**
-- Produces: `CompanyWatchSeed(company_name, careers_url="", ats_provider=None, ats_identifier=None)`
-- Produces: `CompanyWatchCandidate(company_name, careers_url, ats_provider, ats_identifier, confidence)`
-- Produces: `should_auto_promote(evaluation: Evaluation) -> bool`
-- Produces: `promote_company(store: JobStore, *, job_id: int, job: Job, evaluation: Evaluation, candidate: CompanyWatchCandidate | None) -> int | None`
-- Produces: `sync_manual_watch_seeds(store: JobStore, seeds: list[CompanyWatchSeed]) -> None`
-- Produces store methods `upsert_company_watch`, `get_company_watch`, `list_due_company_watches`.
+- Produces `should_auto_promote(evaluation: Evaluation) -> bool`.
+- Produces `sync_manual_watch_seeds(store: JobStore, seeds: list[CompanyWatchSeed]) -> None`.
+- Produces `promote_company(store: JobStore, *, job_id: int, job: Job, evaluation: Evaluation, confidence: float = 1.0) -> int | None`.
+- Produces `JobStore.upsert_company_watch(...) -> int`.
+- Produces `JobStore.get_company_watch(company_name: str) -> sqlite3.Row | None`.
 
-- [ ] **Step 1: Write failing promotion-policy tests**
+- [ ] **Step 1: Add exact promotion-policy tests**
+
+Create `tests/test_watchlist.py` and use the repository's `Evaluation` dataclass directly:
 
 ```python
-@pytest.mark.parametrize("decision,expected", [
-    ("high_priority", True),
-    ("package_match", True),
-    ("possible_match", False),
-    ("skip", False),
-    ("blocked", False),
-])
+import pytest
+from job_hunter.models import Evaluation
+from job_hunter.watchlist import should_auto_promote
+
+
+def _evaluation(decision):
+    return Evaluation(
+        job_id=1,
+        total_score=80,
+        scores={},
+        decision=decision,
+        hard_blockers=[],
+        strengths=[],
+        gaps=[],
+        salary_note="",
+        location_note="",
+        rationale="",
+        model="test",
+    )
+
+
+@pytest.mark.parametrize(
+    "decision,expected",
+    [
+        ("high_priority", True),
+        ("package_match", True),
+        ("possible_match", False),
+        ("skip", False),
+        ("blocked", False),
+    ],
+)
 def test_auto_promotion_uses_final_decision(decision, expected):
-    assert should_auto_promote(make_evaluation(decision=decision)) is expected
+    assert should_auto_promote(_evaluation(decision)) is expected
 ```
 
-- [ ] **Step 2: Write failing manual-seed idempotency/protection tests**
+- [ ] **Step 2: Add manual seed and upgrade tests**
+
+Add tests that:
+
+```text
+syncing the same manual Greenhouse seed twice creates one row
+manual seed row has promotion_source == "manual"
+a generic automatic careers URL cannot replace manual Greenhouse metadata
+a high-confidence Greenhouse target upgrades an automatic generic careers-only entry
+```
+
+Use concrete seeds:
 
 ```python
-def test_manual_seed_is_idempotent_and_marked_manual(tmp_path): ...
-def test_automatic_update_cannot_downgrade_manual_structured_ats_target(tmp_path): ...
+CompanyWatchSeed(company_name="Acme GmbH", ats_provider="greenhouse", ats_identifier="acme")
+CompanyWatchSeed(company_name="Beta", careers_url="https://beta.test/careers")
 ```
 
-- [ ] **Step 3: Write failing endpoint-upgrade tests**
+- [ ] **Step 3: Implement watch persistence and safe upgrade ordering**
 
-Cover:
+Endpoint strength ordering is exact:
 
 ```text
-generic careers -> high-confidence Greenhouse: upgrade
-Greenhouse -> generic careers guess: do not downgrade
-known Lever target -> newer high-confidence Lever identifier: update only when confidence is higher/verified
+verified supported ATS = 3
+generic careers/jobs URL = 2
+company-only entry = 1
 ```
 
-- [ ] **Step 4: Implement watch candidate extraction from evaluated job**
+An update can replace the target only when its strength is higher, or strength is equal and confidence is greater. Manual `promotion_source` remains `manual` once set.
 
-Prefer:
+- [ ] **Step 4: Implement automatic promotion from final job metadata**
+
+If decision qualifies and `job.company` normalizes non-empty:
 
 ```text
-job.ats_provider + parsed board/company identifier
-canonical employer careers/jobs URL
-company homepage-derived careers URL only when explicitly present in fetched metadata
+supported ATS metadata on Job -> watch provider/board
+canonical employer URL without ATS -> careers_url
+no usable endpoint -> store company-only watch entry for later repair
 ```
 
-Do not invent an ATS slug from company name.
+Never derive an ATS board slug from company name.
 
-- [ ] **Step 5: Implement promotion and manual seed sync**
-
-`promote_company()` returns `None` unless final decision is `high_priority` or `package_match` and company identity is non-empty. Automatic entries use `promotion_source='automatic'`; manual config always writes `promotion_source='manual'` and is allowed to activate/repair its existing entry.
-
-- [ ] **Step 6: Run watch/config/store tests**
+- [ ] **Step 5: Run watch/config/store tests**
 
 ```bash
 pytest tests/test_watchlist.py tests/test_store.py tests/test_config.py -v
@@ -723,16 +915,16 @@ pytest tests/test_watchlist.py tests/test_store.py tests/test_config.py -v
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/job_hunter/watchlist.py src/job_hunter/store.py src/job_hunter/models.py src/job_hunter/config.py tests/test_watchlist.py tests/test_store.py tests/test_config.py
+git add src/job_hunter/watchlist.py src/job_hunter/store.py src/job_hunter/config.py tests/test_watchlist.py tests/test_store.py tests/test_config.py
 git commit -m "feat: learn relevant company watch targets"
 ```
 
 ---
 
-### Task 7: Add Watched-Company Discovery With Health Backoff
+### Task 7: Add Watched-Company Discovery and Health Backoff
 
 **Files:**
 - Create: `src/job_hunter/sources/company_watch.py`
@@ -742,50 +934,77 @@ git commit -m "feat: learn relevant company watch targets"
 - Test: `tests/test_watchlist.py`
 
 **Interfaces:**
-- Produces: `CompanyWatchSource(store: JobStore, http)` implementing `discover() -> list[Job]`
-- Produces store methods `record_watch_success(watch_id: int, verified_at: str | None = None)`, `record_watch_failure(watch_id: int)`, and `list_due_company_watches(now: datetime) -> list[sqlite3.Row]`.
+- Produces `CompanyWatchSource(store: JobStore, http, now: Callable[[], datetime] = utc_now)` implementing `discover() -> list[Job]`.
+- Produces `JobStore.list_due_company_watches(now: datetime) -> list[sqlite3.Row]`.
+- Produces `JobStore.record_watch_success(watch_id: int, now: datetime) -> None`.
+- Produces `JobStore.record_watch_failure(watch_id: int, now: datetime) -> None`.
 
-- [ ] **Step 1: Write failing structured-watch tests**
+- [ ] **Step 1: Add deterministic health tests**
 
-Create watch rows for Greenhouse, Lever, and Ashby and fake their public responses. Assert `CompanyWatchSource.discover()` returns standard jobs with sources such as:
-
-```text
-watch:greenhouse
-watch:lever
-watch:ashby
-```
-
-and preserves source job IDs/URLs.
-
-- [ ] **Step 2: Write failing health/backoff tests**
+In `tests/test_watchlist.py`, use:
 
 ```python
-def test_three_failures_pause_watch_for_24_hours(tmp_path, frozen_time):
-    ...
-    assert watch["consecutive_failures"] == 3
-    assert watch["paused_until"] == "2026-09-01T12:00:00+00:00"
+from datetime import datetime, timezone
 
 
-def test_success_resets_failure_state(tmp_path): ...
-def test_paused_watch_is_not_due(tmp_path): ...
-def test_manual_watch_is_paused_not_deleted(tmp_path): ...
+def test_third_failure_pauses_for_24_hours(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = store.upsert_company_watch(
+        company_name="Acme",
+        careers_url="https://acme.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    store.record_watch_failure(watch_id, now)
+    store.record_watch_failure(watch_id, now)
+    store.record_watch_failure(watch_id, now)
+    row = store.get_company_watch("Acme")
+    assert row["consecutive_failures"] == 3
+    assert row["paused_until"] == "2026-09-01T12:00:00+00:00"
+
+
+def test_success_clears_failures_and_pause(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = store.upsert_company_watch(
+        company_name="Acme",
+        careers_url="https://acme.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    store.record_watch_failure(watch_id, now)
+    store.record_watch_success(watch_id, now)
+    row = store.get_company_watch("Acme")
+    assert row["consecutive_failures"] == 0
+    assert row["paused_until"] is None
 ```
 
-- [ ] **Step 3: Implement ATS delegation**
+- [ ] **Step 2: Add structured ATS source test**
 
-For supported ATS entries, instantiate the existing provider adapter with the watch identifier and use its public `discover()` output. Rewrite only the source label to `watch:<provider>`; retain provider source IDs and URLs.
+Create `tests/test_company_watch_source.py` with a Greenhouse watch entry and fake `get_json()` response matching the existing `GreenhouseSource` API. Assert returned job source is `watch:greenhouse` while source job ID and employer URL remain intact.
 
-- [ ] **Step 4: Implement generic public careers-page fallback**
+- [ ] **Step 3: Implement due-watch query and health writes**
 
-For `careers_url` without a supported ATS target, fetch the page and extract only explicit job links supported by structured `JobPosting` JSON-LD or clearly job-like links. Do not crawl arbitrary site depth in R2.
+`list_due_company_watches(now)` returns active rows where `paused_until IS NULL OR paused_until <= now`. On the third failure set the 24-hour pause. Successful check resets counters/pause and updates `last_successful_check_at` and `last_verified_at`.
 
-Each watch entry is isolated in `try/except`; one failure calls `record_watch_failure()` and continues.
+- [ ] **Step 4: Implement ATS delegation**
 
-- [ ] **Step 5: Implement deterministic pause behavior**
+For a watch row with supported provider, instantiate the existing provider adapter using `ats_identifier`, discover, and rewrite only `job.source` to `watch:<provider>`.
 
-On failure count 3, set `paused_until = now + 24 hours`. Counts above 3 should not extend the pause repeatedly while the entry is already paused because paused entries are not due. On success clear `paused_until` and reset count.
+- [ ] **Step 5: Implement generic careers-page fallback**
 
-- [ ] **Step 6: Run source/watch tests**
+Fetch one `careers_url` page only. Parse structured JSON-LD `JobPosting` entries and explicit links returned by `extract_job_page_links()`. Do not recursively crawl additional pages in R2.
+
+Wrap each company check independently; an exception records a watch failure and continues to the next company.
+
+- [ ] **Step 6: Run watch source tests**
 
 ```bash
 pytest tests/test_company_watch_source.py tests/test_watchlist.py -v
@@ -802,7 +1021,7 @@ git commit -m "feat: discover jobs from watched companies"
 
 ---
 
-### Task 8: Wire Watch Discovery and Post-Evaluation Promotion Into the Pipeline
+### Task 8: Integrate R2 Discovery and Promotion Into the Pipeline
 
 **Files:**
 - Modify: `src/job_hunter/pipeline.py`
@@ -810,121 +1029,62 @@ git commit -m "feat: discover jobs from watched companies"
 - Test: `tests/test_pipeline.py`
 
 **Interfaces:**
-- Consumes: `CompanyWatchSource`, `sync_manual_watch_seeds`, `promote_company`.
-- Produces no new public interface; integrates R2 into `run_pipeline()`.
+- Consumes `CanonicalResolver`, `CompanyWatchSource`, `sync_manual_watch_seeds`, and `promote_company`.
+- Keeps `run_pipeline(...) -> RunSummary` unchanged.
 
-- [ ] **Step 1: Write failing pipeline test for manual watch discovery**
+- [ ] **Step 1: Add package-match promotion integration test**
 
-Arrange settings with one manual seed and fake watch source output. Assert the watch candidate enters normal discovery/evaluation rather than a separate path.
-
-- [ ] **Step 2: Write failing post-evaluation promotion test**
+Use the existing `tests/test_pipeline.py` fake source/store/Gemini patterns. Configure a single job whose fake Gemini response produces `package_match`. After `run_pipeline()` assert:
 
 ```python
-def test_package_match_promotes_company_after_evaluation(...):
-    summary = run_pipeline(...)
-    watch = store.get_company_watch("Acme")
-    assert watch is not None
-    assert watch["promotion_source"] == "automatic"
+row = store.get_company_watch("Acme")
+assert row is not None
+assert row["promotion_source"] == "automatic"
 ```
 
-Also assert `possible_match` does not promote.
+Add a second test producing `possible_match` and assert `get_company_watch("Acme") is None`.
 
-- [ ] **Step 3: Write failure-isolation test**
+- [ ] **Step 2: Add watch failure isolation test**
 
-Make `CompanyWatchSource.discover()` fail while an existing public source returns a valid job. Assert that job is still evaluated/delivered and pipeline returns normally.
+Inject a normal fake source returning one valid job and monkeypatch `CompanyWatchSource.discover` to raise `RuntimeError("watch down")`. Assert the normal job still reaches evaluation and `summary.errors` is not incremented merely because the discovery source fails open.
 
-- [ ] **Step 4: Wire manual seed sync before source construction**
+- [ ] **Step 3: Build resolver dependencies after store/http exist**
 
-At pipeline startup:
-
-```python
-sync_manual_watch_seeds(store, settings.policy.manual_company_watch)
-```
-
-Then append `CompanyWatchSource(store, http)` alongside `GmailStagedSource(store)` after the store exists.
-
-- [ ] **Step 5: Promote only after evaluation is persisted**
-
-Immediately after `store.save_evaluation(job_id, evaluation)`, call `promote_company(...)` inside its own fail-open `try/except`. Promotion failure increments/logs an R2 metric but must not interrupt cover-letter generation or delivery.
-
-- [ ] **Step 6: Run pipeline regression suite**
-
-```bash
-pytest tests/test_pipeline.py tests/test_discovery.py tests/test_gmail_sync.py -v
-```
-
-Expected: PASS and R1 behavior unchanged.
-
-- [ ] **Step 7: Commit**
-
-```bash
-git add src/job_hunter/pipeline.py src/job_hunter/sources/__init__.py tests/test_pipeline.py
-git commit -m "feat: integrate self-expanding company watches"
-```
-
----
-
-### Task 9: Add Source, Canonical, Dedupe, and Watch Observability
-
-**Files:**
-- Modify: `src/job_hunter/discovery.py`
-- Modify: `src/job_hunter/pipeline.py`
-- Modify: `src/job_hunter/watchlist.py`
-- Test: `tests/test_discovery.py`
-- Test: `tests/test_pipeline.py`
-
-**Interfaces:**
-- Extends `DiscoveryStats` with `canonical_resolved`, `canonical_unresolved`, `cross_source_duplicates`, and per-source error/contribution counters as practical without changing source failure semantics.
-- Extends `RunSummary` only if needed for user-visible/testable counters; logs remain the primary observability surface.
-
-- [ ] **Step 1: Write failing metric tests**
-
-Assert a run with three source copies resolving to one canonical job logs/records:
+Pipeline constructs:
 
 ```text
-raw=3
-unique=1
-canonical_resolved>=1
-cross_source_duplicates=2
+manual watch seed sync
+base sources
+GmailStagedSource(store)
+CompanyWatchSource(store, http)
+CanonicalResolver(http, targeted search callback, watch lookup callback)
+collect_candidates(..., resolver=resolver)
 ```
 
-and a watch promotion records `companies_promoted=1`.
+The targeted canonical-search callback uses the existing DuckDuckGo HTML search mechanism with a small company/title query and returns `Job` candidates; it does not create a second general discovery run.
 
-- [ ] **Step 2: Implement deterministic counters at the ownership layer**
+- [ ] **Step 4: Promote only after successful evaluation persistence**
 
-`discovery.py` owns candidate/resolution/dedupe counters. `pipeline.py` owns promotion counters. `CompanyWatchSource`/watch store owns check success/failure/pause logs. Avoid duplicate counting across layers.
+Immediately after `store.save_evaluation(job_id, evaluation)`, call `promote_company()` inside a dedicated `try/except`. Promotion failure is logged and counted separately, but cover-letter/PDF/delivery continues.
 
-- [ ] **Step 3: Add compact logs**
-
-Emit lines equivalent to:
-
-```text
-source=yc discovered=18 eligible=6 errors=0
-source=company_watch discovered=21 eligible=8 errors=2
-canonical_resolved=31 canonical_unresolved=9 cross_source_duplicates=14
-companies_promoted=2 watch_checks=17 watch_paused=1
-```
-
-Never log Gmail bodies, secrets, CV text, or raw Gemini prompts.
-
-- [ ] **Step 4: Run metric tests**
+- [ ] **Step 5: Run pipeline and R1 regressions**
 
 ```bash
-pytest tests/test_discovery.py tests/test_pipeline.py -v
+pytest tests/test_pipeline.py tests/test_discovery.py tests/test_gmail_sync.py tests/test_gmail_staged_source.py -v
 ```
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/job_hunter/discovery.py src/job_hunter/pipeline.py src/job_hunter/watchlist.py tests/test_discovery.py tests/test_pipeline.py
-git commit -m "feat: report automated discovery health"
+git add src/job_hunter/pipeline.py src/job_hunter/sources/__init__.py tests/test_pipeline.py
+git commit -m "feat: integrate automated company discovery"
 ```
 
 ---
 
-### Task 10: Verify Late Canonical Discovery Preserves Existing Job History
+### Task 9: Preserve History During Late Canonicalization and Job Merge
 
 **Files:**
 - Modify: `src/job_hunter/store.py`
@@ -933,50 +1093,46 @@ git commit -m "feat: report automated discovery health"
 - Test: `tests/test_discovery.py`
 
 **Interfaces:**
-- Consumes `merge_jobs()` and `upsert_logical_job()` from Tasks 2 and 4.
-- No new public interface; hardens migration of already-existing R1 job rows.
+- Hardens `merge_jobs()` and logical upsert; no new interface.
 
-- [ ] **Step 1: Write failing legacy late-resolution integration test**
+- [ ] **Step 1: Add concrete merge-history test**
 
-Scenario:
+In `tests/test_store.py`:
 
-```text
-Run 1: Gmail stores aggregator URL and job is evaluated/delivered.
-Run 2: Lever source finds canonical employer posting for the same company/title/location.
-```
+1. Insert legacy job A with aggregator URL.
+2. Save an evaluation, material, Telegram delivery, and `INTERVIEW` application event on A using existing store methods.
+3. Insert job B with the same exact normalized company/title/location and canonical Lever metadata.
+4. Call the merge path.
 
-Assert after Run 2:
+Assert:
 
 ```python
 assert store.count_jobs() == 1
-assert store.get_evaluation(original_job_id) is not None
-assert store.has_delivery(original_job_id, "telegram_message")
-assert len(store.list_job_sources(original_job_id)) >= 2
-assert store.get_job(original_job_id).url == "https://jobs.lever.co/acme/abc"
+assert store.get_evaluation(survivor_id) is not None
+assert store.get_material(survivor_id) is not None
+assert store.has_delivery(survivor_id, "telegram_message")
+assert store.current_application_state(survivor_id) == "INTERVIEW"
+assert store.get_job(survivor_id).url == "https://jobs.lever.co/acme/abc"
 ```
 
-- [ ] **Step 2: Write application-history preservation test**
+- [ ] **Step 2: Implement deterministic survivor selection**
 
-Attach an R1 `INTERVIEW` application event to the pre-canonical job. After canonical merge/resolution:
-
-```python
-assert store.current_application_state(original_job_id) == "INTERVIEW"
-```
-
-- [ ] **Step 3: Implement survivor-selection rule**
-
-When a newly discovered canonical job matches an existing legacy job, prefer the **existing job ID as survivor** if it already has evaluations, deliveries, materials, or application events. Update that row's canonical URL/ATS identity rather than switching IDs unnecessarily.
-
-If two existing job rows must be merged, choose survivor deterministically:
+When two stored rows need consolidation, choose survivor in this exact order:
 
 ```text
-1. row with application events
-2. row with evaluations/deliveries/materials
-3. older first_seen_at
-4. lower job id
+row with application events
+row with any evaluations/materials/deliveries
+older first_seen_at
+lower job ID
 ```
 
-- [ ] **Step 4: Run preservation tests**
+When a new canonical candidate matches one existing row, keep the existing row ID and enrich it rather than replacing it.
+
+- [ ] **Step 3: Ensure provenance from both jobs survives merge**
+
+Before deleting duplicate, upsert every duplicate `job_sources` record onto survivor and preserve first/last seen bounds.
+
+- [ ] **Step 4: Run history regressions**
 
 ```bash
 pytest tests/test_store.py tests/test_discovery.py tests/test_gmail_matching.py -v
@@ -988,34 +1144,66 @@ Expected: PASS.
 
 ```bash
 git add src/job_hunter/store.py src/job_hunter/discovery.py tests/test_store.py tests/test_discovery.py
-git commit -m "fix: preserve job history during canonical merges"
+git commit -m "fix: preserve history during canonical job merges"
 ```
 
 ---
 
-### Task 11: Document R2 Configuration and Operational Behavior
+### Task 10: Add R2 Observability and Documentation
 
 **Files:**
+- Modify: `src/job_hunter/discovery.py`
+- Modify: `src/job_hunter/pipeline.py`
 - Modify: `README.md`
-- Modify: `.env.example` only if R2 introduces an environment variable (expected: no new secrets).
-- Test: `tests/test_config.py`
+- Test: `tests/test_discovery.py`
+- Test: `tests/test_pipeline.py`
 
-**Interfaces:** Documentation only; no new runtime behavior.
+**Interfaces:**
+- Finalizes R2 counters/logs; no new external API.
 
-- [ ] **Step 1: Update README architecture**
+- [ ] **Step 1: Add metric assertions**
 
-Document the new flow explicitly:
+Extend discovery tests to assert:
+
+```text
+raw=3
+unique=1
+cross_source_duplicates=2
+canonical_resolved >= 1
+```
+
+Extend pipeline tests to assert one qualifying evaluation increments/logs one company promotion and that watch checks report successes/failures without private content.
+
+- [ ] **Step 2: Emit compact ownership-specific logs**
+
+`discovery.py` logs source counts plus:
+
+```text
+canonical_resolved=<n> canonical_unresolved=<n> cross_source_duplicates=<n>
+```
+
+`pipeline.py` logs:
+
+```text
+companies_promoted=<n> watch_checks=<n> watch_paused=<n>
+```
+
+Never log Gmail bodies, secrets, CV text, or raw Gemini prompts.
+
+- [ ] **Step 3: Document R2 architecture**
+
+README must describe:
 
 ```text
 Gmail + existing sources + YC + specialist-domain search + company watch
   -> canonical resolution + provenance/dedupe
-  -> existing filter/rank/evaluate/deliver pipeline
-  -> strong match may promote company into watchlist
+  -> existing filter/rank/evaluate/deliver
+  -> high_priority/package_match may promote company
 ```
 
-- [ ] **Step 2: Document manual watch seeds**
+- [ ] **Step 4: Document manual watch configuration**
 
-Include a concrete example matching the implemented config schema:
+Include:
 
 ```yaml
 manual_company_watch:
@@ -1026,42 +1214,37 @@ manual_company_watch:
     careers_url: https://example.com/careers
 ```
 
-Explain that manual entries are never automatically deleted and that three failed checks pause them for 24 hours rather than removing them.
+Explain the exact three-failure/24-hour pause rule and that manual entries are preserved.
 
-- [ ] **Step 3: Document specialist source mechanics**
+- [ ] **Step 5: Document specialist source mechanics and privacy boundary**
 
-State that YC is read from public pages, while Wellfound/Welcome to the Jungle/VC boards are discovered through public targeted search and then canonicalized. Explicitly state that R2 does not authenticate to these services.
+State that YC uses public pages; Wellfound, Welcome to the Jungle, and added portfolio domains use public targeted search; R2 performs no authenticated scraping.
 
-- [ ] **Step 4: Document canonical/provenance behavior**
-
-Explain that the bot may display/use an employer ATS URL even when originally discovered through another source, while preserving the original source in SQLite provenance.
-
-- [ ] **Step 5: Run config tests and grep for accidental secrets/placeholders**
+- [ ] **Step 6: Run observability regressions**
 
 ```bash
-pytest tests/test_config.py -v
-grep -R "TBD\|TODO\|GMAIL_REFRESH_TOKEN=.*[^.]" README.md config/search.yml .env.example || true
+pytest tests/test_discovery.py tests/test_pipeline.py tests/test_config.py -v
 ```
 
-Review grep matches manually; legitimate documentation mentioning secret names is allowed, but no values may be committed.
+Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add README.md config/search.yml src/job_hunter/config.py src/job_hunter/models.py tests/test_config.py .env.example
+git add src/job_hunter/discovery.py src/job_hunter/pipeline.py README.md tests/test_discovery.py tests/test_pipeline.py
 git commit -m "docs: document R2 automated discovery"
 ```
 
 ---
 
-### Task 12: Full Verification and Release Readiness
+### Task 11: Full Verification and Release Readiness
 
 **Files:**
-- No planned production-file changes. Fix only defects exposed by verification and commit each focused fix separately.
+- No planned production changes; fix only concrete defects revealed by verification and commit each fix separately.
 
 **Interfaces:** None.
 
-- [ ] **Step 1: Run the complete automated test suite**
+- [ ] **Step 1: Run the complete test suite**
 
 ```bash
 pytest -q
@@ -1069,115 +1252,100 @@ pytest -q
 
 Expected: all tests pass.
 
-- [ ] **Step 2: Run focused R1 regression tests**
+- [ ] **Step 2: Run focused R1 regressions**
 
 ```bash
 pytest tests/test_gmail_auth.py tests/test_gmail_client.py tests/test_gmail_classifier.py tests/test_gmail_matching.py tests/test_gmail_sync.py tests/test_gmail_staged_source.py -q
 ```
 
-Expected: all pass; R2 must not regress Gmail intelligence.
+Expected: all pass.
 
-- [ ] **Step 3: Run focused R2 tests verbosely**
+- [ ] **Step 3: Run focused R2 regressions**
 
 ```bash
-pytest tests/test_job_identity.py tests/test_canonical.py tests/test_watchlist.py tests/test_company_watch_source.py tests/test_yc_source.py tests/test_discovery.py tests/test_store.py tests/test_pipeline.py -v
+pytest tests/test_job_identity.py tests/test_canonical.py tests/test_yc_source.py tests/test_watchlist.py tests/test_company_watch_source.py tests/test_store.py tests/test_discovery.py tests/test_pipeline.py -v
 ```
 
 Expected: all pass.
 
-- [ ] **Step 4: Run a local dry-run smoke test with production-shaped config**
+- [ ] **Step 4: Run repository CI commands locally**
 
-With normal non-secret test/local environment values loaded:
+Read `.github/workflows/ci.yml` and execute exactly the Python install/test/static commands already used there. Do not introduce a new formatter or linter for R2.
+
+- [ ] **Step 5: Run dry-run smoke test**
+
+With the existing local development secrets/profile variables loaded:
 
 ```bash
 JOB_HUNTER_DRY_RUN=1 python -m job_hunter run
 ```
 
-Expected:
+Expected behavior:
 
 ```text
-- existing public discovery still runs
-- YC failure/success is isolated
-- specialist search queries are visible only in normal safe logs
-- company-watch failures do not abort the run
-- canonical resolution failures fall back to original URLs
-- no Telegram message is sent
+existing sources continue if YC or one watch fails
+specialist-domain queries run through normal search
+canonical failures retain original URLs
+watch failures do not abort the run
+Telegram is not called in dry-run mode
 ```
 
-- [ ] **Step 5: Inspect SQLite state after smoke test**
+- [ ] **Step 6: Inspect R2 SQLite state**
 
-Use Python or `sqlite3` locally and verify:
-
-```sql
-SELECT COUNT(*) FROM job_sources;
-SELECT company_name, promotion_source, active, paused_until, consecutive_failures FROM company_watch;
-SELECT id, company, title, url, canonical_url FROM jobs ORDER BY id DESC LIMIT 20;
+```bash
+sqlite3 var/job_hunter.sqlite3 "SELECT COUNT(*) FROM job_sources;"
+sqlite3 var/job_hunter.sqlite3 "SELECT company_name,promotion_source,active,paused_until,consecutive_failures FROM company_watch ORDER BY company_name;"
+sqlite3 var/job_hunter.sqlite3 "SELECT id,company,title,url,canonical_url,ats_provider,ats_board,ats_job_id FROM jobs ORDER BY id DESC LIMIT 20;"
 ```
 
-Confirm no duplicate logical job is obvious among a multi-source fixture/test setup and no Gmail full body data was introduced by R2.
+Confirm multi-source examples are one logical job with multiple provenance rows.
 
-- [ ] **Step 6: Review git diff against the approved spec**
+- [ ] **Step 7: Verify branch scope**
 
 ```bash
 git diff main...HEAD --stat
-git diff main...HEAD -- docs/superpowers/specs/2026-08-31-job-hunter-bot-r2-automated-discovery-design.md
+git status --short
 ```
 
-The approved design doc should remain intact except for explicit user-approved corrections.
-
-- [ ] **Step 7: Run formatting/static checks already used by repository CI**
-
-Inspect `.github/workflows/ci.yml` and run the same commands locally. Do not introduce a new formatter/linter solely for R2.
-
-- [ ] **Step 8: Commit any verification-only fixes individually**
-
-Examples:
-
-```bash
-git add <focused-files>
-git commit -m "fix: preserve provenance during watch discovery"
-```
-
-Do not create a meaningless empty “verification” commit when no changes were needed.
+Expected: only R2 spec/plan plus implementation/test/docs files intentionally required by this plan; working tree clean after commits.
 
 ---
 
 ## Implementation Order and Review Gates
 
-Implement Tasks 1–12 in order. The dependency chain is intentional:
+Execute Tasks 1–11 in order:
 
 ```text
-identity
-  -> persistence
-  -> canonical resolution
-  -> logical dedupe
+identity/types
+  -> persistence/provenance
+  -> canonical resolver
+  -> logical dedupe/merge
   -> specialist discovery
-  -> watch promotion/storage
-  -> watched-company source/health
+  -> watch promotion
+  -> watch discovery/health
   -> pipeline integration
-  -> observability
-  -> legacy-history preservation
-  -> docs
-  -> full verification
+  -> late-canonical history preservation
+  -> observability/docs
+  -> verification
 ```
 
-Recommended reviewer checkpoints:
+Recommended review checkpoints:
 
-1. After Task 4: verify identity/canonical/provenance semantics before adding more sources.
-2. After Task 8: verify the self-expanding watchlist is truly downstream of final strong evaluation.
-3. After Task 10: verify existing R1 evaluation/delivery/application history survives late canonicalization.
-4. After Task 12: final spec-conformance review before PR merge.
+1. After Task 4, verify canonical identity and merge safety before expanding sources.
+2. After Task 8, verify automatic watch promotion is strictly downstream of final strong evaluation.
+3. After Task 9, verify R1 application/evaluation/delivery history survives canonical merging.
+4. After Task 11, perform final spec-conformance review before PR merge.
 
 ## Explicit Non-Goals During Execution
 
-Do not opportunistically add any of the following while implementing this plan:
+Do not add:
 
-- Supabase tables or repositories.
+- Supabase/Postgres persistence.
 - Relay integration.
-- Telegram inbound URL commands.
-- LinkedIn browser login/session automation.
+- Telegram inbound URL ingestion.
+- LinkedIn logged-in automation.
 - Wellfound or Welcome to the Jungle authenticated scraping.
-- A generic crawler framework.
+- A generic recursive crawler framework.
 - Automatic application submission.
 - Application-outcome learning/ranking feedback.
-- Additional specialist boards beyond the configured targeted-domain mechanism unless the spec is revised first.
+- Additional dedicated specialist-board scrapers beyond YC without revising the approved R2 spec.
