@@ -202,6 +202,16 @@ def test_html_anchor_hrefs_are_preserved_in_message_links():
     assert message.links == ["https://jobs.example.com/a"]
 
 
+def test_html_anchor_scheme_only_href_is_not_preserved_in_message_links():
+    http = MessageHttp(
+        message_payload({"mimeType": "text/html", "body": {"data": b64url('<a href="https:foo">Ignore</a>')}})
+    )
+
+    message = GmailClient(http, FakeTokenProvider("token")).get_message("m1")
+
+    assert message.links == []
+
+
 def test_binary_attachment_is_not_loaded():
     http = MessageHttp(
         message_payload(

@@ -109,7 +109,12 @@ class GmailClient:
         for html in html_parts:
             for anchor in BeautifulSoup(html, "html.parser").find_all("a", href=True):
                 href = anchor["href"]
-                if urlparse(href).scheme in {"http", "https"} and href not in links:
+                parsed_href = urlparse(href)
+                if (
+                    parsed_href.scheme in {"http", "https"}
+                    and parsed_href.netloc
+                    and href not in links
+                ):
                     links.append(href)
 
         body = "\n".join(plain_parts)
