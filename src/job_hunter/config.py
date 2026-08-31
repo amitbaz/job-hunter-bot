@@ -12,6 +12,18 @@ from .models import (
     Settings,
     SearchPolicy,
 )
+from .gmail_models import GmailSettings
+
+
+def load_gmail_settings() -> GmailSettings:
+    return GmailSettings(
+        client_id=_require_env("GMAIL_CLIENT_ID"),
+        client_secret=_require_env("GMAIL_CLIENT_SECRET"),
+        refresh_token=_require_env("GMAIL_REFRESH_TOKEN"),
+        gemini_api_key=_require_env("GEMINI_API_KEY"),
+        gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
+        db_path=os.environ.get("JOB_HUNTER_DB_PATH", "var/job_hunter.sqlite3"),
+    )
 
 
 def load_settings(config_path: Path) -> Settings:
