@@ -4,6 +4,34 @@ A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It 
 
 The bot **never submits applications**. It prepares material for you to review and send yourself — see [v1 safety boundary](#v1-safety-boundary) below.
 
+## Project direction
+
+Job Hunter Bot currently runs as a standalone Python application using SQLite for persistence.
+
+The longer-term direction is to share the same Supabase/Postgres backend used by the [Interviewer App](https://github.com/amitbaz/interviewer-app). The migration will happen incrementally and must not block ongoing feature development in either project.
+
+Until an individual persistence domain is explicitly migrated, SQLite remains the production source of truth for Job Hunter Bot. New features should avoid unnecessary coupling to SQLite so that persistence can later move behind shared repository/service boundaries without requiring unrelated feature rewrites.
+
+Target ecosystem:
+
+```text
+Job Hunter Bot  ->  Supabase/Postgres  <-  Interviewer App
+```
+
+This is an evolutionary migration, not a rewrite. Documentation describing the target architecture should not be interpreted as meaning that Supabase is already available or in use by this repository.
+
+## Roadmap
+
+Current product direction includes:
+
+- Improve Telegram job browsing and navigation.
+- Add an explicit application workflow and application status tracking.
+- Gradually migrate persistent job/application data from SQLite to Supabase/Postgres.
+- Share candidate, job, application, and related data with the Interviewer App where appropriate.
+- Move toward a unified job-search -> application -> interview-preparation workflow across both projects.
+
+The exact shared schema and migration phases are intentionally not defined here. Each migration phase should have its own design and implementation plan before code changes begin.
+
 ## Architecture
 
 ```
