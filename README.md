@@ -1,6 +1,6 @@
 # Job Hunter Bot
 
-A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It discovers public remote job postings, deduplicates them in SQLite, evaluates each one against your candidate profile with Gemini, drafts tailored cover letters and renders them as PDFs for strong matches, and delivers a concise digest through Telegram.
+A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It reads Gmail job signals, discovers public remote job postings, deduplicates them in SQLite, evaluates each one against your candidate profile with Gemini, drafts tailored cover letters and renders them as PDFs for strong matches, and delivers a concise digest through Telegram.
 
 The bot **never submits applications**. It prepares material for you to review and send yourself — see [v1 safety boundary](#v1-safety-boundary) below.
 
@@ -24,7 +24,8 @@ all public sources (Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work R
 - `src/job_hunter/cover_letter.py` / `pdf.py` — cover letter drafting and PDF rendering for jobs that clear the bar.
 - `src/job_hunter/store.py` — SQLite persistence (dedup, evaluation cache, delivery tracking) at `var/job_hunter.sqlite3` by default.
 - `src/job_hunter/telegram.py` — outbound-only Telegram Bot API delivery (digest message + PDF documents).
-- `src/job_hunter/pipeline.py` / `cli.py` — orchestration and the `python -m job_hunter run` entrypoint.
+- `src/job_hunter/gmail_sync.py` — read-only Gmail intake that classifies job signals and stages discovered jobs or review-needed events in the shared SQLite state.
+- `src/job_hunter/pipeline.py` / `cli.py` — orchestration and the `python -m job_hunter run` and `python -m job_hunter sync-gmail` entrypoints.
 - `scripts/restore_state.py` — restores the SQLite database from the most recent `job-hunter-state` GitHub Actions artifact before a run, since Actions runners are ephemeral.
 
 SQLite state does not persist on the runner between workflow runs, so the daily workflow restores the previous run's database from an uploaded artifact at the start of each run and re-uploads it at the end (see [Schedule and state persistence](#schedule-and-state-persistence)).
@@ -40,6 +41,9 @@ Set these under **Settings -> Secrets and variables -> Actions** on your fork/re
 | `TELEGRAM_CHAT_ID` | Telegram chat id to deliver the digest/PDFs to |
 | `CANDIDATE_PROFILE_B64` | Base64-encoded plain-text candidate profile/CV |
 | `COVER_LETTER_TEMPLATE_B64` | Base64-encoded plain-text cover letter template |
+| `GMAIL_CLIENT_ID` | OAuth client ID used only by the Gmail intelligence sync |
+| `GMAIL_CLIENT_SECRET` | OAuth client secret used only by the Gmail intelligence sync |
+| `GMAIL_REFRESH_TOKEN` | Refresh token printed by the local Gmail OAuth bootstrap |
 
 Never commit your CV or cover letter template text in plain form. Encode them locally and paste only the base64 output into the GitHub secret:
 
@@ -81,6 +85,29 @@ python -m job_hunter run
 
 This runs discovery, profile extraction, source-diverse shortlisting, evaluation, and cover letter/PDF generation against the local SQLite database at `var/job_hunter.sqlite3` (override with `JOB_HUNTER_DB_PATH`) without sending anything to Telegram.
 
+## Gmail intelligence setup
+
+Gmail intelligence reads job-related messages into the shared SQLite state before normal job discovery. It uses the Gmail read-only OAuth scope: Gmail is never modified, and full email bodies are not stored. The sync stores only the privacy-minimized message metadata and extracted job/application signals needed by the bot.
+
+Create an OAuth client for the Gmail API, then run the local bootstrap with the client credentials available only in your shell:
+
+```bash
+export GMAIL_CLIENT_ID='...'
+export GMAIL_CLIENT_SECRET='...'
+python scripts/gmail_oauth_bootstrap.py
+```
+
+The bootstrap opens the Google consent flow and prints a refresh token. Store that printed value as the GitHub Actions secret `GMAIL_REFRESH_TOKEN`; also add `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET` as GitHub secrets. Never commit any of these values.
+
+Use the following local commands after loading those Gmail variables and `GEMINI_API_KEY`:
+
+```bash
+python -m job_hunter sync-gmail --dry-run
+python -m job_hunter sync-gmail --force-backfill
+```
+
+`--dry-run` classifies and extracts without advancing the Gmail cursor or persisting Gmail-derived state. `--force-backfill` repeats the 12-month backfill idempotently and is non-destructive. A completed sync with individual message errors keeps its cursor so those messages retry on the next sync; setup, authorization, profile, or listing failures return a nonzero status.
+
 ## Manual GitHub Actions dispatch
 
 Go to **Actions -> Daily Job Hunter -> Run workflow** to trigger an on-demand run using the current `main` branch and configured secrets. A manual dispatch always runs the full pipeline (`python -m job_hunter run`, no scheduled-hour gate).
@@ -91,7 +118,8 @@ The daily workflow runs on two cron triggers, `5 7 * * *` and `5 8 * * *` (UTC),
 
 Because GitHub Actions runners are ephemeral, the workflow:
 1. Restores `var/job_hunter.sqlite3` from the most recent non-expired `job-hunter-state` artifact (via `scripts/restore_state.py`, using the run's `GITHUB_TOKEN`) before running — silently starting with a fresh database if none exists.
-2. Uploads the resulting `var/job_hunter.sqlite3` as a `job-hunter-state` artifact (90-day retention) after the run, even if the bot run step failed partway through (as long as the database file was created).
+2. Runs the read-only Gmail intelligence sync before the normal job pipeline. This step is fail-open, so Gmail setup or service failures do not prevent the public-source job run.
+3. Uploads the resulting `var/job_hunter.sqlite3` as a `job-hunter-state` artifact (90-day retention) after the run, even if a prior step failed partway through (as long as the database file was created).
 
 ## Adding ATS board slugs
 

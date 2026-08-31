@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from job_hunter.gmail_models import GmailSettings, GmailSyncSummary
 from job_hunter.models import RunSummary, SearchPolicy, Settings
 from job_hunter import cli
 
@@ -96,3 +97,80 @@ def test_run_unhandled_exception_returns_nonzero(monkeypatch, tmp_path):
     exit_code = cli.main(["run"])
 
     assert exit_code == 1
+
+
+def test_parser_accepts_sync_gmail_dry_run():
+    args = cli.build_parser().parse_args(["sync-gmail", "--dry-run"])
+
+    assert args.command == "sync-gmail"
+    assert args.dry_run is True
+    assert args.force_backfill is False
+
+
+def test_parser_accepts_sync_gmail_force_backfill():
+    args = cli.build_parser().parse_args(["sync-gmail", "--force-backfill"])
+
+    assert args.command == "sync-gmail"
+    assert args.dry_run is False
+    assert args.force_backfill is True
+
+
+def _gmail_settings(tmp_path):
+    return GmailSettings(
+        client_id="client",
+        client_secret="secret",
+        refresh_token="refresh",
+        gemini_api_key="gemini",
+        db_path=str(tmp_path / "gmail.sqlite3"),
+    )
+
+
+def _patch_gmail_sync_dependencies(monkeypatch, tmp_path, run):
+    class SyncService:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def sync(self, now, *, dry_run, force_backfill):
+            return run(now=now, dry_run=dry_run, force_backfill=force_backfill)
+
+    monkeypatch.setattr(cli, "load_gmail_settings", lambda: _gmail_settings(tmp_path), raising=False)
+    monkeypatch.setattr(cli, "HttpClient", object, raising=False)
+    monkeypatch.setattr(cli, "GoogleOAuthTokenProvider", lambda settings: object(), raising=False)
+    monkeypatch.setattr(cli, "GmailClient", lambda http, token_provider: object(), raising=False)
+    monkeypatch.setattr(cli, "GeminiClient", lambda api_key, model, http: object(), raising=False)
+    monkeypatch.setattr(cli, "JobStore", lambda path: object(), raising=False)
+    monkeypatch.setattr(cli, "GmailSyncService", SyncService, raising=False)
+
+
+def test_sync_gmail_does_not_load_candidate_profile_settings(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli,
+        "load_settings",
+        lambda path: (_ for _ in ()).throw(AssertionError("must not load candidate profile settings")),
+    )
+    _patch_gmail_sync_dependencies(
+        monkeypatch, tmp_path, lambda **kwargs: GmailSyncSummary()
+    )
+
+    assert cli.main(["sync-gmail"]) == 0
+
+
+def test_sync_gmail_returns_nonzero_on_fatal_auth_error(monkeypatch, tmp_path):
+    _patch_gmail_sync_dependencies(
+        monkeypatch,
+        tmp_path,
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("Gmail authorization failed")),
+    )
+
+    assert cli.main(["sync-gmail"]) == 1
+
+
+def test_sync_gmail_returns_zero_when_service_completes_with_message_errors(
+    monkeypatch, tmp_path, caplog
+):
+    _patch_gmail_sync_dependencies(
+        monkeypatch, tmp_path, lambda **kwargs: GmailSyncSummary(errors=2)
+    )
+
+    assert cli.main(["sync-gmail"]) == 0
+    assert any("will retry" in record.message for record in caplog.records)

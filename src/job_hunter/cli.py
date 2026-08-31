@@ -5,8 +5,14 @@ import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-from job_hunter.config import load_settings
+from job_hunter.config import load_gmail_settings, load_settings
+from job_hunter.gemini import GeminiClient
+from job_hunter.gmail_auth import GoogleOAuthTokenProvider
+from job_hunter.gmail_client import GmailClient
+from job_hunter.gmail_sync import GmailSyncService
+from job_hunter.http import HttpClient
 from job_hunter.pipeline import cover_letter_output_dir, run_pipeline, should_run_scheduled
+from job_hunter.store import JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +29,18 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--scheduled", action="store_true", help="Only proceed at the configured scheduled hour")
     run_parser.add_argument("--config", default="config/search.yml", help="Path to search.yml")
 
+    sync_parser = subparsers.add_parser("sync-gmail", help="Read Gmail job signals into shared state")
+    sync_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Classify/extract without persisting Gmail-derived state",
+    )
+    sync_parser.add_argument(
+        "--force-backfill",
+        action="store_true",
+        help="Repeat the 12-month backfill idempotently",
+    )
+
     return parser
 
 
@@ -32,6 +50,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
+        if args.command == "sync-gmail":
+            return _sync_gmail(args)
         return _run(args)
     except Exception:
         logger.exception("job hunter run failed")
@@ -63,4 +83,37 @@ def _run(args: argparse.Namespace) -> int:
         summary.skipped,
         summary.errors,
     )
+    return 0
+
+
+def _sync_gmail(args: argparse.Namespace) -> int:
+    settings = load_gmail_settings()
+    Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
+
+    http = HttpClient()
+    gmail = GmailClient(http, GoogleOAuthTokenProvider(settings))
+    gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
+    service = GmailSyncService(gmail=gmail, gemini=gemini, store=JobStore(settings.db_path))
+    summary = service.sync(
+        datetime.now(timezone.utc),
+        dry_run=args.dry_run,
+        force_backfill=args.force_backfill,
+    )
+    logger.info(
+        "Gmail sync complete: fetched=%d processed=%d job_alerts=%d "
+        "application_events=%d review_needed=%d irrelevant=%d errors=%d",
+        summary.fetched,
+        summary.processed,
+        summary.job_alerts,
+        summary.application_events,
+        summary.review_needed,
+        summary.irrelevant,
+        summary.errors,
+    )
+    if summary.errors:
+        logger.warning(
+            "Gmail sync completed with %d per-message errors; the cursor was retained and "
+            "those messages will retry on the next sync.",
+            summary.errors,
+        )
     return 0
