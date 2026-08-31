@@ -1,0 +1,294 @@
+from __future__ import annotations
+
+import logging
+from dataclasses import replace
+from datetime import datetime, timedelta
+
+from job_hunter.gmail_classifier import classify_email, source_candidate_key
+from job_hunter.gmail_client import GmailHistoryExpired
+from job_hunter.gmail_matching import match_job
+from job_hunter.gmail_models import (
+    AUTO_CONFIDENCE_THRESHOLD,
+    DISCOVERY_FRESHNESS_DAYS,
+    GmailClassification,
+    GmailMessage,
+    GmailSyncSummary,
+)
+
+
+_LOGGER = logging.getLogger(__name__)
+_QUERY_TERMS = (
+    '{application interview recruiter hiring "job alert" position '
+    '"technical assessment" "coding challenge" offer}'
+)
+_LIFECYCLE_KINDS = frozenset(
+    {"RECRUITER_CONTACT", "APPLIED", "INTERVIEW", "TECHNICAL", "OFFER", "REJECTED"}
+)
+
+
+def _query_after(year: int, month: int, day: int) -> str:
+    return f"after:{year:04d}/{month:02d}/{day:02d} {_QUERY_TERMS}"
+
+
+def build_backfill_query(now: datetime) -> str:
+    year = now.year - 1
+    day = min(now.day, 28) if now.month == 2 else now.day
+    return _query_after(year, now.month, day)
+
+
+class GmailSyncService:
+    def __init__(self, *, gmail, gemini, store) -> None:
+        self.gmail = gmail
+        self.gemini = gemini
+        self.store = store
+        self._backfill_now: datetime | None = None
+
+    def sync(
+        self,
+        now: datetime,
+        dry_run: bool = False,
+        force_backfill: bool = False,
+    ) -> GmailSyncSummary:
+        summary = GmailSyncSummary()
+        account_id, checkpoint_history_id = self.gmail.get_profile()
+        state = self.store.get_gmail_sync_state(account_id)
+
+        if state is None or force_backfill:
+            message_ids = self._search_message_ids(build_backfill_query(now))
+            self._backfill_now = now
+            try:
+                had_hard_errors = self._process_message_ids(
+                    message_ids,
+                    summary=summary,
+                    dry_run=dry_run,
+                )
+            finally:
+                self._backfill_now = None
+            if not dry_run and not had_hard_errors:
+                self.store.save_gmail_sync_state(
+                    account_id=account_id,
+                    history_id=checkpoint_history_id,
+                    last_successful_sync_at=now.isoformat(),
+                    backfill_completed_at=now.isoformat(),
+                )
+        else:
+            self._sync_incremental(
+                state=state,
+                checkpoint_history_id=checkpoint_history_id,
+                now=now,
+                dry_run=dry_run,
+                summary=summary,
+            )
+
+        self._log_summary(summary)
+        return summary
+
+    def _sync_incremental(
+        self,
+        *,
+        state,
+        checkpoint_history_id: str,
+        now: datetime,
+        dry_run: bool,
+        summary: GmailSyncSummary,
+    ) -> None:
+        saved_history_id = state["history_id"]
+        recovered_from_expiry = False
+        try:
+            message_ids, next_history_id = self._list_history_message_ids(
+                saved_history_id
+            )
+        except GmailHistoryExpired:
+            recovered_from_expiry = True
+            last_successful = (
+                datetime.fromisoformat(state["last_successful_sync_at"])
+                if state["last_successful_sync_at"]
+                else now
+            )
+            overlap_start = last_successful - timedelta(days=1)
+            message_ids = self._search_message_ids(
+                _query_after(overlap_start.year, overlap_start.month, overlap_start.day)
+            )
+            next_history_id = checkpoint_history_id
+
+        had_hard_errors = self._process_message_ids(
+            message_ids,
+            summary=summary,
+            dry_run=dry_run,
+        )
+        if dry_run or had_hard_errors:
+            return
+
+        self.store.save_gmail_sync_state(
+            account_id=state["account_id"],
+            history_id=(checkpoint_history_id if recovered_from_expiry else next_history_id),
+            last_successful_sync_at=now.isoformat(),
+            backfill_completed_at=state["backfill_completed_at"],
+        )
+
+    def process_message(
+        self, message: GmailMessage, dry_run: bool
+    ) -> GmailClassification:
+        classification = classify_email(message, self.gemini)
+        effective = classification
+
+        if dry_run:
+            _LOGGER.info(
+                "gmail_dry_run message_id=%s classification=%s extracted_jobs=%s",
+                message.message_id,
+                classification.kind,
+                len(classification.jobs),
+            )
+            if classification.kind in _LIFECYCLE_KINDS:
+                effective, _ = self._match_classification(message, classification)
+            return effective
+
+        should_stage_jobs = classification.kind == "RECRUITER_CONTACT" or (
+            classification.kind == "JOB_ALERT" and self._alert_is_fresh(message)
+        )
+        if should_stage_jobs:
+            for job in classification.jobs:
+                self.store.stage_inbound_job(
+                    message.message_id,
+                    source_candidate_key(job),
+                    job,
+                )
+
+        if classification.kind in _LIFECYCLE_KINDS:
+            effective, job_id = self._match_classification(message, classification)
+            self._save_event(message, effective, job_id)
+        elif classification.kind == "REVIEW_NEEDED":
+            self._save_event(message, classification, None)
+
+        self.store.record_gmail_message(
+            message_id=message.message_id,
+            thread_id=message.thread_id,
+            sender=message.sender,
+            subject=message.subject,
+            occurred_at=message.sent_at.isoformat(),
+            classification=effective.kind,
+            confidence=effective.confidence,
+            rationale=effective.rationale,
+        )
+        return effective
+
+    def _alert_is_fresh(self, message: GmailMessage) -> bool:
+        if self._backfill_now is None:
+            return True
+        return self._backfill_now - message.sent_at <= timedelta(
+            days=DISCOVERY_FRESHNESS_DAYS
+        )
+
+    def _match_classification(
+        self,
+        message: GmailMessage,
+        classification: GmailClassification,
+    ) -> tuple[GmailClassification, int | None]:
+        match = match_job(self.store, classification, message)
+        if (
+            match.job_id is None
+            or match.ambiguous
+            or classification.confidence < AUTO_CONFIDENCE_THRESHOLD
+        ):
+            return replace(classification, kind="REVIEW_NEEDED"), match.job_id
+        return classification, match.job_id
+
+    def _save_event(
+        self,
+        message: GmailMessage,
+        classification: GmailClassification,
+        job_id: int | None,
+    ) -> None:
+        self.store.save_application_event(
+            job_id=job_id,
+            event_type=classification.kind,
+            occurred_at=message.sent_at.isoformat(),
+            source_message_id=message.message_id,
+            source_thread_id=message.thread_id,
+            confidence=classification.confidence,
+            company=classification.company,
+            role_title=classification.role_title,
+            rationale=classification.rationale,
+        )
+
+    def _search_message_ids(self, query: str) -> list[str]:
+        message_ids: list[str] = []
+        seen: set[str] = set()
+        page_token = None
+        while True:
+            page = self.gmail.list_message_ids(query, page_token=page_token)
+            for message_id in page.message_ids:
+                if message_id not in seen:
+                    seen.add(message_id)
+                    message_ids.append(message_id)
+            page_token = page.next_page_token
+            if page_token is None:
+                return message_ids
+
+    def _list_history_message_ids(self, start_history_id: str) -> tuple[list[str], str]:
+        message_ids: list[str] = []
+        seen: set[str] = set()
+        newest_history_id = start_history_id
+        page_token = None
+        while True:
+            page = self.gmail.list_history(
+                start_history_id,
+                page_token=page_token,
+            )
+            newest_history_id = page.history_id
+            for message_id in page.message_ids:
+                if message_id not in seen:
+                    seen.add(message_id)
+                    message_ids.append(message_id)
+            page_token = page.next_page_token
+            if page_token is None:
+                return message_ids, newest_history_id
+
+    def _process_message_ids(
+        self,
+        message_ids: list[str],
+        *,
+        summary: GmailSyncSummary,
+        dry_run: bool,
+    ) -> bool:
+        had_hard_errors = False
+        for message_id in message_ids:
+            summary.fetched += 1
+            if not dry_run and self.store.has_processed_gmail_message(message_id):
+                continue
+            try:
+                classification = self.process_message(
+                    self.gmail.get_message(message_id),
+                    dry_run=dry_run,
+                )
+            except Exception:
+                _LOGGER.exception("gmail_message_processing_failed message_id=%s", message_id)
+                summary.errors += 1
+                had_hard_errors = True
+                continue
+
+            summary.processed += 1
+            if classification.kind == "JOB_ALERT":
+                summary.job_alerts += 1
+            elif classification.kind == "REVIEW_NEEDED":
+                summary.review_needed += 1
+            elif classification.kind == "IRRELEVANT":
+                summary.irrelevant += 1
+            elif classification.kind in _LIFECYCLE_KINDS:
+                summary.application_events += 1
+        return had_hard_errors
+
+    @staticmethod
+    def _log_summary(summary: GmailSyncSummary) -> None:
+        _LOGGER.info(
+            "gmail_fetched=%s gmail_processed=%s gmail_job_alerts=%s "
+            "gmail_application_events=%s gmail_review_needed=%s "
+            "gmail_irrelevant=%s gmail_errors=%s",
+            summary.fetched,
+            summary.processed,
+            summary.job_alerts,
+            summary.application_events,
+            summary.review_needed,
+            summary.irrelevant,
+            summary.errors,
+        )
