@@ -23,6 +23,7 @@
 - OAuth credentials are GitHub Secrets only and must never enter SQLite or repository files.
 - `sync-gmail --dry-run` may read/classify/extract but must not persist jobs, staged candidates, application events, delivery state, processed-message state, or Gmail cursors.
 - Gmail failures are fail-open for the daily workflow; the existing public-source job search still runs.
+- A hard per-message fetch/persistence error must not advance the Gmail history cursor or mark a backfill complete; already-successful messages remain safe to replay because message IDs are idempotent.
 - Release 1 does not add company watchlists, new ATS adapters, Telegram inbound URLs, learning-to-rank, Pub/Sub, Relay integration, or application submission.
 
 ---
@@ -31,27 +32,27 @@
 
 ### New production files
 
-- `src/job_hunter/gmail_models.py` — Gmail-only domain types and constants: decoded message, extracted job, classification, sync state/summary.
+- `src/job_hunter/gmail_models.py` — Gmail-only domain types/constants: decoded message, extracted links/jobs, classification, settings, sync summary.
 - `src/job_hunter/gmail_auth.py` — read-only OAuth token provider used by the runtime Gmail client.
-- `src/job_hunter/gmail_client.py` — Gmail REST API calls, pagination models, history-expiry handling, MIME/body decoding.
-- `src/job_hunter/gmail_classifier.py` — deterministic job-signal rules, LinkedIn/job-link extraction, Gemini fallback, confidence gating.
+- `src/job_hunter/gmail_client.py` — Gmail REST calls, pagination/history handling, MIME decoding, and in-memory HTML-link extraction.
+- `src/job_hunter/gmail_classifier.py` — deterministic job-signal rules, job extraction, Gemini fallback, confidence gating.
 - `src/job_hunter/gmail_matching.py` — ordered job matching and derived application-state calculation.
-- `src/job_hunter/gmail_sync.py` — backfill/incremental orchestration, idempotent message processing, staging/events, sync metrics.
-- `src/job_hunter/sources/gmail_staged.py` — DB-backed `JobSource` exposing only staged candidates not yet materialized as Gmail-source jobs.
+- `src/job_hunter/gmail_sync.py` — backfill/incremental orchestration, idempotent processing, staging/events, sync metrics.
+- `src/job_hunter/sources/gmail_staged.py` — DB-backed `JobSource` exposing staged candidates not already represented in `jobs`.
 - `scripts/gmail_oauth_bootstrap.py` — one-time local interactive OAuth helper that prints a refresh token.
 
 ### Modified production files
 
 - `pyproject.toml` — add Google OAuth dependencies.
-- `src/job_hunter/models.py` — add `ReviewItem` only; keep Gmail-specific types out of the general model module.
-- `src/job_hunter/config.py` — add a Gmail-specific settings loader without making normal `run` depend on Gmail secrets.
-- `src/job_hunter/store.py` — add Gmail sync/message/staging/application-event/review-delivery tables and query methods.
-- `src/job_hunter/pipeline.py` — append `GmailStagedSource` after the store exists; deliver pending review items after normal job delivery.
+- `src/job_hunter/models.py` — add `ReviewItem` only; Gmail-specific domain types stay in `gmail_models.py`.
+- `src/job_hunter/config.py` — add Gmail-specific settings loader without making normal `run` require Gmail secrets.
+- `src/job_hunter/store.py` — add Gmail sync/message/staging/application-event/review-delivery tables and methods.
+- `src/job_hunter/pipeline.py` — append `GmailStagedSource` after store creation; deliver pending Gmail review items.
 - `src/job_hunter/telegram.py` — format Gmail `REVIEW_NEEDED` items.
 - `src/job_hunter/cli.py` — add `sync-gmail`, `--dry-run`, and `--force-backfill`.
-- `.github/workflows/daily.yml` — run Gmail sync before normal job search with `continue-on-error: true`.
-- `.env.example` — document Gmail environment variable names without values.
-- `README.md` — document OAuth bootstrap, secrets, Gmail behavior, dry-run/backfill, and failure semantics.
+- `.github/workflows/daily.yml` — run Gmail sync before normal search with `continue-on-error: true`.
+- `.env.example` — document Gmail variable names without values.
+- `README.md` — document OAuth bootstrap, secrets, dry-run/backfill, privacy, and fail-open behavior.
 
 ### New tests
 
@@ -72,7 +73,7 @@
 
 ---
 
-### Task 1: Gmail Domain Types, Runtime Settings, and OAuth Bootstrap
+### Task 1: Gmail Domain Types, Settings, and OAuth Bootstrap
 
 **Files:**
 - Create: `src/job_hunter/gmail_models.py`
@@ -85,8 +86,11 @@
 
 **Interfaces:**
 - Produces: `GMAIL_READONLY_SCOPE: str`
+- Produces: `AUTO_CONFIDENCE_THRESHOLD = 0.90`
+- Produces: `MATCH_RECENCY_DAYS = 120`
+- Produces: `DISCOVERY_FRESHNESS_DAYS = 14`
 - Produces: `GmailSettings(client_id, client_secret, refresh_token, gemini_api_key, gemini_model, db_path)`
-- Produces: `GmailMessage(message_id, thread_id, sender, subject, sent_at, snippet, body)`
+- Produces: `GmailMessage(message_id, thread_id, sender, subject, sent_at, snippet, body, links)`
 - Produces: `ExtractedJob(source_platform, source_job_id, url, company, title, location, remote, description, index)`
 - Produces: `GmailClassification(kind, confidence, company, role_title, source_job_id, job_urls, jobs, rationale)`
 - Produces: `GmailSyncSummary(fetched, processed, job_alerts, application_events, review_needed, irrelevant, errors)`
@@ -94,9 +98,9 @@
 - Produces: `GoogleOAuthTokenProvider(settings: GmailSettings).get_access_token() -> str`
 - Produces: `load_gmail_settings() -> GmailSettings`
 
-- [ ] **Step 1: Write failing domain/config tests**
+- [ ] **Step 1: Write failing settings tests**
 
-Add tests proving Gmail settings are independent of CV/Telegram settings and missing Gmail secrets fail explicitly:
+Add to `tests/test_config.py`:
 
 ```python
 from job_hunter.config import load_gmail_settings
@@ -122,19 +126,17 @@ def test_load_gmail_settings_requires_refresh_token(monkeypatch):
         load_gmail_settings()
 ```
 
-- [ ] **Step 2: Run the focused tests and verify failure**
-
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_config.py -q
 ```
 
-Expected: FAIL because `load_gmail_settings` and `GmailSettings` do not exist.
+Expected: FAIL because `load_gmail_settings`/`GmailSettings` do not exist.
 
-- [ ] **Step 3: Add Gmail types and settings loader**
+- [ ] **Step 3: Add Gmail types/constants and settings loader**
 
-Create `gmail_models.py` with these concrete values/types:
+Create `gmail_models.py`:
 
 ```python
 from dataclasses import dataclass, field
@@ -147,6 +149,7 @@ SUPPORTED_KINDS = frozenset({
 })
 AUTO_CONFIDENCE_THRESHOLD = 0.90
 MATCH_RECENCY_DAYS = 120
+DISCOVERY_FRESHNESS_DAYS = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +171,7 @@ class GmailMessage:
     sent_at: datetime
     snippet: str
     body: str
+    links: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,24 +210,24 @@ class GmailSyncSummary:
     errors: int = 0
 ```
 
-Add `load_gmail_settings()` in `config.py` using `_require_env()` for `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, and `GEMINI_API_KEY`, while reading `GEMINI_MODEL` and `JOB_HUNTER_DB_PATH` with the same defaults as normal settings.
+Add `load_gmail_settings()` in `config.py` using `_require_env()` for `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, and `GEMINI_API_KEY`, plus current defaults for `GEMINI_MODEL`/`JOB_HUNTER_DB_PATH`.
 
-- [ ] **Step 4: Add OAuth dependencies and token provider test**
+- [ ] **Step 4: Add OAuth dependencies and failing provider test**
 
-Update `pyproject.toml` dependencies with:
+Update `pyproject.toml` dependencies:
 
 ```toml
 "google-auth>=2.40",
 "google-auth-oauthlib>=1.2",
 ```
 
-Create `tests/test_gmail_auth.py` using a fake credentials object and assert the provider refreshes when needed and returns the token. Structure `GoogleOAuthTokenProvider` so credentials construction is injectable in tests rather than making network calls.
+Create a fake credentials object in `tests/test_gmail_auth.py`; assert the provider refreshes expired credentials and returns the cached token afterward.
 
-- [ ] **Step 5: Implement read-only OAuth provider and bootstrap script**
+- [ ] **Step 5: Implement read-only token provider and bootstrap script**
 
-`gmail_auth.py` must construct Google credentials with exactly one scope, `GMAIL_READONLY_SCOPE`, and refresh through `google.auth.transport.requests.Request`.
+`gmail_auth.py` must construct Google credentials with exactly `[GMAIL_READONLY_SCOPE]`. The provider object retains credentials in memory so a valid access token is reused until refresh is required.
 
-The bootstrap script must use this client configuration and print only the refresh token on success:
+Bootstrap code:
 
 ```python
 client_config = {
@@ -244,32 +248,24 @@ print(credentials.refresh_token)
 
 - [ ] **Step 6: Run tests and commit**
 
-Run:
-
 ```bash
 pytest tests/test_config.py tests/test_gmail_auth.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add pyproject.toml src/job_hunter/config.py src/job_hunter/gmail_models.py src/job_hunter/gmail_auth.py scripts/gmail_oauth_bootstrap.py tests/test_config.py tests/test_gmail_auth.py
 git commit -m "feat: add Gmail OAuth configuration"
 ```
 
+Expected: tests PASS before commit.
+
 ---
 
-### Task 2: Gmail REST Client and Safe Message Decoding
+### Task 2: Gmail REST Client, MIME Decoding, and Link Preservation
 
 **Files:**
 - Create: `src/job_hunter/gmail_client.py`
 - Test: `tests/test_gmail_client.py`
 
 **Interfaces:**
-- Consumes: `AccessTokenProvider.get_access_token() -> str`
-- Consumes: `GmailMessage`
+- Consumes: `AccessTokenProvider`, `GmailMessage`
 - Produces: `GmailPage(message_ids: list[str], next_page_token: str | None)`
 - Produces: `GmailHistoryPage(message_ids: list[str], history_id: str, next_page_token: str | None)`
 - Produces: `GmailHistoryExpired`
@@ -278,9 +274,9 @@ git commit -m "feat: add Gmail OAuth configuration"
 - Produces: `GmailClient.list_history(start_history_id, page_token=None) -> GmailHistoryPage`
 - Produces: `GmailClient.get_message(message_id) -> GmailMessage`
 
-- [ ] **Step 1: Write failing API/pagination tests**
+- [ ] **Step 1: Write failing REST/pagination tests**
 
-Use the repository's existing fake HTTP-response style. Cover profile, search pagination, history pagination, and expired history:
+Cover profile, search pagination, history pagination, bearer auth, and history expiry:
 
 ```python
 def test_list_message_ids_returns_ids_and_page_token():
@@ -293,15 +289,12 @@ def test_list_message_ids_returns_ids_and_page_token():
 
 
 def test_history_404_raises_history_expired():
-    http = FakeHttpResponse(status_code=404, payload={"error": {"message": "historyId too old"}})
-    client = GmailClient(http=http, token_provider=FakeTokenProvider("token"))
+    client = GmailClient(http=Fake404Http(), token_provider=FakeTokenProvider("token"))
     with pytest.raises(GmailHistoryExpired):
         client.list_history("123")
 ```
 
-- [ ] **Step 2: Run focused tests and verify failure**
-
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_gmail_client.py -q
@@ -309,70 +302,66 @@ pytest tests/test_gmail_client.py -q
 
 Expected: FAIL because `gmail_client.py` does not exist.
 
-- [ ] **Step 3: Implement Gmail REST calls**
+- [ ] **Step 3: Implement read-only Gmail endpoints**
 
-Use these endpoints only:
+Use only:
 
-```python
-_BASE = "https://gmail.googleapis.com/gmail/v1/users/me"
-# GET {_BASE}/profile
-# GET {_BASE}/messages?q=...&maxResults=100&pageToken=...
-# GET {_BASE}/messages/{message_id}?format=full
-# GET {_BASE}/history?startHistoryId=...&historyTypes=messageAdded&maxResults=100&pageToken=...
+```text
+GET https://gmail.googleapis.com/gmail/v1/users/me/profile
+GET https://gmail.googleapis.com/gmail/v1/users/me/messages
+GET https://gmail.googleapis.com/gmail/v1/users/me/messages/{id}?format=full
+GET https://gmail.googleapis.com/gmail/v1/users/me/history?historyTypes=messageAdded
 ```
 
-Every request must send `Authorization: Bearer <token>`. `list_history` must deduplicate message IDs appearing multiple times in one response. A 404 from history becomes `GmailHistoryExpired`; other HTTP errors use `raise_for_status()`.
+Every call sends `Authorization: Bearer <token>`. Search/history page size is 100. Deduplicate history message IDs per page. Convert a history 404 into `GmailHistoryExpired`; other HTTP failures call `raise_for_status()`.
 
-- [ ] **Step 4: Write failing MIME-decoding tests**
+- [ ] **Step 4: Write failing MIME/link tests**
 
 Cover:
 
 ```python
 def test_decode_prefers_plain_text_over_html(): ...
 def test_decode_falls_back_to_stripped_html(): ...
-def test_decode_recurses_nested_multipart_payload(): ...
-def test_decode_uses_snippet_when_body_is_empty(): ...
-def test_decode_does_not_return_attachment_content(): ...
+def test_decode_recurses_nested_multipart(): ...
+def test_decode_uses_snippet_when_body_empty(): ...
+def test_html_anchor_hrefs_are_preserved_in_message_links(): ...
+def test_binary_attachment_is_not_loaded(): ...
 ```
 
-Use base64url fixture helper:
+Use:
 
 ```python
 def b64url(text: str) -> str:
     return base64.urlsafe_b64encode(text.encode()).decode().rstrip("=")
 ```
 
-- [ ] **Step 5: Implement safe decoding**
+- [ ] **Step 5: Implement safe body decoding plus in-memory links**
 
 `get_message()` must:
 
 1. Normalize headers case-insensitively.
 2. Parse `From`, `Subject`, and Gmail `internalDate` into UTC `datetime`.
-3. Recursively collect only inline `text/plain` and `text/html` payload bodies where `body.data` is present.
-4. Prefer joined plain-text parts; otherwise strip HTML with BeautifulSoup.
-5. Fall back to `snippet` if there is no inline textual body.
-6. Never fetch attachment IDs in Release 1.
+3. Recursively inspect MIME parts.
+4. Decode inline `text/plain` and `text/html` `body.data` only; never fetch binary attachments.
+5. Before stripping HTML, collect unique absolute `http://`/`https://` anchor `href` values into `GmailMessage.links`.
+6. Prefer joined plain-text parts as `body`; otherwise strip HTML with BeautifulSoup.
+7. Fall back to `snippet` when there is no inline textual body.
+
+This preserves LinkedIn/ATS URLs without persisting raw HTML.
 
 - [ ] **Step 6: Run tests and commit**
 
-Run:
-
 ```bash
 pytest tests/test_gmail_client.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add src/job_hunter/gmail_client.py tests/test_gmail_client.py
 git commit -m "feat: add Gmail read-only client"
 ```
 
+Expected: PASS.
+
 ---
 
-### Task 3: Gmail Persistence, Staging, Events, and Idempotency
+### Task 3: Gmail Persistence, Staging, Events, and Review Delivery State
 
 **Files:**
 - Modify: `src/job_hunter/store.py`
@@ -385,14 +374,14 @@ git commit -m "feat: add Gmail read-only client"
 - Produces: `JobStore.save_gmail_sync_state(account_id, history_id, last_successful_sync_at, backfill_completed_at) -> None`
 - Produces: `JobStore.stage_inbound_job(source_message_id, source_candidate_key, job: ExtractedJob) -> int`
 - Produces: `JobStore.list_unmaterialized_inbound_jobs() -> list[sqlite3.Row]`
-- Produces: `JobStore.save_application_event(...) -> int | None`
+- Produces: `JobStore.save_application_event(...) -> int`
 - Produces: `JobStore.list_application_events(job_id: int) -> list[sqlite3.Row]`
 - Produces: `JobStore.pending_review_events() -> list[sqlite3.Row]`
 - Produces: `JobStore.mark_review_delivered(event_ids: list[int], telegram_message_id: str) -> None`
 
-- [ ] **Step 1: Write schema/idempotency tests**
+- [ ] **Step 1: Write failing schema/idempotency tests**
 
-Add tests that initialize a fresh DB and assert all new tables exist. Add duplicate-message/event/candidate tests:
+Fresh DB tests must assert the new tables exist. Add duplicate event/candidate tests:
 
 ```python
 def test_application_event_source_message_is_idempotent(tmp_path):
@@ -407,25 +396,20 @@ def test_application_event_source_message_is_idempotent(tmp_path):
         source_message_id="m1", source_thread_id="t1", confidence=0.4,
         company="Acme", role_title="Frontend Engineer", rationale="ambiguous",
     )
-    assert first is not None
     assert second == first
 ```
 
-Also assert duplicate `(origin, source_message_id, source_candidate_key)` returns the existing inbound candidate row instead of inserting another.
+Also assert duplicate `(origin, source_message_id, source_candidate_key)` updates `last_seen_at` and returns the existing candidate ID.
 
-- [ ] **Step 2: Run focused tests and verify failure**
-
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_store.py -q
 ```
 
-Expected: FAIL because Gmail persistence methods/tables do not exist.
+Expected: FAIL because Gmail tables/methods do not exist.
 
-- [ ] **Step 3: Add Gmail tables without altering existing tables**
-
-Add `CREATE TABLE IF NOT EXISTS` statements for:
+- [ ] **Step 3: Add tables without altering existing schema semantics**
 
 ```sql
 CREATE TABLE IF NOT EXISTS gmail_sync_state (
@@ -490,45 +474,49 @@ CREATE TABLE IF NOT EXISTS review_deliveries (
 );
 ```
 
-Do not add full email body columns.
+No table contains full email body or OAuth credentials.
 
-- [ ] **Step 4: Implement store methods transactionally**
+- [ ] **Step 4: Implement transactional store methods**
 
 Rules:
 
-- `record_gmail_message` uses `INSERT OR IGNORE` and never stores body text.
-- `stage_inbound_job` updates `last_seen_at` when the same candidate key is seen again.
-- `save_application_event` returns the existing event ID when the message ID already exists.
-- `pending_review_events` returns only `REVIEW_NEEDED` events absent from `review_deliveries`, oldest first.
-- `save_gmail_sync_state` updates timestamps atomically and never advances state from dry-run code paths.
+- `record_gmail_message` uses `INSERT OR IGNORE` and receives no body parameter.
+- `stage_inbound_job` uses `INSERT ... ON CONFLICT(origin, source_message_id, source_candidate_key) DO UPDATE SET last_seen_at=excluded.last_seen_at`.
+- `save_application_event` returns the existing ID on duplicate `source_message_id`.
+- `pending_review_events` joins `gmail_messages` on `source_message_id` to expose the email subject, excludes delivered events, and sorts by `occurred_at`, then event ID.
+- `save_gmail_sync_state` is never called from dry-run branches.
 
-- [ ] **Step 5: Add an unmaterialized-candidate query**
+- [ ] **Step 5: Write failing cross-source materialization tests**
 
-`list_unmaterialized_inbound_jobs()` must exclude candidates already represented by a Gmail-source job created from the same stable candidate key. Use the convention implemented in Task 7:
+Create three tests for `list_unmaterialized_inbound_jobs()`:
 
-```text
-Job.source = "gmail:<source_platform>"
-Job.source_job_id = source_candidate_key
+```python
+def test_candidate_not_emitted_when_any_job_has_same_canonical_url(tmp_path): ...
+def test_candidate_not_emitted_when_url_missing_but_identity_matches(tmp_path): ...
+def test_candidate_emitted_when_no_existing_job_matches(tmp_path): ...
 ```
 
-The query can compare `jobs.source` and `jobs.source_job_id` directly, avoiding a new staging-consumed column.
+Use the same identity definition as `discovery.candidate_identity_key`: normalized `(company, title, location)`.
 
-- [ ] **Step 6: Run tests and commit**
+- [ ] **Step 6: Implement cross-source materialization filtering**
 
-Run:
+Inside `list_unmaterialized_inbound_jobs()`, load staged rows and the lightweight existing-job fields `source`, `source_job_id`, `url`, `company`, `title`, `location`. Exclude a staged candidate if any existing job satisfies, in order:
+
+1. same Gmail materialization identity: `job.source == f"gmail:{source_platform}"` and `job.source_job_id == source_candidate_key`;
+2. both URLs present and `canonicalize_url(job.url) == canonicalize_url(candidate.url)`;
+3. candidate identity is not empty and normalized `(company, title, location)` exactly matches.
+
+This mirrors current in-run deduplication enough to prevent a richer public-source winner from causing the Gmail staging row to reappear on later runs.
+
+- [ ] **Step 7: Run tests and commit**
 
 ```bash
 pytest tests/test_store.py -q
-```
-
-Expected: PASS, including existing persistence tests.
-
-Commit:
-
-```bash
 git add src/job_hunter/store.py tests/test_store.py
 git commit -m "feat: persist Gmail intelligence state"
 ```
+
+Expected: PASS.
 
 ---
 
@@ -545,9 +533,7 @@ git commit -m "feat: persist Gmail intelligence state"
 - Produces: `classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification`
 - Produces: `source_candidate_key(job: ExtractedJob) -> str`
 
-- [ ] **Step 1: Write failing deterministic-rule tests**
-
-Add fixture-like messages for these exact outcomes:
+- [ ] **Step 1: Write failing deterministic tests**
 
 ```python
 @pytest.mark.parametrize((subject, body, expected), [
@@ -560,33 +546,31 @@ Add fixture-like messages for these exact outcomes:
 def test_high_signal_templates_are_deterministic(subject, body, expected): ...
 ```
 
-Add LinkedIn alert test using sender `jobalerts-noreply@linkedin.com` and HTML-decoded body containing `https://www.linkedin.com/jobs/view/1234567890/`. Assert `JOB_ALERT`, confidence `1.0`, and one extracted job URL.
+Add a LinkedIn alert message with sender `jobalerts-noreply@linkedin.com` and `links=["https://www.linkedin.com/jobs/view/1234567890/"]`; assert `JOB_ALERT`, confidence `1.0`, and one extracted job URL.
 
-- [ ] **Step 2: Run classifier tests and verify failure**
-
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_gmail_classifier.py -q
 ```
 
-Expected: FAIL because classifier functions do not exist.
+Expected: FAIL.
 
 - [ ] **Step 3: Implement deterministic precedence and cheap irrelevance gate**
 
-Use this precedence when multiple deterministic phrases appear:
+Use:
 
 ```text
 OFFER > REJECTED > TECHNICAL > INTERVIEW > APPLIED > JOB_ALERT > RECRUITER_CONTACT
 ```
 
-`is_probably_job_related()` must return true when sender/subject/body contains strong job terms such as `application`, `interview`, `recruiter`, `hiring`, `job alert`, `position`, `technical assessment`, `coding challenge`, `offer`, or known job-platform senders. If none are present, return `IRRELEVANT` with confidence `1.0` without calling Gemini.
+`is_probably_job_related()` returns true on strong terms (`application`, `interview`, `recruiter`, `hiring`, `job alert`, `position`, `technical assessment`, `coding challenge`, `offer`) or known job-platform senders. If false, `classify_email()` returns `IRRELEVANT` at confidence `1.0` without Gemini.
 
 - [ ] **Step 4: Implement URL/job extraction and stable candidate keys**
 
-Extract HTTP(S) links with `urllib.parse`, strip tracking parameters with existing `canonicalize_url`, and retain links matching known job URL patterns (`linkedin.com/jobs/view`, `greenhouse`, `lever`, `ashbyhq`, `workable`, and generic URLs when Gemini explicitly identifies them as a job URL).
+Use `message.links` first, plus visible absolute URLs found in body text. Canonicalize with existing `canonicalize_url()`. Retain known job URLs (`linkedin.com/jobs/view`, Greenhouse, Lever, Ashby, Workable) deterministically; generic URLs are accepted only when Gemini identifies them as job URLs.
 
-Candidate key order must be:
+Candidate key:
 
 ```python
 if job.url:
@@ -598,20 +582,20 @@ return "fallback:" + "|".join([
 ])
 ```
 
-- [ ] **Step 5: Write failing semantic-classification tests**
+- [ ] **Step 5: Write failing semantic tests**
 
-Use a fake Gemini client returning JSON. Cover high-confidence recruiter outreach, lower-confidence lifecycle output, malformed JSON, and unsupported kind:
+Use fake Gemini JSON responses. Cover confident recruiter outreach, low-confidence lifecycle output, malformed JSON, unsupported kind, and low-confidence irrelevant output. Example:
 
 ```python
 def test_low_confidence_semantic_lifecycle_becomes_review_needed():
-    gemini = FakeGemini('{"kind":"INTERVIEW","confidence":0.72,"company":"Acme","role_title":"Frontend Engineer","jobs":[],"rationale":"possibly scheduling"}')
+    gemini = FakeGemini('{"kind":"INTERVIEW","confidence":0.72,"company":"Acme","role_title":"Frontend Engineer","source_job_id":null,"job_urls":[],"jobs":[],"rationale":"possibly scheduling"}')
     result = classify_email(message("Next steps", "Can we find time to chat?"), gemini)
     assert result.kind == "REVIEW_NEEDED"
 ```
 
-- [ ] **Step 6: Implement Gemini fallback with strict JSON validation**
+- [ ] **Step 6: Implement strict Gemini fallback**
 
-Use `gemini.generate_text(prompt, json_mode=True)` with this schema instruction embedded verbatim in the prompt:
+Call `gemini.generate_text(prompt, json_mode=True)`. Include this schema instruction verbatim:
 
 ```text
 Return one JSON object only with keys:
@@ -622,24 +606,17 @@ jobs must be an array of objects with source_platform, source_job_id, url, compa
 Do not infer facts not present in the email. Keep rationale under 160 characters.
 ```
 
-Only send `sender`, `subject`, `snippet`, and a body truncated to 20,000 characters. If JSON is malformed, kind unsupported, required values conflict, or a lifecycle/recruiter result is below `AUTO_CONFIDENCE_THRESHOLD = 0.90`, return `REVIEW_NEEDED`. A confident `IRRELEVANT` result may remain irrelevant.
+Send only sender, subject, snippet, up to 20,000 body characters, and the extracted link list. Malformed/unsupported/conflicting output becomes `REVIEW_NEEDED`. Any likely-job semantic result below `0.90`, including uncertain `IRRELEVANT`, becomes `REVIEW_NEEDED`.
 
 - [ ] **Step 7: Run tests and commit**
 
-Run:
-
 ```bash
 pytest tests/test_gmail_classifier.py tests/test_gemini.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add src/job_hunter/gmail_classifier.py tests/test_gmail_classifier.py
 git commit -m "feat: classify Gmail job signals"
 ```
+
+Expected: PASS.
 
 ---
 
@@ -652,16 +629,13 @@ git commit -m "feat: classify Gmail job signals"
 - Test: `tests/test_store.py`
 
 **Interfaces:**
-- Consumes: `GmailClassification`, `GmailMessage`, `JobStore`
 - Produces: `JobMatch(job_id: int | None, reason: str, ambiguous: bool)`
 - Produces: `match_job(store, classification, message) -> JobMatch`
 - Produces: `derive_application_state(events) -> str | None`
 - Produces: `JobStore.list_jobs_for_matching() -> list[sqlite3.Row]`
 - Produces: `JobStore.current_application_state(job_id: int) -> str | None`
 
-- [ ] **Step 1: Write failing priority-order matching tests**
-
-Create store fixtures with multiple jobs and prove the matcher uses the approved priority exactly:
+- [ ] **Step 1: Write failing priority-order tests**
 
 ```python
 def test_exact_canonical_url_beats_company_title(tmp_path): ...
@@ -671,38 +645,41 @@ def test_company_only_recent_match_requires_single_candidate(tmp_path): ...
 def test_ambiguous_company_match_returns_no_job(tmp_path): ...
 ```
 
-The recent company-only window is exactly `MATCH_RECENCY_DAYS = 120`, measured from email `sent_at` against job `first_seen_at`/`last_seen_at`.
+Company-only recency is exactly 120 days, measured from message `sent_at` against job `first_seen_at`/`last_seen_at`.
 
-- [ ] **Step 2: Run focused tests and verify failure**
-
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_gmail_matching.py -q
 ```
 
-Expected: FAIL because matching module/methods do not exist.
+Expected: FAIL.
 
-- [ ] **Step 3: Implement matching without database mutation**
+- [ ] **Step 3: Implement matching without mutation**
 
-`match_job()` must canonicalize URLs with existing `canonicalize_url()` and normalize company/title with existing `normalize_text()`. It returns no job when a priority level has multiple equally valid matches. It does not create placeholder jobs for unresolved historical applications.
+Apply priorities exactly:
 
-Source job ID matching compares the classification source job ID against existing `jobs.source_job_id`. URL matching compares canonicalized URLs in Python so tracking parameters do not prevent a match.
+1. canonical URL;
+2. source job ID;
+3. normalized company + normalized role title;
+4. company-only within 120 days, only if exactly one candidate;
+5. unresolved/ambiguous.
+
+Canonicalize with `canonicalize_url()` and normalize with `normalize_text()`. Do not create placeholder jobs for unresolved historical applications.
 
 - [ ] **Step 4: Write failing derived-state tests**
-
-Cover timestamp-first and tie precedence:
 
 ```python
 def test_latest_event_wins_even_if_earlier_event_has_higher_stage(): ...
 def test_same_timestamp_uses_offer_before_rejected(): ...
 def test_review_needed_never_becomes_current_state(): ...
 def test_unresolved_event_never_becomes_current_state(): ...
+def test_low_confidence_event_never_becomes_current_state(): ...
 ```
 
-- [ ] **Step 5: Implement derived-state rule exactly**
+- [ ] **Step 5: Implement approved derived-state rule**
 
-Filter to events where `job_id` is non-null, `event_type != "REVIEW_NEEDED"`, and `confidence >= AUTO_CONFIDENCE_THRESHOLD`. Sort by:
+Filter to resolved, confidence `>= 0.90`, non-review lifecycle events. Sort by:
 
 ```python
 _STATE_TIE_PRECEDENCE = {
@@ -716,24 +693,17 @@ _STATE_TIE_PRECEDENCE = {
 key = (event["occurred_at"], _STATE_TIE_PRECEDENCE[event["event_type"]], event["id"])
 ```
 
-Return the event type from the maximum key.
+Return the maximum event type.
 
-- [ ] **Step 6: Integrate `current_application_state` into `JobStore` and commit**
-
-Run:
+- [ ] **Step 6: Integrate store query/state method and commit**
 
 ```bash
 pytest tests/test_gmail_matching.py tests/test_store.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add src/job_hunter/gmail_matching.py src/job_hunter/store.py tests/test_gmail_matching.py tests/test_store.py
 git commit -m "feat: match Gmail events to jobs"
 ```
+
+Expected: PASS.
 
 ---
 
@@ -744,121 +714,120 @@ git commit -m "feat: match Gmail events to jobs"
 - Test: `tests/test_gmail_sync.py`
 
 **Interfaces:**
-- Consumes: `GmailClient`, `JobStore`, `GeminiClient`, classifier/matcher/store interfaces from Tasks 2–5
+- Consumes: Gmail client/classifier/matcher/store interfaces from Tasks 2–5 and existing `GeminiClient`
 - Produces: `GmailSyncService.sync(now: datetime, dry_run: bool = False, force_backfill: bool = False) -> GmailSyncSummary`
 - Produces: `build_backfill_query(now: datetime) -> str`
 - Produces: `process_message(message: GmailMessage, dry_run: bool) -> GmailClassification`
 
-- [ ] **Step 1: Write failing 12-month backfill tests**
-
-Use fake Gmail pages/messages and a temporary SQLite database. Assert:
+- [ ] **Step 1: Write failing initial-sync/backfill tests**
 
 ```python
+def test_first_sync_uses_profile_email_as_account_id(tmp_path): ...
 def test_first_sync_scans_12_months_and_marks_backfill_complete(tmp_path): ...
-def test_backfill_rerun_skips_already_processed_message_ids(tmp_path): ...
-def test_backfill_completion_is_not_written_when_a_page_fetch_fails(tmp_path): ...
+def test_backfill_rerun_skips_processed_message_ids(tmp_path): ...
+def test_backfill_error_prevents_completion_marker(tmp_path): ...
+def test_message_arriving_during_backfill_is_not_skipped_by_saved_history_checkpoint(tmp_path): ...
 ```
 
-`build_backfill_query()` must calculate the same calendar date one year earlier (clamp Feb 29 to Feb 28) and return a Gmail query that searches job-related mail content:
+`build_backfill_query()` computes the same calendar date one year earlier, clamping Feb 29 to Feb 28, and returns:
 
 ```text
 after:YYYY/MM/DD {application interview recruiter hiring "job alert" position "technical assessment" "coding challenge" offer}
 ```
 
-- [ ] **Step 2: Run focused tests and verify failure**
-
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_gmail_sync.py -q
 ```
 
-Expected: FAIL because sync service does not exist.
+Expected: FAIL.
 
-- [ ] **Step 3: Implement per-message processing and crash-safe persistence**
+- [ ] **Step 3: Implement sync-start checkpoint semantics**
+
+Every sync begins with:
+
+```python
+account_id, checkpoint_history_id = gmail.get_profile()
+state = store.get_gmail_sync_state(account_id)
+```
+
+For a first backfill, capture `checkpoint_history_id` **before** scanning. After a fully successful backfill, persist that captured history ID, not a newly fetched end-of-backfill ID. Therefore the next incremental history read includes any message changes that occurred while the backfill was running; already-backfilled messages are harmless because Gmail message IDs are idempotent.
+
+`force_backfill=True` repeats the search but preserves existing events/candidates and still captures a fresh start checkpoint.
+
+- [ ] **Step 4: Implement per-message processing with no-loss error handling**
 
 For each message ID:
 
 1. Increment `fetched`.
-2. If non-dry-run and `has_processed_gmail_message(message_id)` is true, skip fetching/classifying it.
+2. In non-dry-run, skip IDs already in `gmail_messages`.
 3. Fetch/decode message.
-4. Classify it.
-5. In dry-run: log the classification/extraction and return without any store write.
-6. For `JOB_ALERT`, stage each extracted job using `source_candidate_key()`; increment `job_alerts` once per message.
-7. For concrete recruiter outreach with extracted jobs, stage those candidates; lifecycle handling continues below.
-8. For lifecycle kinds, run `match_job()`.
-9. If matching is ambiguous/unresolved, persist `REVIEW_NEEDED` rather than the original lifecycle kind.
-10. If matching is resolved and classification confidence is at least `0.90`, persist the lifecycle event.
+4. Classify.
+5. In dry-run, log classification/extraction and perform no write.
+6. For `JOB_ALERT`, stage extracted jobs when eligible under Step 5.
+7. For concrete recruiter outreach, stage extracted jobs and continue lifecycle handling.
+8. For lifecycle/recruiter events, run `match_job()`.
+9. If lifecycle matching is unresolved/ambiguous, persist `REVIEW_NEEDED` instead of the original lifecycle event.
+10. If resolved and confidence `>= 0.90`, persist the lifecycle event.
 11. Persist minimal `gmail_messages` metadata only after related staging/event writes succeed.
 12. Increment summary counters.
 
-Do not write message body into any store call.
+Catch hard failures per message, increment `errors`, and continue processing remaining IDs for observability. Track `had_hard_errors=True`; if any hard error occurred in the backfill/history batch, do **not** mark backfill complete or advance history state. Next run replays successful IDs idempotently and retries failures.
 
-- [ ] **Step 4: Add stale-opportunity protection for historical alerts**
+Malformed/uncertain Gemini output that is successfully converted to `REVIEW_NEEDED` is not a hard processing failure.
 
-The 12-month backfill exists primarily to reconstruct lifecycle history. To avoid flooding the current search with expired alert jobs, stage `JOB_ALERT` candidates only when the email `sent_at` is within 14 days of the sync's `now`. Older job-alert messages are still recorded as processed/classified but do not create current inbound candidates. Recruiter outreach is staged regardless of age only when it represents an explicit concrete role; lifecycle events still follow the full 12-month backfill.
+- [ ] **Step 5: Add stale-alert protection for the historical backfill**
 
-Add tests proving a 6-month-old LinkedIn alert does not stage jobs while a 3-day-old alert does.
+The backfill reconstructs lifecycle history for 12 months, but current discovery must not be flooded with old alert jobs. During backfill, stage `JOB_ALERT` jobs only when `now - message.sent_at <= 14 days`. Older alert messages are still classified/recorded as processed. Concrete recruiter outreach may stage an older role only when the message explicitly describes a real role; lifecycle events retain the full 12-month window.
 
-- [ ] **Step 5: Write failing incremental/history tests**
-
-Cover:
+Tests:
 
 ```python
-def test_second_sync_uses_saved_history_id_instead_of_backfill_search(tmp_path): ...
+def test_six_month_old_job_alert_is_not_staged(tmp_path): ...
+def test_three_day_old_job_alert_is_staged(tmp_path): ...
+```
+
+- [ ] **Step 6: Write failing incremental/history tests**
+
+```python
+def test_second_sync_uses_saved_history_id(tmp_path): ...
 def test_history_message_ids_are_idempotent(tmp_path): ...
-def test_expired_history_falls_back_to_overlap_search(tmp_path): ...
-def test_incremental_cursor_advances_only_after_page_is_processed(tmp_path): ...
-def test_dry_run_does_not_write_cursor_or_message_state(tmp_path): ...
-def test_force_backfill_runs_search_without_erasing_existing_events(tmp_path): ...
+def test_history_hard_error_does_not_advance_cursor(tmp_path): ...
+def test_expired_history_uses_one_day_overlap_search(tmp_path): ...
+def test_dry_run_writes_nothing_and_does_not_advance_state(tmp_path): ...
+def test_force_backfill_is_idempotent_and_non_destructive(tmp_path): ...
 ```
 
-- [ ] **Step 6: Implement incremental cursor semantics**
+- [ ] **Step 7: Implement incremental and expired-history recovery**
 
-At successful end of the initial backfill:
+Normal sync uses `list_history(saved_history_id)` through all pages. If all message processing completes without hard errors, save the response's newest history ID and `last_successful_sync_at`.
 
-```python
-email_address, history_id = gmail.get_profile()
-store.save_gmail_sync_state(
-    account_id=email_address,
-    history_id=history_id,
-    last_successful_sync_at=now.isoformat(),
-    backfill_completed_at=now.isoformat(),
-)
-```
+For `GmailHistoryExpired`, reuse the sync-start `checkpoint_history_id`, search from one day before `last_successful_sync_at`, process idempotently, and only after success replace the stale cursor with that captured checkpoint. This prevents messages arriving during overlap recovery from being skipped.
 
-Normal sync uses `users.history.list(startHistoryId=saved_history_id, historyTypes=messageAdded)`. After every history page's message IDs are safely processed, continue pagination; update the stored history ID only after all pages complete.
+Dry-run never calls `record_gmail_message`, `stage_inbound_job`, `save_application_event`, `mark_review_delivered`, or `save_gmail_sync_state`.
 
-When `GmailHistoryExpired` occurs, do a bounded overlap search beginning one day before `last_successful_sync_at`, process idempotently, fetch the current profile history ID, and replace the stale cursor only after success.
+- [ ] **Step 8: Add compact metrics and commit**
 
-`force_backfill=True` repeats the 12-month search idempotently but does not delete events/candidates or clear existing state first.
-
-- [ ] **Step 7: Add compact metrics logging and commit**
-
-Log exactly this shape at INFO:
+Log exactly:
 
 ```text
 gmail_fetched=<n> gmail_processed=<n> gmail_job_alerts=<n> gmail_application_events=<n> gmail_review_needed=<n> gmail_irrelevant=<n> gmail_errors=<n>
 ```
 
-Run:
+Run/commit:
 
 ```bash
 pytest tests/test_gmail_sync.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add src/job_hunter/gmail_sync.py tests/test_gmail_sync.py
 git commit -m "feat: sync Gmail job intelligence"
 ```
 
+Expected: PASS.
+
 ---
 
-### Task 7: Feed Staged Gmail Jobs Through the Existing Discovery Pipeline
+### Task 7: Feed Staged Gmail Jobs Through Existing Discovery
 
 **Files:**
 - Create: `src/job_hunter/sources/gmail_staged.py`
@@ -870,35 +839,32 @@ git commit -m "feat: sync Gmail job intelligence"
 **Interfaces:**
 - Consumes: `JobStore.list_unmaterialized_inbound_jobs()`
 - Produces: `GmailStagedSource(store: JobStore).discover() -> list[Job]`
-- Existing `collect_candidates()` remains the only path that enriches/upserts/prefilters these jobs.
+- Existing `collect_candidates()` remains the path that enriches/upserts/prefilters these jobs.
 
 - [ ] **Step 1: Write failing staged-source tests**
 
-Assert exact conversion convention:
-
 ```python
-def test_staged_source_returns_normal_job_with_stable_gmail_identity(tmp_path):
-    # staged row source_platform="linkedin", source_candidate_key="url:https://..."
-    jobs = GmailStagedSource(store).discover()
-    assert jobs[0].source == "gmail:linkedin"
-    assert jobs[0].source_job_id == "url:https://www.linkedin.com/jobs/view/123"
+def test_staged_source_returns_stable_gmail_job_identity(tmp_path): ...
+def test_same_canonical_url_already_materialized_by_public_source_is_not_emitted(tmp_path): ...
+def test_same_identity_already_materialized_by_public_source_is_not_emitted(tmp_path): ...
 ```
 
-Also prove rows already materialized as `jobs(source="gmail:linkedin", source_job_id=<candidate_key>)` are not emitted again.
+For emitted rows assert:
 
-- [ ] **Step 2: Run focused tests and verify failure**
+```python
+assert job.source == "gmail:linkedin"
+assert job.source_job_id == row["source_candidate_key"]
+```
 
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_gmail_staged_source.py -q
 ```
 
-Expected: FAIL because source does not exist.
+Expected: FAIL.
 
-- [ ] **Step 3: Implement `GmailStagedSource`**
-
-Map every staging row to `Job` without extra network access:
+- [ ] **Step 3: Implement source conversion only**
 
 ```python
 Job(
@@ -913,13 +879,13 @@ Job(
 )
 ```
 
+The source itself performs no HTTP calls and no store writes.
+
 - [ ] **Step 4: Write failing pipeline integration test**
 
-Stage one Gmail job, inject no public sources, and assert normal pipeline behavior still evaluates it through existing ranking/evaluation logic. A second run must not re-evaluate the same materialized candidate unless its normal job description-change rules require it.
+Stage one Gmail job, inject no public sources, and assert normal pipeline evaluation occurs. Add a second scenario where a richer public-source job with the same URL wins current in-run deduplication; after the run, the staging row must not be emitted on the next run because Task 3 materialization filtering recognizes the public-source job.
 
-- [ ] **Step 5: Append the source only after store initialization**
-
-In `run_pipeline()`:
+- [ ] **Step 5: Append Gmail source only after store creation**
 
 ```python
 store = store or JobStore(settings.db_path)
@@ -927,24 +893,17 @@ base_sources = sources if sources is not None else build_sources(settings, http)
 sources = [*base_sources, GmailStagedSource(store)]
 ```
 
-Do not put this source in `build_sources(settings, http)` because it requires the initialized `JobStore`.
+Do not move it into `build_sources(settings, http)` because that function has no store.
 
-- [ ] **Step 6: Run pipeline/discovery tests and commit**
-
-Run:
+- [ ] **Step 6: Run and commit**
 
 ```bash
 pytest tests/test_gmail_staged_source.py tests/test_discovery.py tests/test_pipeline.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add src/job_hunter/sources/gmail_staged.py src/job_hunter/sources/__init__.py src/job_hunter/pipeline.py tests/test_gmail_staged_source.py tests/test_pipeline.py
 git commit -m "feat: route Gmail jobs through discovery"
 ```
+
+Expected: PASS.
 
 ---
 
@@ -960,11 +919,11 @@ git commit -m "feat: route Gmail jobs through discovery"
 **Interfaces:**
 - Produces: `ReviewItem(event_id, company, role_title, occurred_at, subject, rationale)`
 - Produces: `build_gmail_review_digest(items: Sequence[ReviewItem]) -> str`
-- Consumes: `JobStore.pending_review_events()` and `mark_review_delivered()`
+- Consumes: `pending_review_events()`/`mark_review_delivered()`
 
-- [ ] **Step 1: Write failing review-format tests**
+- [ ] **Step 1: Write failing review formatter tests**
 
-Expected text shape:
+Expected:
 
 ```text
 Gmail review needed
@@ -972,11 +931,9 @@ Gmail review needed
 - Unknown company — Senior Engineer | could not match message to a job
 ```
 
-Assert deterministic order by `occurred_at`, then `event_id`, and that no email body is rendered.
+Sort by `occurred_at`, then `event_id`; never render email body.
 
-- [ ] **Step 2: Implement `ReviewItem` and formatter**
-
-Add to `models.py`:
+- [ ] **Step 2: Add `ReviewItem` and formatter**
 
 ```python
 @dataclass(slots=True)
@@ -989,42 +946,29 @@ class ReviewItem:
     rationale: str
 ```
 
-`build_gmail_review_digest()` must use `company or "Unknown company"` and `role_title or "Unknown role"`, with rationale truncated to 200 characters.
+Formatter uses `company or "Unknown company"`, `role_title or "Unknown role"`, and rationale truncated to 200 chars.
 
-- [ ] **Step 3: Write failing delivery/retry test**
+- [ ] **Step 3: Write failing review retry tests**
 
-In pipeline tests, create two pending review events. Assert:
+Create pending review events and assert successful Telegram send marks all event IDs delivered; failed send leaves all pending. Assert this path is independent from normal scored-job digest selection.
 
-- successful `send_message` marks both in `review_deliveries`;
-- failed send leaves both pending for the next run;
-- Gmail review delivery is independent from the normal scored-job digest.
+- [ ] **Step 4: Deliver reviews at end of normal `run_pipeline`**
 
-- [ ] **Step 4: Add review delivery after normal job/document delivery**
+After normal message/document delivery, query pending reviews, build `ReviewItem`s, send one compact review digest, and call `mark_review_delivered()` only after a non-null Telegram message ID. Do not mix review events into `DigestItem` scoring.
 
-At the end of non-dry-run `run_pipeline()`, query pending review events, build `ReviewItem`s, call `telegram.send_message()`, and only call `mark_review_delivered()` if a message ID is returned.
-
-Do not include `REVIEW_NEEDED` application events in the scored job digest.
-
-- [ ] **Step 5: Run tests and commit**
-
-Run:
+- [ ] **Step 5: Run and commit**
 
 ```bash
 pytest tests/test_telegram.py tests/test_pipeline.py -q
-```
-
-Expected: PASS.
-
-Commit:
-
-```bash
 git add src/job_hunter/models.py src/job_hunter/telegram.py src/job_hunter/pipeline.py tests/test_telegram.py tests/test_pipeline.py
 git commit -m "feat: surface Gmail review events"
 ```
 
+Expected: PASS.
+
 ---
 
-### Task 9: CLI, Fail-Open GitHub Actions Integration, and Operator Documentation
+### Task 9: CLI, Fail-Open Workflow, and Operator Documentation
 
 **Files:**
 - Modify: `src/job_hunter/cli.py`
@@ -1034,33 +978,30 @@ git commit -m "feat: surface Gmail review events"
 - Test: `tests/test_cli.py`
 
 **Interfaces:**
-- Consumes: `load_gmail_settings`, `GoogleOAuthTokenProvider`, `GmailClient`, `GmailSyncService`, existing `HttpClient`, `GeminiClient`, `JobStore`
-- Produces CLI: `python -m job_hunter sync-gmail [--dry-run] [--force-backfill]`
+- Consumes: Gmail settings/auth/client/sync interfaces and existing `HttpClient`, `GeminiClient`, `JobStore`
+- Produces: `python -m job_hunter sync-gmail [--dry-run] [--force-backfill]`
 
-- [ ] **Step 1: Write failing CLI parser/dispatch tests**
-
-Cover:
+- [ ] **Step 1: Write failing CLI tests**
 
 ```python
 def test_parser_accepts_sync_gmail_dry_run(): ...
 def test_parser_accepts_sync_gmail_force_backfill(): ...
 def test_sync_gmail_does_not_load_candidate_profile_settings(mocker): ...
 def test_sync_gmail_returns_nonzero_on_fatal_auth_error(mocker): ...
+def test_sync_gmail_returns_zero_when_service_completes_with_message_errors(mocker): ...
 ```
 
-- [ ] **Step 2: Run focused tests and verify failure**
+The last test prevents a few malformed/transient messages from generating a failed GitHub pipeline notification while the service has deliberately retained its cursor for retry.
 
-Run:
+- [ ] **Step 2: Run and verify failure**
 
 ```bash
 pytest tests/test_cli.py -q
 ```
 
-Expected: FAIL because `sync-gmail` command is absent.
+Expected: FAIL.
 
-- [ ] **Step 3: Implement CLI construction and dispatch**
-
-Add parser:
+- [ ] **Step 3: Implement command and dependency construction**
 
 ```python
 sync_parser = subparsers.add_parser("sync-gmail", help="Read Gmail job signals into shared state")
@@ -1068,11 +1009,11 @@ sync_parser.add_argument("--dry-run", action="store_true", help="Classify/extrac
 sync_parser.add_argument("--force-backfill", action="store_true", help="Repeat the 12-month backfill idempotently")
 ```
 
-Build Gmail dependencies only for this command. Use `datetime.now(timezone.utc)` and log the summary. Fatal authorization/API setup errors may return exit code 1; per-message classification errors stay inside `GmailSyncSummary.errors` and do not abort the entire sync.
+Build Gmail dependencies only for `sync-gmail`. Fatal authorization/profile/list failures return 1. A completed sync whose summary has per-message `errors > 0` returns 0 after logging the errors because state was deliberately not advanced and those messages will retry.
 
-- [ ] **Step 4: Modify daily workflow with an explicitly fail-open sync step**
+- [ ] **Step 4: Add explicit fail-open workflow step**
 
-Insert after `Restore prior state` and before `Run job hunter`:
+Insert after state restore and before normal run:
 
 ```yaml
       - name: Sync Gmail intelligence
@@ -1085,11 +1026,11 @@ Insert after `Restore prior state` and before `Run job hunter`:
         run: python -m job_hunter sync-gmail
 ```
 
-Do not add Gmail secrets to the normal `Run job hunter` step. Keep the existing SQLite restore/upload behavior so Gmail state is persisted in the same artifact.
+Do not add Gmail secrets to the existing `Run job hunter` environment. Keep the shared SQLite restore/upload flow unchanged.
 
-- [ ] **Step 5: Update `.env.example` and README with concrete setup commands**
+- [ ] **Step 5: Document secrets and exact operator commands**
 
-Document these names only, never example secret values:
+Add to `.env.example` only empty names:
 
 ```text
 GMAIL_CLIENT_ID=
@@ -1097,7 +1038,7 @@ GMAIL_CLIENT_SECRET=
 GMAIL_REFRESH_TOKEN=
 ```
 
-Document bootstrap:
+README bootstrap:
 
 ```bash
 export GMAIL_CLIENT_ID='...'
@@ -1105,40 +1046,26 @@ export GMAIL_CLIENT_SECRET='...'
 python scripts/gmail_oauth_bootstrap.py
 ```
 
-Then instruct the operator to copy the printed refresh token into GitHub Secret `GMAIL_REFRESH_TOKEN` and unset/remove local shell history as appropriate.
-
-Document inspection commands:
+Document storing the printed token as GitHub Secret `GMAIL_REFRESH_TOKEN`, then:
 
 ```bash
 python -m job_hunter sync-gmail --dry-run
 python -m job_hunter sync-gmail --force-backfill
 ```
 
-State explicitly that dry-run does not advance Gmail cursors or persist Gmail-derived state, and that `--force-backfill` is idempotent rather than destructive.
+State explicitly that dry-run advances no cursor and persists no Gmail-derived state; force-backfill is idempotent/non-destructive; full bodies are not stored; Gmail is read-only.
 
-- [ ] **Step 6: Run focused tests and full suite**
-
-Run:
+- [ ] **Step 6: Run focused/full tests and privacy scan**
 
 ```bash
 pytest tests/test_cli.py -q
 pytest -q
+grep -RInE 'GMAIL_REFRESH_TOKEN=.+|client_secret[^A-Za-z].*[A-Za-z0-9_-]{20,}' . --exclude-dir=.git --exclude='*.md'
 ```
 
-Expected: all tests PASS.
+Expected: all tests PASS; grep finds no committed credential values.
 
-- [ ] **Step 7: Perform repository privacy scan**
-
-Run:
-
-```bash
-grep -RInE 'GMAIL_REFRESH_TOKEN=.+|client_secret[^A-Za-z].*[A-Za-z0-9_-]{20,}' . \
-  --exclude-dir=.git --exclude='*.md'
-```
-
-Expected: no committed Gmail credential values. Environment-variable names and documentation placeholders are allowed.
-
-- [ ] **Step 8: Commit operator integration**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/job_hunter/cli.py .github/workflows/daily.yml .env.example README.md tests/test_cli.py
@@ -1147,32 +1074,29 @@ git commit -m "feat: run Gmail intelligence before daily search"
 
 ---
 
-### Task 10: Final End-to-End Verification Against the Approved Spec
+### Task 10: Final Verification Against the Approved Spec
 
 **Files:**
-- Modify only if a verification failure requires a fix; do not add new scope.
+- Modify only if verification exposes a defect; do not add scope.
 
-**Interfaces:**
-- Verifies every Release 1 interface and global constraint above.
-
-- [ ] **Step 1: Run the complete automated suite**
+- [ ] **Step 1: Run full suite**
 
 ```bash
 pytest -q
 ```
 
-Expected: PASS with zero failures.
+Expected: zero failures.
 
-- [ ] **Step 2: Verify CLI help surfaces both commands and Gmail safety flags**
+- [ ] **Step 2: Verify command surface**
 
 ```bash
 python -m job_hunter --help
 python -m job_hunter sync-gmail --help
 ```
 
-Expected: `run` and `sync-gmail` are listed; `--dry-run` and `--force-backfill` appear only on `sync-gmail`.
+Expected: `run` and `sync-gmail` listed; Gmail help includes `--dry-run` and `--force-backfill`.
 
-- [ ] **Step 3: Verify schema contains no full-body storage**
+- [ ] **Step 3: Verify privacy schema**
 
 ```bash
 python - <<'PY'
@@ -1193,7 +1117,7 @@ PY
 
 Expected: `privacy schema check passed`.
 
-- [ ] **Step 4: Verify workflow fail-open configuration**
+- [ ] **Step 4: Verify workflow ordering/fail-open**
 
 ```bash
 python - <<'PY'
@@ -1208,32 +1132,34 @@ PY
 
 Expected: `workflow ordering check passed`.
 
-- [ ] **Step 5: Dry-run against a local mocked/fake Gmail fixture path, not a real mailbox**
-
-Run the integration test that exercises the CLI/service with fake Gmail responses:
+- [ ] **Step 5: Re-run critical Gmail integration tests**
 
 ```bash
-pytest tests/test_gmail_sync.py tests/test_cli.py -q
+pytest tests/test_gmail_sync.py tests/test_gmail_staged_source.py tests/test_pipeline.py tests/test_cli.py -q
 ```
 
-Expected: PASS and no SQLite mutations in dry-run tests.
+Expected: PASS, including dry-run no-write, cursor no-loss, cross-source staging, and fail-open cases.
 
-- [ ] **Step 6: Review git diff for scope discipline**
+- [ ] **Step 6: Review implementation diff for scope discipline**
 
 ```bash
 git diff main...HEAD --stat
 git diff main...HEAD -- . ':!docs/superpowers/specs/*' ':!docs/superpowers/plans/*'
 ```
 
-Expected: changes are limited to Release 1 Gmail intelligence, its tests, workflow integration, dependencies, and operator documentation. There are no company-watchlist, Telegram-inbound, Relay, LinkedIn-browser, or application-submission changes.
+Expected: only Gmail intelligence, tests, dependencies, workflow wiring, and operator docs. No company-watchlist, Telegram-inbound, Relay, LinkedIn-browser, or application-submission code.
 
-- [ ] **Step 7: Final implementation commit only if verification required fixes**
-
-If verification required code/test/doc fixes, commit only those fixes:
+- [ ] **Step 7: Commit verification fixes only if files changed**
 
 ```bash
-git add -A
+git status --short
+```
+
+If verification required fixes, stage only those files and commit:
+
+```bash
+git add <files-changed-by-verification>
 git commit -m "fix: complete Gmail intelligence verification"
 ```
 
-If no files changed, do not create an empty commit.
+If `git status --short` is empty, do not create a commit.
