@@ -1,9 +1,6 @@
 name: Daily Job Hunter
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '23 9 * * *'
-      timezone: "Europe/Berlin"
 permissions:
   contents: read
   actions: read
@@ -24,17 +21,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python scripts/restore_state.py --repo "$GH_REPO" --token "$GH_TOKEN" --dest var/job_hunter.sqlite3
-      - name: Run job hunter (manual dispatch)
-        if: github.event_name == 'workflow_dispatch'
-        env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          CANDIDATE_PROFILE_B64: ${{ secrets.CANDIDATE_PROFILE_B64 }}
-          COVER_LETTER_TEMPLATE_B64: ${{ secrets.COVER_LETTER_TEMPLATE_B64 }}
-        run: python -m job_hunter run
-      - name: Run job hunter (scheduled)
-        if: github.event_name == 'schedule'
+      - name: Run job hunter
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
