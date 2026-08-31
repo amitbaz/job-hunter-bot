@@ -2,7 +2,12 @@ from datetime import UTC, datetime
 
 import pytest
 
-from job_hunter.gmail_classifier import classify_deterministically, classify_email, source_candidate_key
+from job_hunter.gmail_classifier import (
+    classify_deterministically,
+    classify_email,
+    is_probably_job_related,
+    source_candidate_key,
+)
 from job_hunter.gmail_models import ExtractedJob, GmailMessage
 
 
@@ -51,6 +56,48 @@ def test_linkedin_job_alert_extracts_known_job_url():
     assert result.kind == "JOB_ALERT"
     assert result.confidence == 1.0
     assert [job.url for job in result.jobs] == ["https://www.linkedin.com/jobs/view/1234567890/"]
+
+
+def test_linkedin_security_notification_uses_semantic_fallback_not_job_alert():
+    gemini = FakeGemini(
+        semantic_response(
+            kind="IRRELEVANT",
+            confidence=0.96,
+            company="",
+            role_title="",
+            source_job_id=None,
+            job_urls=[],
+            jobs=[],
+            rationale="Account security notification.",
+        )
+    )
+
+    result = classify_email(
+        message(
+            "New sign-in to LinkedIn",
+            "We noticed a new sign-in to your account.",
+            sender="security-noreply@linkedin.com",
+        ),
+        gemini,
+    )
+
+    assert result.kind == "IRRELEVANT"
+    assert len(gemini.calls) == 1
+
+
+def test_platform_sender_and_url_require_hostname_boundaries():
+    spoofed_sender = message("Account notification", "Your preferences changed.", sender="alerts@notlinkedin.com")
+    spoofed_url = classify_deterministically(
+        message(
+            "Job alert",
+            "A new role may interest you.",
+            links=["https://notlinkedin.com/jobs/view/42"],
+        )
+    )
+
+    assert not is_probably_job_related(spoofed_sender)
+    assert spoofed_url is not None
+    assert spoofed_url.jobs == []
 
 
 @pytest.mark.parametrize(
@@ -107,7 +154,11 @@ def test_confident_semantic_recruiter_outreach_accepts_gemini_identified_job_url
     gemini = FakeGemini(semantic_response())
 
     result = classify_email(
-        message("Hiring conversation", "I would like to discuss a Frontend Engineer role with you."),
+        message(
+            "Hiring conversation",
+            "I would like to discuss a Frontend Engineer role with you.",
+            links=["https://jobs.acme.example/frontend"],
+        ),
         gemini,
     )
 
@@ -115,6 +166,43 @@ def test_confident_semantic_recruiter_outreach_accepts_gemini_identified_job_url
     assert result.confidence == 0.96
     assert result.job_urls == ["https://jobs.acme.example/frontend"]
     assert [job.url for job in result.jobs] == ["https://jobs.acme.example/frontend"]
+
+
+def test_semantic_generic_urls_must_appear_in_the_email():
+    result = classify_email(
+        message("Hiring conversation", "Can we discuss a role?"),
+        FakeGemini(semantic_response()),
+    )
+
+    assert result.kind == "REVIEW_NEEDED"
+
+
+def test_semantic_classification_retains_known_email_job_urls():
+    result = classify_email(
+        message(
+            "Hiring conversation",
+            "Can we discuss a role?",
+            links=["https://www.linkedin.com/jobs/view/1234567890/"],
+        ),
+        FakeGemini(semantic_response(job_urls=[], jobs=[])),
+    )
+
+    assert result.kind == "RECRUITER_CONTACT"
+    assert result.job_urls == ["https://www.linkedin.com/jobs/view/1234567890/"]
+    assert [job.url for job in result.jobs] == ["https://www.linkedin.com/jobs/view/1234567890/"]
+
+
+def test_conflicting_semantic_job_urls_and_jobs_becomes_review_needed():
+    result = classify_email(
+        message(
+            "Hiring conversation",
+            "Can we discuss a role?",
+            links=["https://jobs.acme.example/frontend"],
+        ),
+        FakeGemini(semantic_response(jobs=[])),
+    )
+
+    assert result.kind == "REVIEW_NEEDED"
 
 
 def test_low_confidence_semantic_lifecycle_becomes_review_needed():

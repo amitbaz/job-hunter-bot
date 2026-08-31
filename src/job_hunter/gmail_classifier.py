@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+from dataclasses import replace
+from email.utils import parseaddr
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
@@ -63,6 +65,29 @@ def _is_absolute_http_url(value: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
+def _host_matches_domain(host: str, domain: str) -> bool:
+    host = host.lower().rstrip(".")
+    return host == domain or host.endswith("." + domain)
+
+
+def _is_known_platform_host(host: str) -> bool:
+    return any(_host_matches_domain(host, domain) for domain in _KNOWN_PLATFORM_SENDERS)
+
+
+def _sender_address(message: GmailMessage) -> str:
+    return parseaddr(message.sender)[1].lower()
+
+
+def _is_known_platform_sender(message: GmailMessage) -> bool:
+    address = _sender_address(message)
+    _, separator, host = address.rpartition("@")
+    return bool(separator) and _is_known_platform_host(host)
+
+
+def _is_job_alert_sender(message: GmailMessage) -> bool:
+    return _sender_address(message) == "jobalerts-noreply@linkedin.com"
+
+
 def _message_urls(message: GmailMessage) -> list[str]:
     values = [*message.links, *_VISIBLE_URL_PATTERN.findall(message.body)]
     urls: list[str] = []
@@ -78,17 +103,17 @@ def _message_urls(message: GmailMessage) -> list[str]:
 
 def _job_url_platform(url: str) -> str | None:
     parsed = urlparse(url)
-    host = parsed.netloc.lower()
+    host = (parsed.hostname or "").lower()
     path = parsed.path.lower()
-    if host.endswith("linkedin.com") and "/jobs/view" in path:
+    if _host_matches_domain(host, "linkedin.com") and "/jobs/view" in path:
         return "linkedin"
-    if host.endswith("greenhouse.io"):
+    if _host_matches_domain(host, "greenhouse.io"):
         return "greenhouse"
-    if host.endswith("lever.co"):
+    if _host_matches_domain(host, "lever.co"):
         return "lever"
-    if host.endswith("ashbyhq.com"):
+    if _host_matches_domain(host, "ashbyhq.com"):
         return "ashby"
-    if host.endswith("workable.com"):
+    if _host_matches_domain(host, "workable.com"):
         return "workable"
     return None
 
@@ -126,14 +151,11 @@ def is_probably_job_related(message: GmailMessage) -> bool:
         "coding challenge",
         "offer",
     )
-    sender = normalize_text(message.sender)
-    return any(term in text for term in strong_terms) or any(domain in sender for domain in _KNOWN_PLATFORM_SENDERS)
+    return any(term in text for term in strong_terms) or _is_known_platform_sender(message)
 
 
 def classify_deterministically(message: GmailMessage) -> GmailClassification | None:
     text = normalize_text(" ".join([message.subject, message.snippet, message.body]))
-    sender = normalize_text(message.sender)
-
     if "offer you the position" in text or "pleased to offer" in text:
         return _classification("OFFER", message, "deterministic offer template")
     if "not be moving forward" in text or "we regret to inform" in text:
@@ -144,7 +166,7 @@ def classify_deterministically(message: GmailMessage) -> GmailClassification | N
         return _classification("INTERVIEW", message, "deterministic interview template")
     if "thanks for applying" in text or "received your application" in text:
         return _classification("APPLIED", message, "deterministic application receipt template")
-    if "job alert" in text or any(domain in sender for domain in _KNOWN_PLATFORM_SENDERS):
+    if "job alert" in text or _is_job_alert_sender(message):
         return _classification("JOB_ALERT", message, "deterministic job alert sender or template")
     if "recruiter" in text:
         return _classification("RECRUITER_CONTACT", message, "deterministic recruiter template")
@@ -265,6 +287,34 @@ def _parse_semantic_classification(raw: str) -> GmailClassification:
     return classification
 
 
+def _reconcile_semantic_urls(
+    message: GmailMessage, classification: GmailClassification
+) -> GmailClassification:
+    semantic_urls = set(classification.job_urls)
+    semantic_job_urls = {job.url for job in classification.jobs if job.url}
+    if semantic_urls != semantic_job_urls:
+        raise ValueError("job_urls and jobs URLs conflict")
+
+    message_urls = set(_message_urls(message))
+    if not semantic_urls.issubset(message_urls):
+        raise ValueError("semantic job URL was not present in the email")
+
+    known_jobs = _known_jobs(message)
+    if classification.kind == "IRRELEVANT" and known_jobs:
+        raise ValueError("irrelevant response conflicts with known job URLs")
+
+    job_urls = list(classification.job_urls)
+    jobs = list(classification.jobs)
+    known_urls = {job.url for job in jobs if job.url}
+    for job in known_jobs:
+        if job.url not in known_urls:
+            jobs.append(job)
+            known_urls.add(job.url)
+        if job.url not in job_urls:
+            job_urls.append(job.url)
+    return replace(classification, job_urls=job_urls, jobs=jobs)
+
+
 def _build_semantic_prompt(message: GmailMessage) -> str:
     email_data = {
         "sender": message.sender,
@@ -287,6 +337,7 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
         classification = _parse_semantic_classification(
             gemini.generate_text(_build_semantic_prompt(message), json_mode=True)
         )
+        classification = _reconcile_semantic_urls(message, classification)
     except Exception:
         return _review_needed("semantic classification unavailable or invalid")
 
