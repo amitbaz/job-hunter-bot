@@ -1,6 +1,29 @@
 import base64
 from pathlib import Path
+import pytest
+
 from job_hunter.config import load_settings
+from job_hunter.config import load_gmail_settings
+
+
+def test_load_gmail_settings_does_not_require_candidate_profile(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "refresh")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini")
+    monkeypatch.delenv("CANDIDATE_PROFILE_B64", raising=False)
+    settings = load_gmail_settings()
+    assert settings.client_id == "client"
+    assert settings.db_path == "var/job_hunter.sqlite3"
+
+
+def test_load_gmail_settings_requires_refresh_token(monkeypatch):
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini")
+    monkeypatch.delenv("GMAIL_REFRESH_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="GMAIL_REFRESH_TOKEN"):
+        load_gmail_settings()
 
 
 def test_load_settings_decodes_private_sources(monkeypatch, tmp_path: Path):

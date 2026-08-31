@@ -5,8 +5,14 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import Evaluation, Job, Material
-from job_hunter.normalize import description_hash, job_fingerprint
+from job_hunter.normalize import (
+    canonicalize_url,
+    description_hash,
+    job_fingerprint,
+    normalize_text,
+)
 
 _CREATE_JOBS = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -67,6 +73,77 @@ CREATE TABLE IF NOT EXISTS deliveries (
 )
 """
 
+_CREATE_GMAIL_SYNC_STATE = """
+CREATE TABLE IF NOT EXISTS gmail_sync_state (
+    account_id TEXT PRIMARY KEY,
+    history_id TEXT,
+    last_successful_sync_at TEXT,
+    last_processed_message_at TEXT,
+    backfill_completed_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+)
+"""
+
+_CREATE_GMAIL_MESSAGES = """
+CREATE TABLE IF NOT EXISTS gmail_messages (
+    message_id TEXT PRIMARY KEY,
+    thread_id TEXT,
+    sender TEXT NOT NULL DEFAULT '',
+    subject TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    classification TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    rationale TEXT NOT NULL DEFAULT '',
+    processed_at TEXT NOT NULL
+)
+"""
+
+_CREATE_INBOUND_JOB_CANDIDATES = """
+CREATE TABLE IF NOT EXISTS inbound_job_candidates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    origin TEXT NOT NULL DEFAULT 'gmail',
+    source_message_id TEXT NOT NULL,
+    source_candidate_key TEXT NOT NULL,
+    source_platform TEXT NOT NULL DEFAULT '',
+    source_job_id TEXT,
+    url TEXT NOT NULL DEFAULT '',
+    company TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    location TEXT NOT NULL DEFAULT '',
+    remote INTEGER,
+    description TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(origin, source_message_id, source_candidate_key)
+)
+"""
+
+_CREATE_APPLICATION_EVENTS = """
+CREATE TABLE IF NOT EXISTS application_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER REFERENCES jobs(id),
+    event_type TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'gmail',
+    source_message_id TEXT NOT NULL UNIQUE,
+    source_thread_id TEXT,
+    confidence REAL NOT NULL,
+    company TEXT NOT NULL DEFAULT '',
+    role_title TEXT NOT NULL DEFAULT '',
+    rationale TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+)
+"""
+
+_CREATE_REVIEW_DELIVERIES = """
+CREATE TABLE IF NOT EXISTS review_deliveries (
+    event_id INTEGER PRIMARY KEY REFERENCES application_events(id),
+    delivered_at TEXT NOT NULL,
+    telegram_message_id TEXT
+)
+"""
+
 _DELIVERABLE_SCORE_FLOOR = 60
 
 
@@ -77,11 +154,22 @@ def _now_iso() -> str:
 class JobStore:
     """SQLite-backed persistence layer for the job hunter bot."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
         self._path = str(path)
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        if read_only:
+            database_uri = Path(path).resolve().as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(
+                database_uri,
+                uri=True,
+                check_same_thread=False,
+            )
+        else:
+            self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._init_db()
+        if read_only:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+        else:
+            self._init_db()
 
     # ------------------------------------------------------------------
     # Schema setup
@@ -94,6 +182,11 @@ class JobStore:
             self._conn.execute(_CREATE_EVALUATIONS)
             self._conn.execute(_CREATE_MATERIALS)
             self._conn.execute(_CREATE_DELIVERIES)
+            self._conn.execute(_CREATE_GMAIL_SYNC_STATE)
+            self._conn.execute(_CREATE_GMAIL_MESSAGES)
+            self._conn.execute(_CREATE_INBOUND_JOB_CANDIDATES)
+            self._conn.execute(_CREATE_APPLICATION_EVENTS)
+            self._conn.execute(_CREATE_REVIEW_DELIVERIES)
 
     # ------------------------------------------------------------------
     # Job operations
@@ -186,6 +279,274 @@ class JobStore:
     def count_jobs(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
         return row[0]
+
+    def list_jobs_for_matching(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT id, source_job_id, url, company, title, first_seen_at, last_seen_at
+            FROM jobs
+            ORDER BY id
+            """
+        ).fetchall()
+
+    # ------------------------------------------------------------------
+    # Gmail sync and staging operations
+    # ------------------------------------------------------------------
+
+    def has_processed_gmail_message(self, message_id: str) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM gmail_messages WHERE message_id = ? LIMIT 1",
+            (message_id,),
+        ).fetchone()
+        return row is not None
+
+    def record_gmail_message(
+        self,
+        *,
+        message_id: str,
+        thread_id: str | None,
+        sender: str,
+        subject: str,
+        occurred_at: str,
+        classification: str,
+        confidence: float,
+        rationale: str,
+    ) -> None:
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO gmail_messages
+                    (message_id, thread_id, sender, subject, occurred_at,
+                     classification, confidence, rationale, processed_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    thread_id,
+                    sender,
+                    subject,
+                    occurred_at,
+                    classification,
+                    confidence,
+                    rationale,
+                    _now_iso(),
+                ),
+            )
+
+    def get_gmail_sync_state(self, account_id: str) -> sqlite3.Row | None:
+        table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gmail_sync_state'"
+        ).fetchone()
+        if table is None:
+            return None
+        return self._conn.execute(
+            "SELECT * FROM gmail_sync_state WHERE account_id = ?",
+            (account_id,),
+        ).fetchone()
+
+    def save_gmail_sync_state(
+        self,
+        account_id: str,
+        history_id: str | None,
+        last_successful_sync_at: str | None,
+        backfill_completed_at: str | None,
+    ) -> None:
+        now = _now_iso()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO gmail_sync_state
+                    (account_id, history_id, last_successful_sync_at,
+                     backfill_completed_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET
+                    history_id = excluded.history_id,
+                    last_successful_sync_at = excluded.last_successful_sync_at,
+                    backfill_completed_at = excluded.backfill_completed_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    account_id,
+                    history_id,
+                    last_successful_sync_at,
+                    backfill_completed_at,
+                    now,
+                    now,
+                ),
+            )
+
+    def stage_inbound_job(
+        self,
+        source_message_id: str,
+        source_candidate_key: str,
+        job: ExtractedJob,
+    ) -> int:
+        now = _now_iso()
+        remote = None if job.remote is None else int(job.remote)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO inbound_job_candidates
+                    (origin, source_message_id, source_candidate_key,
+                     source_platform, source_job_id, url, company, title,
+                     location, remote, description, created_at, last_seen_at)
+                VALUES ('gmail', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(origin, source_message_id, source_candidate_key) DO UPDATE SET
+                    last_seen_at = excluded.last_seen_at
+                """,
+                (
+                    source_message_id,
+                    source_candidate_key,
+                    job.source_platform,
+                    job.source_job_id,
+                    job.url,
+                    job.company,
+                    job.title,
+                    job.location,
+                    remote,
+                    "",
+                    now,
+                    now,
+                ),
+            )
+            row = self._conn.execute(
+                """
+                SELECT id FROM inbound_job_candidates
+                WHERE origin = 'gmail' AND source_message_id = ?
+                  AND source_candidate_key = ?
+                """,
+                (source_message_id, source_candidate_key),
+            ).fetchone()
+        return row["id"]
+
+    def list_unmaterialized_inbound_jobs(self) -> list[sqlite3.Row]:
+        candidates = self._conn.execute(
+            "SELECT * FROM inbound_job_candidates ORDER BY id"
+        ).fetchall()
+        jobs = self._conn.execute(
+            """
+            SELECT source, source_job_id, url, company, title, location
+            FROM jobs
+            """
+        ).fetchall()
+
+        return [
+            candidate
+            for candidate in candidates
+            if not any(
+                self._matches_materialized_job(candidate, job) for job in jobs
+            )
+        ]
+
+    @staticmethod
+    def _matches_materialized_job(
+        candidate: sqlite3.Row, job: sqlite3.Row
+    ) -> bool:
+        if (
+            job["source"] == f"gmail:{candidate['source_platform']}"
+            and job["source_job_id"] == candidate["source_candidate_key"]
+        ):
+            return True
+
+        if candidate["url"] and job["url"]:
+            if canonicalize_url(candidate["url"]) == canonicalize_url(job["url"]):
+                return True
+
+        candidate_identity = "|".join(
+            normalize_text(value)
+            for value in (candidate["company"], candidate["title"], candidate["location"])
+        )
+        job_identity = "|".join(
+            normalize_text(value)
+            for value in (job["company"], job["title"], job["location"])
+        )
+        return candidate_identity != "||" and candidate_identity == job_identity
+
+    def save_application_event(
+        self,
+        *,
+        job_id: int | None,
+        event_type: str,
+        occurred_at: str,
+        source_message_id: str,
+        source_thread_id: str | None,
+        confidence: float,
+        company: str,
+        role_title: str,
+        rationale: str,
+        source: str = "gmail",
+    ) -> int:
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO application_events
+                    (job_id, event_type, occurred_at, source, source_message_id,
+                     source_thread_id, confidence, company, role_title,
+                     rationale, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    job_id,
+                    event_type,
+                    occurred_at,
+                    source,
+                    source_message_id,
+                    source_thread_id,
+                    confidence,
+                    company,
+                    role_title,
+                    rationale,
+                    _now_iso(),
+                ),
+            )
+            row = self._conn.execute(
+                "SELECT id FROM application_events WHERE source_message_id = ?",
+                (source_message_id,),
+            ).fetchone()
+        return row["id"]
+
+    def list_application_events(self, job_id: int) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT * FROM application_events
+            WHERE job_id = ?
+            ORDER BY occurred_at, id
+            """,
+            (job_id,),
+        ).fetchall()
+
+    def current_application_state(self, job_id: int) -> str | None:
+        from job_hunter.gmail_matching import derive_application_state
+
+        return derive_application_state(self.list_application_events(job_id))
+
+    def pending_review_events(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT e.*, m.subject
+            FROM application_events e
+            JOIN gmail_messages m ON m.message_id = e.source_message_id
+            LEFT JOIN review_deliveries d ON d.event_id = e.id
+            WHERE e.event_type = 'REVIEW_NEEDED' AND d.event_id IS NULL
+            ORDER BY e.occurred_at, e.id
+            """
+        ).fetchall()
+
+    def mark_review_delivered(
+        self, event_ids: list[int], telegram_message_id: str
+    ) -> None:
+        if not event_ids:
+            return
+        with self._conn:
+            self._conn.executemany(
+                """
+                INSERT OR IGNORE INTO review_deliveries
+                    (event_id, delivered_at, telegram_message_id)
+                VALUES (?, ?, ?)
+                """,
+                [(event_id, _now_iso(), telegram_message_id) for event_id in event_ids],
+            )
 
     # ------------------------------------------------------------------
     # Evaluation operations

@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
-from job_hunter.models import DigestItem
+from job_hunter.models import DigestItem, ReviewItem
 
 if TYPE_CHECKING:
     from job_hunter.http import HttpClient
@@ -23,6 +23,7 @@ _GROUP_HEADERS = {
 _GROUP_ORDER = ("Ready to apply", "Possible matches", "Needs review / blockers")
 _DELIVERABLE_DECISIONS = frozenset(_GROUP_HEADERS)
 _DELIVERABLE_SCORE_FLOOR = 60
+_REVIEW_HEADER = "Gmail review needed"
 
 
 def select_deliverable_items(items: Sequence[DigestItem]) -> list[DigestItem]:
@@ -66,6 +67,52 @@ def build_digest(items: Sequence[DigestItem]) -> str:
         sections.append("\n".join([header, *(_digest_line(item) for item in sorted(group_items, key=_item_sort_key))]))
 
     return "\n\n".join(sections) if sections else "No matching jobs today."
+
+
+def _gmail_review_line(item: ReviewItem) -> str:
+    company = item.company or "Unknown company"
+    role_title = item.role_title or "Unknown role"
+    return f"- {company} — {role_title} | {item.rationale[:200]}"
+
+
+def build_gmail_review_digest(items: Sequence[ReviewItem]) -> str:
+    """Format pending Gmail review events without rendering email content."""
+    ordered = sorted(items, key=lambda item: (item.occurred_at, item.event_id))
+    return "\n".join([_REVIEW_HEADER, *(_gmail_review_line(item) for item in ordered)])
+
+
+def build_gmail_review_digest_chunks(
+    items: Sequence[ReviewItem], limit: int = 3900
+) -> list[tuple[str, list[int]]]:
+    """Chunk review items without splitting one event across acknowledgements."""
+    ordered = sorted(items, key=lambda item: (item.occurred_at, item.event_id))
+    chunks: list[tuple[str, list[int]]] = []
+    current_lines: list[str] = []
+    current_ids: list[int] = []
+    current_length = len(_REVIEW_HEADER)
+    max_line_length = max(1, limit - len(_REVIEW_HEADER) - 1)
+
+    for item in ordered:
+        line = _gmail_review_line(item)
+        if len(line) > max_line_length:
+            line = line[: max_line_length - 1].rstrip() + "…"
+
+        added_length = 1 + len(line)
+        if current_lines and current_length + added_length > limit:
+            chunks.append(
+                ("\n".join([_REVIEW_HEADER, *current_lines]), current_ids)
+            )
+            current_lines = []
+            current_ids = []
+            current_length = len(_REVIEW_HEADER)
+
+        current_lines.append(line)
+        current_ids.append(item.event_id)
+        current_length += 1 + len(line)
+
+    if current_lines:
+        chunks.append(("\n".join([_REVIEW_HEADER, *current_lines]), current_ids))
+    return chunks
 
 
 def chunk_message(text: str, limit: int = 3900) -> list[str]:

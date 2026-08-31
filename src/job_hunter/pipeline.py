@@ -10,14 +10,18 @@ from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
-from job_hunter.models import DigestItem, Material, RunSummary, Settings
+from job_hunter.models import DigestItem, Material, ReviewItem, RunSummary, Settings
 from job_hunter.preferences import extract_candidate_preferences, preferences_source
 from job_hunter.pdf import render_cover_letter_pdf
 from job_hunter.discovery import collect_candidates
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
-from job_hunter.sources import build_sources
+from job_hunter.sources import GmailStagedSource, build_sources
 from job_hunter.store import JobStore
-from job_hunter.telegram import TelegramClient, build_digest
+from job_hunter.telegram import (
+    TelegramClient,
+    build_digest,
+    build_gmail_review_digest_chunks,
+)
 from job_hunter.telegram import select_deliverable_items
 
 logger = logging.getLogger(__name__)
@@ -119,8 +123,9 @@ def run_pipeline(
     http: HttpClient | None = None,
 ) -> RunSummary:
     http = http or HttpClient()
-    sources = sources if sources is not None else build_sources(settings, http)
     store = store or JobStore(settings.db_path)
+    base_sources = sources if sources is not None else build_sources(settings, http)
+    sources = [*base_sources, GmailStagedSource(store)]
     gemini = gemini or GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
     if telegram is None and not settings.dry_run:
         telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id, http)
@@ -219,5 +224,24 @@ def run_pipeline(
             document_id = telegram.send_document(pdf_path, caption)
             if document_id is not None:
                 store.mark_delivered(job_id, "telegram_document", document_id)
+
+        pending_reviews = store.pending_review_events()
+        if pending_reviews:
+            review_items = [
+                ReviewItem(
+                    event_id=row["id"],
+                    company=row["company"],
+                    role_title=row["role_title"],
+                    occurred_at=row["occurred_at"],
+                    subject=row["subject"],
+                    rationale=row["rationale"],
+                )
+                for row in pending_reviews
+            ]
+            for review_text, event_ids in build_gmail_review_digest_chunks(review_items):
+                review_message_id = telegram.send_message(review_text)
+                if review_message_id is None:
+                    break
+                store.mark_review_delivered(event_ids, review_message_id)
 
     return summary

@@ -1,7 +1,13 @@
 from pathlib import Path
 
-from job_hunter.models import DigestItem
-from job_hunter.telegram import TelegramClient, build_digest, chunk_message, select_deliverable_items
+from job_hunter.models import DigestItem, ReviewItem
+from job_hunter.telegram import (
+    TelegramClient,
+    build_digest,
+    build_gmail_review_digest,
+    chunk_message,
+    select_deliverable_items,
+)
 
 
 class FakeResponse:
@@ -36,6 +42,19 @@ def _item(**overrides):
     )
     defaults.update(overrides)
     return DigestItem(**defaults)
+
+
+def _review_item(**overrides):
+    defaults = dict(
+        event_id=1,
+        company="Acme",
+        role_title="Frontend Engineer",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        subject="Interview details inside",
+        rationale="ambiguous scheduling language",
+    )
+    defaults.update(overrides)
+    return ReviewItem(**defaults)
 
 
 def test_chunk_message_splits_long_text_under_limit():
@@ -93,6 +112,35 @@ def test_select_deliverable_items_keeps_only_scores_above_sixty():
         _item(company="DropPossible", score=60, decision="possible_match"),
     ])
     assert [item.company for item in selected] == ["Keep", "KeepPossible"]
+
+
+def test_build_gmail_review_digest_sorts_events_by_time_then_id_without_subject():
+    digest = build_gmail_review_digest(
+        [
+            _review_item(event_id=4, company="Beta", occurred_at="2026-08-31T11:00:00+00:00"),
+            _review_item(event_id=3, company="Gamma", occurred_at="2026-08-31T10:00:00+00:00"),
+            _review_item(event_id=2, company="Acme", occurred_at="2026-08-31T10:00:00+00:00"),
+        ]
+    )
+
+    assert digest == (
+        "Gmail review needed\n"
+        "- Acme — Frontend Engineer | ambiguous scheduling language\n"
+        "- Gamma — Frontend Engineer | ambiguous scheduling language\n"
+        "- Beta — Frontend Engineer | ambiguous scheduling language"
+    )
+    assert "Interview details inside" not in digest
+
+
+def test_build_gmail_review_digest_uses_fallbacks_and_truncates_rationale():
+    digest = build_gmail_review_digest(
+        [_review_item(company="", role_title="", rationale="x" * 201)]
+    )
+
+    assert digest == (
+        "Gmail review needed\n"
+        f"- Unknown company — Unknown role | {'x' * 200}"
+    )
 
 
 def test_send_message_posts_to_send_message_endpoint():

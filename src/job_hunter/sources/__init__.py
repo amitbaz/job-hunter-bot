@@ -7,6 +7,7 @@ from .ashby import AshbySource
 from .base import JobSource
 from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
+from .gmail_staged import GmailStagedSource
 from .himalayas import HimalayasSource
 from .jobicy import JobicySource
 from .lever import LeverSource
@@ -22,6 +23,7 @@ __all__ = [
     "ArbeitnowSource",
     "JobicySource",
     "HimalayasSource",
+    "GmailStagedSource",
     "DuckDuckGoSource",
     "AshbySource",
     "LeverSource",
