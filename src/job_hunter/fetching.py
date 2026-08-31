@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import TYPE_CHECKING
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
@@ -9,6 +10,13 @@ from job_hunter.models import Job
 
 if TYPE_CHECKING:
     from job_hunter.http import HttpClient
+
+
+_SUPPORTED_ATS_HOSTS = {
+    "jobs.lever.co",
+    "jobs.ashbyhq.com",
+    "boards.greenhouse.io",
+}
 
 
 def _find_job_posting(data: dict | list) -> dict | None:
@@ -31,12 +39,53 @@ def _find_job_posting(data: dict | list) -> dict | None:
     return None
 
 
+def _iter_job_postings(data: object):
+    """Yield every JSON-LD JobPosting object in a nested structure."""
+    if isinstance(data, dict):
+        if data.get("@type") == "JobPosting":
+            yield data
+        for value in data.values():
+            yield from _iter_job_postings(value)
+    elif isinstance(data, list):
+        for item in data:
+            yield from _iter_job_postings(item)
+
+
 def _strip_html(text: str) -> str:
     """Remove HTML tags from a string, collapsing whitespace."""
     if not text:
         return text
     soup = BeautifulSoup(text, "html.parser")
     return " ".join(soup.get_text(separator=" ").split())
+
+
+def extract_job_page_links(html: str, base_url: str) -> list[str]:
+    """Extract absolute canonical, JobPosting, and supported ATS links from a page."""
+    soup = BeautifulSoup(html, "html.parser")
+    links: list[str] = []
+
+    for link in soup.find_all("link"):
+        rel = {value.lower() for value in link.get("rel", [])}
+        href = link.get("href")
+        if "canonical" in rel and isinstance(href, str):
+            links.append(urljoin(base_url, href))
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for posting in _iter_job_postings(data):
+            url = posting.get("url")
+            if isinstance(url, str):
+                links.append(urljoin(base_url, url))
+
+    for anchor in soup.find_all("a", href=True):
+        url = urljoin(base_url, anchor["href"])
+        if urlparse(url).hostname in _SUPPORTED_ATS_HOSTS:
+            links.append(url)
+
+    return list(dict.fromkeys(links))
 
 
 def extract_job_from_html(html: str) -> dict:
