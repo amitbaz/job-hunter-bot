@@ -334,6 +334,11 @@ class JobStore:
             )
 
     def get_gmail_sync_state(self, account_id: str) -> sqlite3.Row | None:
+        table = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'gmail_sync_state'"
+        ).fetchone()
+        if table is None:
+            return None
         return self._conn.execute(
             "SELECT * FROM gmail_sync_state WHERE account_id = ?",
             (account_id,),

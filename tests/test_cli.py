@@ -272,3 +272,43 @@ def test_sync_gmail_dry_run_opens_existing_database_read_only(
         assert connection.execute(
             "SELECT * FROM gmail_sync_state ORDER BY account_id"
         ).fetchall() == rows_before
+
+
+def test_sync_gmail_dry_run_reads_legacy_database_without_gmail_schema(
+    monkeypatch, tmp_path
+):
+    settings = _gmail_settings(tmp_path)
+    with sqlite3.connect(settings.db_path) as connection:
+        connection.execute(
+            """
+            CREATE TABLE jobs (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL
+            )
+            """
+        )
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+
+    class InspectingService:
+        def __init__(self, *, store, **kwargs):
+            self.store = store
+
+        def sync(self, now, *, dry_run, force_backfill):
+            assert dry_run is True
+            assert self.store.get_gmail_sync_state("candidate@example.com") is None
+            return GmailSyncSummary()
+
+    monkeypatch.setattr(cli, "load_gmail_settings", lambda: settings)
+    monkeypatch.setattr(cli, "HttpClient", object)
+    monkeypatch.setattr(cli, "GoogleOAuthTokenProvider", lambda value: object())
+    monkeypatch.setattr(cli, "GmailClient", lambda http, token_provider: object())
+    monkeypatch.setattr(cli, "GeminiClient", lambda api_key, model, http: object())
+    monkeypatch.setattr(cli, "GmailSyncService", InspectingService)
+
+    assert cli.main(["sync-gmail", "--dry-run"]) == 0
+    with sqlite3.connect(settings.db_path) as connection:
+        assert connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall() == schema_before
