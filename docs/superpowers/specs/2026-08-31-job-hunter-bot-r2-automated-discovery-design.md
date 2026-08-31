@@ -23,7 +23,7 @@ R2 remains SQLite-first. It must not depend on Relay or Supabase and must not bl
 ### In scope
 
 - SQLite-backed self-expanding company watchlist.
-- Strict automatic company promotion only after a strong relevant job reaches the configured high-priority/package-match threshold.
+- Strict automatic company promotion only after a strong relevant evaluation.
 - Manual watchlist entries supported alongside automatically learned entries.
 - Direct re-checking of active watched companies on future runs.
 - Structured ATS preference when an employer uses a supported ATS.
@@ -95,7 +95,7 @@ R1 remains intact and continues to run before normal discovery.
 
 Gmail-derived job candidates remain a normal discovery input. R2 does not introduce a separate scoring or delivery path for Gmail jobs.
 
-R2 must improve Gmail-discovered jobs in the same way as every other source:
+R2 improves Gmail-discovered jobs in the same way as every other source:
 
 - canonical resolution;
 - cross-source provenance;
@@ -106,15 +106,22 @@ R1 application lifecycle events and review-needed behavior are not redesigned in
 
 ## 5. Self-expanding company watchlist
 
-### 5.1 Promotion policy
+### 5.1 Automatic promotion policy
 
-A company may be automatically promoted to the watchlist only after the bot evaluates at least one job from that company as a strong match at or above the configured high-priority/package-match threshold.
+Automatic promotion is deliberately strict.
 
-The promotion rule must use the configured evaluation threshold rather than a separate hard-coded number so changes to the existing scoring policy remain authoritative.
+A company may be promoted automatically only when all of the following are true:
 
-Passing the profession gate alone is not sufficient for automatic promotion.
+- the job has completed normal Gemini evaluation;
+- the evaluation has no hard blockers;
+- `evaluation.decision` is `package_match` or `high_priority`;
+- `evaluation.total_score` is at least the configured `policy.thresholds.package` value.
 
-A low-score, blocked, skipped, or merely possible-match role must not cause automatic company promotion.
+This uses the existing evaluation policy as the source of truth. With the current configuration, `package_match` begins at 75 and `high_priority` begins at 85, but R2 must not introduce a separate hard-coded promotion score.
+
+Passing the profession gate alone is not sufficient.
+
+`possible_match`, `skip`, `blocked`, failed evaluations, and unevaluated jobs must not auto-promote a company.
 
 ### 5.2 Conceptual schema
 
@@ -124,7 +131,7 @@ Add a persistent company-watch model roughly equivalent to:
 company_watch
 - id                        primary key
 - company_name
-- normalized_company_name   unique for active identity
+- normalized_company_name   unique logical company identity
 - careers_url               nullable
 - ats_provider              nullable
 - ats_identifier            nullable
@@ -141,7 +148,7 @@ company_watch
 - updated_at
 ```
 
-The exact SQLite schema may differ, but these behaviors are required.
+The exact SQLite schema may differ, but the required behavior may not.
 
 ### 5.3 Manual and automatic entries
 
@@ -152,7 +159,7 @@ R2 supports both:
 
 Manual entries must never be deleted or permanently disabled automatically.
 
-Automatic entries may be paused after repeated failures but should not be silently deleted.
+Automatic entries may be temporarily paused after repeated failures but must not be silently deleted.
 
 ### 5.4 Watch target preference
 
@@ -174,8 +181,8 @@ Normalization should safely handle simple presentational differences such as:
 
 - casing;
 - repeated whitespace;
-- common legal suffixes where unambiguous;
-- punctuation differences.
+- punctuation differences;
+- common legal suffixes where removal is unambiguous.
 
 Fuzzy similarity alone must not merge clearly distinct companies.
 
@@ -183,7 +190,7 @@ Fuzzy similarity alone must not merge clearly distinct companies.
 
 Active, non-paused watched companies are checked on normal scheduled runs.
 
-Jobs discovered through a watched company must enter the same normal discovery pipeline as every other source.
+Jobs discovered through a watched company enter the same normal discovery pipeline as every other source.
 
 The watchlist is a discovery input, not a bypass around ranking or Gemini evaluation.
 
@@ -195,21 +202,27 @@ On a successful check:
 
 - update `last_successful_check_at`;
 - reset `consecutive_failures` to zero;
-- refresh `last_verified_at` when the endpoint is verified.
+- clear `paused_until`;
+- refresh `last_verified_at` when the endpoint itself is verified.
 
 On a failed check:
 
 - increment `consecutive_failures`;
 - log the failure without aborting the full run.
 
-After repeated failures, the entry may be temporarily paused using a deterministic backoff policy.
+The deterministic R2 backoff policy is:
 
-The implementation plan must define the exact failure count and pause duration, but the behavior must satisfy these requirements:
+- failures 1 and 2: keep checking on the next normal run;
+- failure 3: set `paused_until` to 24 hours after the failed check;
+- after the pause expires, allow one normal retry;
+- if that retry fails, pause for another 24 hours;
+- any successful check clears the failure count and pause state.
 
-- no permanent deletion from transient failures;
-- no repeated hammering of a clearly broken endpoint every run;
-- manual entries remain preserved;
-- a later known-good endpoint may reactivate or repair an unhealthy entry.
+This keeps the mechanism simple while preventing a broken endpoint from being hammered on every run.
+
+Manual entries remain preserved through all failure states.
+
+A later known-good endpoint may update and reactivate an unhealthy entry.
 
 ## 7. Canonical posting resolution
 
@@ -229,7 +242,7 @@ For each job candidate, attempt resolution in this order:
 4. known company ATS/watch metadata plus source job/company/title data;
 5. targeted search for the original employer posting using company + role title + supported ATS/careers domains.
 
-The resolver must stop once a sufficiently strong canonical match is found.
+The resolver stops once a sufficiently strong canonical match is found.
 
 ### 7.3 Confidence and fallback
 
@@ -275,10 +288,9 @@ job_sources
 - source_url
 - first_seen_at
 - last_seen_at
-- unique(job_id, source, source_job_id/source_url identity)
 ```
 
-The exact uniqueness representation may be implementation-specific, but processing the same source record repeatedly must be idempotent.
+The concrete schema must include an idempotent unique source-record identity derived from source + source job ID where available, otherwise source + canonicalized source URL.
 
 A job may therefore preserve provenance such as:
 
@@ -289,7 +301,7 @@ yc
 greenhouse
 ```
 
-while remaining a single logical job.
+while remaining one logical job.
 
 ## 9. Cross-source deduplication
 
@@ -307,7 +319,7 @@ Fuzzy similarity alone must never automatically merge jobs.
 
 If a source copy is stored first and a canonical ATS version is discovered later, the bot should enrich/merge the existing logical job instead of creating a second job.
 
-Existing evaluation/material/delivery associations must remain attached to the surviving logical job.
+Existing evaluation, material, delivery, and application-event associations must remain attached to the surviving logical job.
 
 ### 9.2 Provenance preservation during merge
 
@@ -317,21 +329,29 @@ When duplicate jobs are collapsed:
 - prefer the richer job description;
 - prefer employer/ATS canonical URL over aggregator URL;
 - preserve the best known company/location/remote metadata;
-- do not discard existing lifecycle/application history.
+- do not discard lifecycle/application history.
+
+Merge behavior must be deterministic so rerunning discovery cannot flip the surviving logical record back and forth.
 
 ## 10. Specialist-source strategy
 
 R2 uses a curated small set, not a broad scraper catalog.
 
-### 10.1 First-class structured/semi-structured candidates
+### 10.1 Initial specialist set
 
-The initial implementation should evaluate these as direct-adapter or semi-direct candidates:
+The implementation must cover these three categories:
 
 - YC / Work at a Startup;
-- Wellfound, only if its public surface is sufficiently stable and legally/technically appropriate for the chosen implementation;
-- one high-value Europe-focused source, with Welcome to the Jungle as the preferred initial candidate if its public surface supports reliable ingestion.
+- Wellfound;
+- one Europe-focused source, with Welcome to the Jungle as the preferred first choice.
 
-The implementation plan must verify the actual public integration surface before choosing adapter mechanics. If a source lacks a stable structured/public mechanism, it should fall back to targeted search rather than fragile logged-in scraping.
+For each source, implementation begins by verifying its current public integration surface.
+
+If a stable public structured or semi-structured surface exists, use a dedicated adapter.
+
+If it does not, use targeted public search for that source domain instead.
+
+A source must not be dropped from R2 merely because a direct adapter is inappropriate; targeted-search fallback satisfies the source requirement.
 
 ### 10.2 Search-driven specialist discovery
 
@@ -340,7 +360,7 @@ Use targeted search for:
 - VC portfolio job boards;
 - smaller startup job boards;
 - niche European engineering boards;
-- other useful sources lacking a stable public structured interface.
+- the R2 specialist sources when a stable public adapter is unavailable.
 
 Search-driven discovery may generate domain-specific queries such as:
 
@@ -349,7 +369,7 @@ site:<source-domain> "senior frontend engineer"
 site:<source-domain> "product engineer" React TypeScript
 ```
 
-These results must still pass through canonical resolution and normal ranking/evaluation.
+These results still pass through canonical resolution and normal ranking/evaluation.
 
 ### 10.3 No authenticated scraping
 
@@ -359,7 +379,7 @@ Only public/authorized surfaces may be used.
 
 ## 11. Source health and observability
 
-Each source path should report compact health/contribution metrics.
+Each source path reports compact health/contribution metrics.
 
 Examples:
 
@@ -375,7 +395,7 @@ watch_checks=17
 watch_paused=1
 ```
 
-The final exact metric names may vary, but logs must make it possible to answer:
+The final metric names may follow existing logging conventions, but logs must make it possible to answer:
 
 - which sources produced jobs;
 - which sources failed;
@@ -410,13 +430,13 @@ All jobs, regardless of origin, enter the existing profession gate, prefilter, r
 
 Source quality may remain an input to existing ranking, but a specialist/watch source must not automatically outrank a better-matching job solely because of origin.
 
-Company promotion happens only after final strong-match evaluation.
+Company promotion happens only after the strict promotion criteria in section 5.1 are satisfied.
 
 ## 14. Manual watch configuration
 
-R2 should support explicit manual seeds so the user can ensure important companies are always checked.
+R2 supports explicit manual seeds so important companies can always be checked.
 
-Manual entries may be represented in existing YAML config or another simple configuration surface consistent with the current project.
+Manual entries should use the existing YAML configuration surface unless the implementation plan finds a strong compatibility reason not to.
 
 Manual seeds may specify:
 
@@ -426,7 +446,7 @@ Manual seeds may specify:
 
 At runtime they are normalized into the same `company_watch` persistence model used by automatic entries.
 
-Repeated startup/run processing of the same manual config must be idempotent.
+Repeated processing of the same manual config must be idempotent.
 
 ## 15. Testing strategy
 
@@ -434,16 +454,16 @@ Repeated startup/run processing of the same manual config must be idempotent.
 
 Verify:
 
-- automatic promotion only after a strong match at the configured threshold;
+- automatic promotion only after `package_match` or `high_priority` with no blockers and score at least the configured package threshold;
 - profession-gate-only jobs do not promote companies;
 - possible/weak/skip/blocked jobs do not promote companies;
 - duplicate normalized company names do not create duplicate watch entries;
 - manual entries are preserved;
 - known ATS endpoints are preferred over generic careers URLs;
 - later higher-confidence endpoints upgrade watch metadata;
-- failed checks increment health counters;
-- successful checks reset counters;
-- repeated failures pause rather than delete entries;
+- failures increment health counters;
+- the third consecutive failure triggers a 24-hour pause;
+- successful checks reset failure and pause state;
 - repaired entries can become active again.
 
 ### 15.2 Canonical resolver tests
@@ -455,7 +475,7 @@ Verify:
 - embedded canonical/employer link extraction;
 - company/title ATS matching;
 - targeted-search matching;
-- confidence thresholds;
+- confidence gating;
 - low-confidence fallback to original URL;
 - resolver exceptions fail open;
 - wrong-company or incompatible-title results are rejected.
@@ -470,11 +490,12 @@ Verify:
 - fuzzy similarity alone does not merge jobs;
 - all source records remain attached after merge;
 - late canonical discovery enriches the existing job;
-- existing evaluations/materials/application events remain associated with the surviving job.
+- existing evaluations/materials/application events remain associated with the surviving job;
+- reruns are idempotent and do not flip merge winners.
 
 ### 15.4 Specialist-source tests
 
-For each direct/semi-direct adapter:
+For each dedicated adapter actually selected:
 
 - fixture happy path;
 - pagination where applicable;
@@ -483,7 +504,7 @@ For each direct/semi-direct adapter:
 - network/API failure;
 - source-specific IDs/URLs preserved correctly.
 
-Targeted-search tests verify domain-specific query generation and result normalization without assuming every search result is a valid job.
+For every specialist source covered through targeted search, test domain-specific query generation and result normalization without assuming every search result is a valid job.
 
 ### 15.5 End-to-end discovery tests
 
@@ -512,9 +533,9 @@ Verify that one failed source/watch/resolution attempt does not prevent successf
 
 R2 remains SQLite-first.
 
-New tables or columns must be introduced with backward-compatible initialization/migration behavior so existing production state can be restored and upgraded in place.
+New tables or columns must use backward-compatible initialization/migration behavior so existing production state can be restored and upgraded in place.
 
-R2 should avoid leaking raw SQLite assumptions into source/canonical/watch business logic where practical. Persistence operations should remain behind the existing store/repository boundary so a later Supabase migration can replace persistence incrementally.
+R2 should avoid leaking raw SQLite assumptions into source/canonical/watch business logic where practical. Persistence operations remain behind the existing store/repository boundary so a later Supabase migration can replace persistence incrementally.
 
 No Supabase client or schema is introduced in R2.
 
@@ -529,25 +550,26 @@ R2 preserves all existing safety boundaries:
 - no email mutation;
 - no LinkedIn credential/cookie storage.
 
-Public website access must remain respectful and bounded. Failed or rate-limited sources should back off/fail open rather than be hammered repeatedly.
+Public website access must remain respectful and bounded. Failed or rate-limited sources should fail open/back off rather than be hammered repeatedly.
 
 ## 18. Success criteria
 
 R2 is complete when:
 
-1. A strong evaluated job can automatically create or update a company watch entry using the configured strong-match threshold.
+1. A qualifying strong evaluated job can automatically create or update a company watch entry using the existing evaluation thresholds.
 2. Weak or merely profession-relevant jobs do not pollute the watchlist.
 3. Active watched companies are checked automatically on later runs without manual intervention.
-4. Supported ATS endpoints are preferred over generic careers pages when confidently known.
-5. Discovered jobs retain both original source provenance and the best known canonical employer/ATS URL.
-6. Jobs arriving through different sources collapse into one logical job when strong identity evidence exists.
-7. Late canonical discovery enriches an existing job rather than duplicating it.
-8. At least the curated R2 specialist-source set contributes through stable public adapters or targeted-search fallback without authenticated scraping.
-9. Canonical resolution is aggressive but never blocks or discards a valid unresolved job.
-10. Source/watch failures remain isolated and the daily job hunt continues.
-11. Logs expose source contribution, canonical-resolution, duplicate-collapse, and watch-health metrics.
-12. Existing Gmail intelligence, evaluation, cover-letter, Telegram, and SQLite state behavior continues to work.
-13. No Supabase dependency or user-driven ingestion is introduced.
+4. Three consecutive watch failures trigger a 24-hour pause, while later success restores normal checking.
+5. Supported ATS endpoints are preferred over generic careers pages when confidently known.
+6. Discovered jobs retain original source provenance and the best known canonical employer/ATS URL.
+7. Jobs arriving through different sources collapse into one logical job when strong identity evidence exists.
+8. Late canonical discovery enriches an existing job rather than duplicating it.
+9. YC, Wellfound, and one Europe-focused specialist source are covered through stable public adapters or targeted-search fallback without authenticated scraping.
+10. Canonical resolution is aggressive but never blocks or discards a valid unresolved job.
+11. Source/watch failures remain isolated and the daily job hunt continues.
+12. Logs expose source contribution, canonical-resolution, duplicate-collapse, and watch-health metrics.
+13. Existing Gmail intelligence, evaluation, cover-letter, Telegram, and SQLite state behavior continues to work.
+14. No Supabase dependency or user-driven ingestion is introduced.
 
 ## 19. Immediate roadmap after R2
 
