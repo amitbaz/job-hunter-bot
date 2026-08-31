@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from job_hunter.gmail_client import GmailHistoryExpired, GmailHistoryPage, GmailPage
+from job_hunter.gmail_matching import JobMatch
 from job_hunter.gmail_models import ExtractedJob, GmailClassification, GmailMessage
 from job_hunter.models import Job
 from job_hunter.gmail_sync import GmailSyncService, build_backfill_query
@@ -442,6 +443,43 @@ def test_unresolved_lifecycle_event_is_review_needed_without_job_association(tmp
     )
     gmail = FakeGmail(message_ids=[message.message_id], messages={message.message_id: message})
     service, store = _service(tmp_path, gmail)
+
+    summary = service.sync(NOW)
+
+    event = store._conn.execute(
+        "SELECT job_id, event_type FROM application_events WHERE source_message_id = ?",
+        (message.message_id,),
+    ).fetchone()
+    assert summary.review_needed == 1
+    assert (event["job_id"], event["event_type"]) == (None, "REVIEW_NEEDED")
+
+
+def test_ambiguous_lifecycle_event_is_review_needed_without_job_association(
+    tmp_path, monkeypatch
+):
+    message = _message("ambiguous-interview")
+    gmail = FakeGmail(message_ids=[message.message_id], messages={message.message_id: message})
+    service, store = _service(tmp_path, gmail)
+    job_id, _, _ = store.upsert_job(
+        Job(
+            source="public",
+            source_job_id="frontend-1",
+            company="Acme",
+            title="Frontend Engineer",
+        )
+    )
+    classification = GmailClassification(
+        kind="INTERVIEW",
+        confidence=1.0,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="interview details",
+    )
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+    monkeypatch.setattr(
+        "job_hunter.gmail_sync.match_job",
+        lambda *_: JobMatch(job_id=job_id, reason="ambiguous_title", ambiguous=True),
+    )
 
     summary = service.sync(NOW)
 

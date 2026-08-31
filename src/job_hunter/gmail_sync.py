@@ -194,11 +194,9 @@ class GmailSyncService:
         classification: GmailClassification,
     ) -> tuple[GmailClassification, int | None]:
         match = match_job(self.store, classification, message)
-        if (
-            match.job_id is None
-            or match.ambiguous
-            or classification.confidence < AUTO_CONFIDENCE_THRESHOLD
-        ):
+        if match.job_id is None or match.ambiguous:
+            return replace(classification, kind="REVIEW_NEEDED"), None
+        if classification.confidence < AUTO_CONFIDENCE_THRESHOLD:
             return replace(classification, kind="REVIEW_NEEDED"), match.job_id
         return classification, match.job_id
 
