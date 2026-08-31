@@ -1,3 +1,5 @@
+import sqlite3
+
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import Evaluation, Job
 from job_hunter.store import JobStore
@@ -19,6 +21,151 @@ def _evaluation(job_id, **overrides):
     )
     defaults.update(overrides)
     return Evaluation(**defaults)
+
+
+def _create_r1_jobs_only_db(path):
+    conn = sqlite3.connect(path)
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            fingerprint TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL DEFAULT '',
+            source_job_id TEXT,
+            url TEXT NOT NULL DEFAULT '',
+            company TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            remote INTEGER,
+            description TEXT NOT NULL DEFAULT '',
+            description_hash TEXT NOT NULL DEFAULT '',
+            first_seen_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'new'
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO jobs
+            (fingerprint, source, url, company, title, description_hash,
+             first_seen_at, last_seen_at)
+        VALUES ('legacy', 'gmail:linkedin', 'https://example.test/job',
+                'Acme', 'Frontend Engineer', '',
+                '2026-08-01T00:00:00+00:00', '2026-08-01T00:00:00+00:00')
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_r2_schema_upgrades_legacy_jobs_table(tmp_path):
+    db = tmp_path / "state.sqlite3"
+    _create_r1_jobs_only_db(db)
+
+    store = JobStore(db)
+
+    columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(jobs)")}
+    assert "canonical_url" in columns
+    assert "ats_provider" in columns
+    assert "ats_board" in columns
+    assert "ats_job_id" in columns
+    assert store.count_jobs() == 1
+    tables = {
+        row["name"]
+        for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "job_sources" in tables
+    assert "company_watch" in tables
+
+
+def test_record_job_source_is_idempotent(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(source="yc", title="Frontend Engineer", company="Acme", url="https://yc.test/job/123")
+    )
+
+    store.record_job_source(
+        job_id,
+        source="yc",
+        source_job_id="123",
+        source_url="https://yc.test/job/123",
+    )
+    store.record_job_source(
+        job_id,
+        source="yc",
+        source_job_id="123",
+        source_url="https://yc.test/job/123",
+    )
+
+    rows = store.list_job_sources(job_id)
+    assert len(rows) == 1
+    assert rows[0]["source"] == "yc"
+    assert rows[0]["source_job_id"] == "123"
+
+
+def test_provenance_without_source_id_uses_canonical_url(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(source="yc", title="Frontend Engineer", company="Acme")
+    )
+
+    store.record_job_source(
+        job_id,
+        source="yc",
+        source_job_id=None,
+        source_url="https://yc.test/job/123?utm_source=digest",
+    )
+    store.record_job_source(
+        job_id,
+        source="yc",
+        source_job_id=None,
+        source_url="https://yc.test/job/123",
+    )
+
+    rows = store.list_job_sources(job_id)
+    assert len(rows) == 1
+    assert rows[0]["identity_key"] == "url:https://yc.test/job/123"
+
+
+def test_strong_lookups_find_the_single_matching_job(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(
+            source="greenhouse",
+            source_job_id="posting-1",
+            title="Senior Frontend Engineer",
+            company="Acme GmbH",
+            location="Berlin, Germany",
+            url="https://boards.greenhouse.io/acme/jobs/posting-1?gh_src=feed",
+            canonical_url="https://boards.greenhouse.io/acme/jobs/posting-1",
+            ats_provider="greenhouse",
+            ats_board="acme",
+            ats_job_id="posting-1",
+        )
+    )
+
+    assert store.find_job_by_canonical_url(
+        "https://boards.greenhouse.io/acme/jobs/posting-1?utm_source=email"
+    ) == job_id
+    assert store.find_job_by_ats("greenhouse", "acme", "posting-1") == job_id
+    assert store.find_job_by_identity("ACME", "senior frontend engineer", "Berlin") == job_id
+
+
+def test_identity_lookup_rejects_ambiguous_matches(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    for source_job_id in ("1", "2"):
+        store.upsert_job(
+            Job(
+                source="source",
+                source_job_id=source_job_id,
+                title="Frontend Engineer",
+                company="Acme",
+                location="Berlin",
+            )
+        )
+
+    assert store.find_job_by_identity("Acme", "Frontend Engineer", "Berlin") is None
 
 
 def test_upsert_dedupes_and_detects_description_change(tmp_path):
