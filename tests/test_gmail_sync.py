@@ -4,7 +4,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 
 from job_hunter.gmail_client import GmailHistoryExpired, GmailHistoryPage, GmailPage
-from job_hunter.gmail_models import GmailMessage
+from job_hunter.gmail_models import ExtractedJob, GmailClassification, GmailMessage
+from job_hunter.models import Job
 from job_hunter.gmail_sync import GmailSyncService, build_backfill_query
 from job_hunter.store import JobStore
 
@@ -175,6 +176,43 @@ def test_backfill_error_prevents_completion_marker(tmp_path):
     assert store.get_gmail_sync_state("candidate@example.com") is None
 
 
+def test_failed_forced_backfill_is_retried_by_following_ordinary_sync(tmp_path):
+    gmail = FakeGmail(
+        profile=("candidate@example.com", "force-start-checkpoint"),
+        message_ids=["historical-message"],
+        messages={"historical-message": RuntimeError("decode failed")},
+    )
+    service, store = _service(tmp_path, gmail)
+    _save_completed_state(store, history_id="completed-cursor")
+
+    failed_summary = service.sync(NOW, force_backfill=True)
+
+    incomplete_state = store.get_gmail_sync_state("candidate@example.com")
+    assert failed_summary.errors == 1
+    assert incomplete_state["backfill_completed_at"] is None
+
+    gmail.messages["historical-message"] = _message("historical-message")
+    retry_summary = service.sync(NOW + timedelta(minutes=1))
+
+    state = store.get_gmail_sync_state("candidate@example.com")
+    assert gmail.search_calls == [
+        (
+            'after:2025/08/31 {application interview recruiter hiring "job alert" '
+            'position "technical assessment" "coding challenge" offer}',
+            None,
+        ),
+        (
+            'after:2025/08/31 {application interview recruiter hiring "job alert" '
+            'position "technical assessment" "coding challenge" offer}',
+            None,
+        ),
+    ]
+    assert gmail.history_calls == []
+    assert retry_summary.processed == 1
+    assert state["history_id"] == "force-start-checkpoint"
+    assert state["backfill_completed_at"] == (NOW + timedelta(minutes=1)).isoformat()
+
+
 def test_message_arriving_during_backfill_is_not_skipped_by_saved_history_checkpoint(
     tmp_path,
 ):
@@ -322,6 +360,174 @@ def test_history_hard_error_does_not_advance_cursor(tmp_path):
     assert summary.processed == 1
     assert state["history_id"] == "old-cursor"
     assert state["last_successful_sync_at"] == original_sync_at.isoformat()
+
+
+def test_processed_message_lookup_failure_is_counted_and_continues_batch(
+    tmp_path, monkeypatch, caplog
+):
+    gmail = FakeGmail(
+        messages={"lookup-broken": _message("lookup-broken"), "ok": _message("ok")}
+    )
+    gmail.history_pages = {
+        None: GmailHistoryPage(["lookup-broken", "ok"], "new-cursor", None)
+    }
+    service, store = _service(tmp_path, gmail)
+    _save_completed_state(store, history_id="old-cursor")
+    original_lookup = store.has_processed_gmail_message
+
+    def fail_one_lookup(message_id: str) -> bool:
+        if message_id == "lookup-broken":
+            raise RuntimeError("processed-message lookup failed")
+        return original_lookup(message_id)
+
+    monkeypatch.setattr(store, "has_processed_gmail_message", fail_one_lookup)
+    caplog.set_level(logging.INFO, logger="job_hunter.gmail_sync")
+
+    summary = service.sync(NOW)
+
+    state = store.get_gmail_sync_state("candidate@example.com")
+    assert summary.errors == 1
+    assert summary.processed == 1
+    assert gmail.message_calls == ["ok"]
+    assert state["history_id"] == "old-cursor"
+    assert caplog.messages[-1] == (
+        "gmail_fetched=2 gmail_processed=1 gmail_job_alerts=0 "
+        "gmail_application_events=0 gmail_review_needed=0 "
+        "gmail_irrelevant=1 gmail_errors=1"
+    )
+
+
+def test_resolved_lifecycle_event_persists_real_event_type(tmp_path):
+    message = GmailMessage(
+        message_id="interview-message",
+        thread_id="interview-thread",
+        sender="jobs@example.com",
+        subject="Interview invitation",
+        sent_at=NOW,
+        snippet="Choose an interview time",
+        body="Interview invitation: choose a time.",
+        links=["https://jobs.example.com/frontend"],
+    )
+    gmail = FakeGmail(message_ids=[message.message_id], messages={message.message_id: message})
+    service, store = _service(tmp_path, gmail)
+    job_id, _, _ = store.upsert_job(
+        Job(
+            source="public",
+            source_job_id="frontend-1",
+            url="https://jobs.example.com/frontend",
+            company="Acme",
+            title="Frontend Engineer",
+        )
+    )
+
+    summary = service.sync(NOW)
+
+    event = store._conn.execute(
+        "SELECT job_id, event_type FROM application_events WHERE source_message_id = ?",
+        (message.message_id,),
+    ).fetchone()
+    assert summary.application_events == 1
+    assert (event["job_id"], event["event_type"]) == (job_id, "INTERVIEW")
+
+
+def test_unresolved_lifecycle_event_is_review_needed_without_job_association(tmp_path):
+    message = GmailMessage(
+        message_id="unresolved-interview",
+        thread_id="unresolved-thread",
+        sender="jobs@example.com",
+        subject="Interview invitation",
+        sent_at=NOW,
+        snippet="Choose an interview time",
+        body="Interview invitation: choose a time.",
+    )
+    gmail = FakeGmail(message_ids=[message.message_id], messages={message.message_id: message})
+    service, store = _service(tmp_path, gmail)
+
+    summary = service.sync(NOW)
+
+    event = store._conn.execute(
+        "SELECT job_id, event_type FROM application_events WHERE source_message_id = ?",
+        (message.message_id,),
+    ).fetchone()
+    assert summary.review_needed == 1
+    assert (event["job_id"], event["event_type"]) == (None, "REVIEW_NEEDED")
+
+
+def test_low_confidence_lifecycle_event_is_review_needed(tmp_path, monkeypatch):
+    message = _message("low-confidence")
+    gmail = FakeGmail(message_ids=[message.message_id], messages={message.message_id: message})
+    service, store = _service(tmp_path, gmail)
+    job_id, _, _ = store.upsert_job(
+        Job(
+            source="public",
+            source_job_id="frontend-1",
+            url="https://jobs.example.com/frontend",
+            company="Acme",
+            title="Frontend Engineer",
+        )
+    )
+    classification = GmailClassification(
+        kind="INTERVIEW",
+        confidence=0.89,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="model was uncertain",
+    )
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+
+    summary = service.sync(NOW)
+
+    event = store._conn.execute(
+        "SELECT job_id, event_type FROM application_events WHERE source_message_id = ?",
+        (message.message_id,),
+    ).fetchone()
+    assert job_id is not None
+    assert summary.review_needed == 1
+    assert (event["job_id"], event["event_type"]) == (job_id, "REVIEW_NEEDED")
+
+
+def test_old_recruiter_mail_without_extracted_job_is_not_staged_but_concrete_role_is(
+    tmp_path, monkeypatch
+):
+    no_job = _message("old-recruiter-no-job", sent_at=NOW - timedelta(days=180))
+    concrete_role = _message("old-recruiter-role", sent_at=NOW - timedelta(days=180))
+    gmail = FakeGmail(
+        message_ids=[no_job.message_id, concrete_role.message_id],
+        messages={no_job.message_id: no_job, concrete_role.message_id: concrete_role},
+    )
+    service, store = _service(tmp_path, gmail)
+    classifications = iter(
+        [
+            GmailClassification(
+                kind="RECRUITER_CONTACT",
+                confidence=1.0,
+                rationale="general outreach without a role",
+            ),
+            GmailClassification(
+                kind="RECRUITER_CONTACT",
+                confidence=1.0,
+                jobs=[
+                    ExtractedJob(
+                        source_platform="linkedin",
+                        url="https://www.linkedin.com/jobs/view/42/",
+                        company="Acme",
+                        title="Frontend Engineer",
+                    )
+                ],
+                rationale="concrete recruiter opportunity",
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        "job_hunter.gmail_sync.classify_email", lambda *_: next(classifications)
+    )
+
+    service.sync(NOW)
+
+    rows = store._conn.execute(
+        "SELECT source_message_id FROM inbound_job_candidates ORDER BY source_message_id"
+    ).fetchall()
+    assert [row["source_message_id"] for row in rows] == ["old-recruiter-role"]
 
 
 def test_expired_history_uses_one_day_overlap_search(tmp_path):

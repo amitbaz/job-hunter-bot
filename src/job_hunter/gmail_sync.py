@@ -53,7 +53,16 @@ class GmailSyncService:
         account_id, checkpoint_history_id = self.gmail.get_profile()
         state = self.store.get_gmail_sync_state(account_id)
 
-        if state is None or force_backfill:
+        backfill_pending = state is None or state["backfill_completed_at"] is None
+        if force_backfill and state is not None and not dry_run:
+            self.store.save_gmail_sync_state(
+                account_id=account_id,
+                history_id=state["history_id"],
+                last_successful_sync_at=state["last_successful_sync_at"],
+                backfill_completed_at=None,
+            )
+
+        if backfill_pending or force_backfill:
             message_ids = self._search_message_ids(build_backfill_query(now))
             self._backfill_now = now
             try:
@@ -254,9 +263,9 @@ class GmailSyncService:
         had_hard_errors = False
         for message_id in message_ids:
             summary.fetched += 1
-            if not dry_run and self.store.has_processed_gmail_message(message_id):
-                continue
             try:
+                if not dry_run and self.store.has_processed_gmail_message(message_id):
+                    continue
                 classification = self.process_message(
                     self.gmail.get_message(message_id),
                     dry_run=dry_run,
