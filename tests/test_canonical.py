@@ -1,3 +1,4 @@
+import job_hunter.canonical as canonical
 from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
 from job_hunter.models import AtsReference, Job
 
@@ -128,6 +129,161 @@ def test_watch_target_matches_ats_board_and_exact_normalized_title():
     assert result is not None
     assert result.confidence == 0.92
     assert result.method == "watch_target"
+
+
+def test_embedded_supported_ats_url_resolves_at_095():
+    http = _Http(
+        _Response(
+            url="https://board.test/job",
+            text='<a href="https://jobs.ashbyhq.com/acme/abc">Apply</a>',
+        )
+    )
+    resolver = CanonicalResolver(
+        http, search_candidates=lambda job: [], watch_target=lambda company: None
+    )
+
+    result = resolver.resolve(
+        Job(
+            source="board",
+            title="Frontend Engineer",
+            company="Acme",
+            url="https://board.test/job",
+        )
+    )
+
+    assert result is not None
+    assert result.url == "https://jobs.ashbyhq.com/acme/abc"
+    assert result.confidence == 0.95
+    assert result.method == "embedded"
+
+
+def test_targeted_search_exact_match_resolves_at_090():
+    http = _Http(_Response(url="https://board.test/job", text="<html></html>"))
+    resolver = CanonicalResolver(
+        http,
+        search_candidates=lambda job: [
+            Job(
+                source="duckduckgo",
+                title="Frontend Engineer",
+                company="Acme Inc.",
+                location="Berlin, Germany",
+                url="https://careers.acme.test/jobs/frontend",
+            )
+        ],
+        watch_target=lambda company: None,
+    )
+
+    result = resolver.resolve(
+        Job(
+            source="board",
+            title="Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://board.test/job",
+        )
+    )
+
+    assert result is not None
+    assert result.url == "https://careers.acme.test/jobs/frontend"
+    assert result.confidence == 0.90
+    assert result.method == "targeted_search"
+
+
+def test_targeted_search_prefers_supported_ats_url_over_generic_result():
+    http = _Http(_Response(url="https://board.test/job", text="<html></html>"))
+    resolver = CanonicalResolver(
+        http,
+        search_candidates=lambda job: [
+            Job(
+                source="duckduckgo",
+                title="Frontend Engineer",
+                company="Acme",
+                url="https://careers.acme.test/jobs/frontend",
+            ),
+            Job(
+                source="duckduckgo",
+                title="Frontend Engineer",
+                company="Acme",
+                url="https://jobs.lever.co/acme/abc",
+            ),
+        ],
+        watch_target=lambda company: None,
+    )
+
+    result = resolver.resolve(
+        Job(
+            source="board",
+            title="Frontend Engineer",
+            company="Acme",
+            url="https://board.test/job",
+        )
+    )
+
+    assert result is not None
+    assert result.url == "https://jobs.lever.co/acme/abc"
+    assert result.ats == AtsReference("lever", "acme", "abc")
+
+
+def test_watch_target_failure_does_not_block_targeted_search():
+    http = _Http(_Response(url="https://board.test/job", text="<html></html>"))
+    resolver = CanonicalResolver(
+        http,
+        search_candidates=lambda job: [
+            Job(
+                source="duckduckgo",
+                title="Frontend Engineer",
+                company="Acme",
+                url="https://careers.acme.test/jobs/frontend",
+            )
+        ],
+        watch_target=lambda company: (_ for _ in ()).throw(RuntimeError("watch down")),
+    )
+
+    result = resolver.resolve(
+        Job(
+            source="board",
+            title="Frontend Engineer",
+            company="Acme",
+            url="https://board.test/job",
+        )
+    )
+
+    assert result is not None
+    assert result.confidence == 0.90
+    assert result.method == "targeted_search"
+
+
+def test_extraction_failure_does_not_block_targeted_search(monkeypatch):
+    def fail_extraction(html: str, base_url: str) -> list[str]:
+        raise RuntimeError("invalid page")
+
+    monkeypatch.setattr(canonical, "extract_job_page_links", fail_extraction)
+    http = _Http(_Response(url="https://board.test/job", text="<html></html>"))
+    resolver = CanonicalResolver(
+        http,
+        search_candidates=lambda job: [
+            Job(
+                source="duckduckgo",
+                title="Frontend Engineer",
+                company="Acme",
+                url="https://jobs.ashbyhq.com/acme/abc",
+            )
+        ],
+        watch_target=lambda company: None,
+    )
+
+    result = resolver.resolve(
+        Job(
+            source="board",
+            title="Frontend Engineer",
+            company="Acme",
+            url="https://board.test/job",
+        )
+    )
+
+    assert result is not None
+    assert result.confidence == 0.90
+    assert result.method == "targeted_search"
 
 
 def test_resolution_failure_is_non_blocking():

@@ -75,7 +75,11 @@ class CanonicalResolver:
                 method="redirect",
             )
 
-        for url in extract_job_page_links(response.text, response.url):
+        try:
+            links = extract_job_page_links(response.text, response.url)
+        except Exception:
+            links = []
+        for url in links:
             ats = parse_supported_ats_url(url)
             if ats is not None:
                 return CanonicalResolution(
@@ -87,9 +91,13 @@ class CanonicalResolver:
 
         try:
             candidates = self._search_candidates(job)
-            watch_ats = self._watch_target(job.company)
         except Exception:
             return None
+
+        try:
+            watch_ats = self._watch_target(job.company)
+        except Exception:
+            watch_ats = None
 
         if watch_ats is not None:
             for candidate in candidates:
@@ -102,16 +110,29 @@ class CanonicalResolver:
                         method="watch_target",
                     )
 
+        generic_candidate: Job | None = None
         for candidate in candidates:
             if _same_company(job, candidate) and _titles_match(job, candidate) and locations_compatible(
                 job.location, candidate.location
             ):
-                return CanonicalResolution(
-                    url=candidate.url,
-                    ats=parse_supported_ats_url(candidate.url),
-                    confidence=0.90,
-                    method="targeted_search",
-                )
+                ats = parse_supported_ats_url(candidate.url)
+                if ats is not None:
+                    return CanonicalResolution(
+                        url=candidate.url,
+                        ats=ats,
+                        confidence=0.90,
+                        method="targeted_search",
+                    )
+                if generic_candidate is None:
+                    generic_candidate = candidate
+
+        if generic_candidate is not None:
+            return CanonicalResolution(
+                url=generic_candidate.url,
+                ats=None,
+                confidence=0.90,
+                method="targeted_search",
+            )
         return None
 
 
