@@ -42,6 +42,28 @@ def test_high_signal_templates_are_deterministic(subject, body, expected):
     assert result.confidence == 1.0
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        (
+            "We are pleased to offer you the position. "
+            "However, we will not be moving forward with your application."
+        ),
+        (
+            "We regret to inform you that we will not be moving forward.\n\n"
+            "-----Original Message-----\n"
+            "We are pleased to offer you the position."
+        ),
+    ],
+)
+def test_conflicting_deterministic_lifecycle_signals_require_review(body):
+    result = classify_deterministically(message("Application update", body))
+
+    assert result is not None
+    assert result.kind == "REVIEW_NEEDED"
+    assert "conflicting" in result.rationale
+
+
 def test_linkedin_job_alert_extracts_known_job_url():
     result = classify_deterministically(
         message(
@@ -56,6 +78,45 @@ def test_linkedin_job_alert_extracts_known_job_url():
     assert result.kind == "JOB_ALERT"
     assert result.confidence == 1.0
     assert [job.url for job in result.jobs] == ["https://www.linkedin.com/jobs/view/1234567890/"]
+
+
+def test_generic_job_alert_without_known_candidate_uses_semantic_extraction():
+    job_url = "https://talentboard.example/jobs/frontend-42"
+    gemini = FakeGemini(
+        semantic_response(
+            kind="JOB_ALERT",
+            company="Acme",
+            role_title="Frontend Engineer",
+            job_urls=[job_url],
+            jobs=[
+                {
+                    "source_platform": "talentboard",
+                    "source_job_id": "frontend-42",
+                    "url": job_url,
+                    "company": "Acme",
+                    "title": "Frontend Engineer",
+                    "location": "Remote",
+                    "remote": True,
+                    "description": "Frontend role from the alert.",
+                }
+            ],
+            rationale="Job-board alert with one frontend opening.",
+        )
+    )
+
+    result = classify_email(
+        message(
+            "Job alert",
+            "A new frontend role matches your preferences.",
+            sender="alerts@talentboard.example",
+            links=[job_url],
+        ),
+        gemini,
+    )
+
+    assert result.kind == "JOB_ALERT"
+    assert [job.url for job in result.jobs] == [job_url]
+    assert len(gemini.calls) == 1
 
 
 def test_linkedin_security_notification_uses_semantic_fallback_not_job_alert():

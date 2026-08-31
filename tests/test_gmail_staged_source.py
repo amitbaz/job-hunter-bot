@@ -31,7 +31,7 @@ def test_staged_source_returns_stable_gmail_job_identity(tmp_path):
     assert job.company == "Acme"
     assert job.location == "Remote"
     assert job.url == "https://linkedin.example/jobs/123"
-    assert job.description == "React TypeScript"
+    assert job.description == ""
     assert job.remote is True
 
 

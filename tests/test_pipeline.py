@@ -96,6 +96,22 @@ class FlakyTelegram:
         return f"doc-{len(self.documents)}"
 
 
+class FailOnSecondMessageTelegram:
+    def __init__(self):
+        self.attempts = []
+        self.messages = []
+
+    def send_message(self, text):
+        self.attempts.append(text)
+        if len(self.attempts) == 2:
+            return None
+        self.messages.append(text)
+        return f"msg-{len(self.messages)}"
+
+    def send_document(self, path, caption):
+        raise AssertionError("review-only fixture must not send documents")
+
+
 class OrderedFakeTelegram(FakeTelegram):
     def __init__(self):
         super().__init__()
@@ -321,6 +337,40 @@ def test_pipeline_retries_gmail_reviews_after_a_failed_telegram_send(settings):
         "Gmail review needed\n"
         "- Acme — Frontend Engineer | ambiguous scheduling language"
     ]
+
+
+def test_pipeline_marks_each_review_chunk_before_retrying_partial_failure(settings):
+    store = JobStore(settings.db_path)
+    first_event_id = _record_review_event(
+        store,
+        message_id="review-1",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        company="A" * 2000,
+    )
+    second_event_id = _record_review_event(
+        store,
+        message_id="review-2",
+        occurred_at="2026-08-31T11:00:00+00:00",
+        company="B" * 2000,
+    )
+    telegram = FailOnSecondMessageTelegram()
+
+    run_pipeline(settings, sources=[], store=store, gemini=FakeGemini(), telegram=telegram)
+
+    assert len(telegram.attempts) == 2
+    assert all(len(message) <= 3900 for message in telegram.attempts)
+    assert [row["id"] for row in store.pending_review_events()] == [second_event_id]
+    delivered = store._conn.execute(
+        "SELECT event_id FROM review_deliveries ORDER BY event_id"
+    ).fetchall()
+    assert [row["event_id"] for row in delivered] == [first_event_id]
+
+    run_pipeline(settings, sources=[], store=store, gemini=FakeGemini(), telegram=telegram)
+
+    assert len(telegram.attempts) == 3
+    assert "A" * 2000 not in telegram.attempts[2]
+    assert "B" * 2000 in telegram.attempts[2]
+    assert store.pending_review_events() == []
 
 
 def test_pipeline_sends_gmail_reviews_after_normal_job_delivery_without_scoring_them(settings):

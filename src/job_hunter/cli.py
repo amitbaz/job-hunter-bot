@@ -88,12 +88,21 @@ def _run(args: argparse.Namespace) -> int:
 
 def _sync_gmail(args: argparse.Namespace) -> int:
     settings = load_gmail_settings()
-    Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
+    db_path = Path(settings.db_path)
+    if args.dry_run:
+        store = (
+            JobStore(db_path, read_only=True)
+            if db_path.exists()
+            else JobStore(":memory:")
+        )
+    else:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        store = JobStore(db_path)
 
     http = HttpClient()
     gmail = GmailClient(http, GoogleOAuthTokenProvider(settings))
     gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
-    service = GmailSyncService(gmail=gmail, gemini=gemini, store=JobStore(settings.db_path))
+    service = GmailSyncService(gmail=gmail, gemini=gemini, store=store)
     summary = service.sync(
         datetime.now(timezone.utc),
         dry_run=args.dry_run,

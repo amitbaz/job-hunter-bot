@@ -154,11 +154,22 @@ def _now_iso() -> str:
 class JobStore:
     """SQLite-backed persistence layer for the job hunter bot."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, read_only: bool = False) -> None:
         self._path = str(path)
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        if read_only:
+            database_uri = Path(path).resolve().as_uri() + "?mode=ro"
+            self._conn = sqlite3.connect(
+                database_uri,
+                uri=True,
+                check_same_thread=False,
+            )
+        else:
+            self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._init_db()
+        if read_only:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+        else:
+            self._init_db()
 
     # ------------------------------------------------------------------
     # Schema setup
@@ -388,7 +399,7 @@ class JobStore:
                     job.title,
                     job.location,
                     remote,
-                    job.description,
+                    "",
                     now,
                     now,
                 ),

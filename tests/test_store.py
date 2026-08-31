@@ -363,6 +363,31 @@ def test_candidate_not_emitted_when_any_job_has_same_canonical_url(tmp_path):
     assert store.list_unmaterialized_inbound_jobs() == []
 
 
+def test_candidate_not_emitted_when_gmail_source_and_candidate_key_match(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.stage_inbound_job(
+        "m1",
+        "candidate-key-1",
+        ExtractedJob(
+            source_platform="talentboard",
+            url="https://email.example/jobs/one",
+            company="Email Company",
+            title="Email Role",
+        ),
+    )
+    store.upsert_job(
+        Job(
+            source="gmail:talentboard",
+            source_job_id="candidate-key-1",
+            url="https://materialized.example/jobs/different",
+            company="Materialized Company",
+            title="Materialized Role",
+        )
+    )
+
+    assert store.list_unmaterialized_inbound_jobs() == []
+
+
 def test_candidate_not_emitted_when_url_missing_but_identity_matches(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     store.stage_inbound_job(

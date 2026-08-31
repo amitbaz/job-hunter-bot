@@ -58,6 +58,10 @@ confidence must be a number from 0 to 1.
 jobs must be an array of objects with source_platform, source_job_id, url, company, title, location, remote, description.
 Do not infer facts not present in the email. Keep rationale under 160 characters.
 """
+_JOB_ALERT_EXTRACTION_INSTRUCTION = """Deterministic rules identified this message as a JOB_ALERT.
+Keep kind as JOB_ALERT and extract only job candidates evidenced by the email.
+Use a URL only when it appears in the supplied email links or body.
+"""
 
 
 def _is_absolute_http_url(value: str) -> bool:
@@ -156,16 +160,30 @@ def is_probably_job_related(message: GmailMessage) -> bool:
 
 def classify_deterministically(message: GmailMessage) -> GmailClassification | None:
     text = normalize_text(" ".join([message.subject, message.snippet, message.body]))
+    lifecycle_matches: list[tuple[str, str]] = []
     if "offer you the position" in text or "pleased to offer" in text:
-        return _classification("OFFER", message, "deterministic offer template")
+        lifecycle_matches.append(("OFFER", "deterministic offer template"))
     if "not be moving forward" in text or "we regret to inform" in text:
-        return _classification("REJECTED", message, "deterministic rejection template")
+        lifecycle_matches.append(("REJECTED", "deterministic rejection template"))
     if "technical assessment" in text or "coding challenge" in text:
-        return _classification("TECHNICAL", message, "deterministic technical assessment template")
-    if "interview invitation" in text or ("choose a time" in text and "interview" in text):
-        return _classification("INTERVIEW", message, "deterministic interview template")
+        lifecycle_matches.append(
+            ("TECHNICAL", "deterministic technical assessment template")
+        )
+    if "interview invitation" in text or (
+        "choose a time" in text and "interview" in text
+    ):
+        lifecycle_matches.append(("INTERVIEW", "deterministic interview template"))
     if "thanks for applying" in text or "received your application" in text:
-        return _classification("APPLIED", message, "deterministic application receipt template")
+        lifecycle_matches.append(
+            ("APPLIED", "deterministic application receipt template")
+        )
+
+    if len(lifecycle_matches) > 1:
+        kinds = ", ".join(kind.lower() for kind, _ in lifecycle_matches)
+        return _review_needed(f"conflicting deterministic lifecycle signals: {kinds}")
+    if lifecycle_matches:
+        kind, rationale = lifecycle_matches[0]
+        return _classification(kind, message, rationale)
     if "job alert" in text or _is_job_alert_sender(message):
         return _classification("JOB_ALERT", message, "deterministic job alert sender or template")
     if "recruiter" in text:
@@ -315,7 +333,9 @@ def _reconcile_semantic_urls(
     return replace(classification, job_urls=job_urls, jobs=jobs)
 
 
-def _build_semantic_prompt(message: GmailMessage) -> str:
+def _build_semantic_prompt(
+    message: GmailMessage, *, extract_job_alert: bool = False
+) -> str:
     email_data = {
         "sender": message.sender,
         "subject": message.subject,
@@ -323,21 +343,42 @@ def _build_semantic_prompt(message: GmailMessage) -> str:
         "body": message.body[:20_000],
         "links": _message_urls(message),
     }
-    return f"{_SCHEMA_INSTRUCTION}\nEmail data:\n{json.dumps(email_data, ensure_ascii=False)}"
+    extraction_instruction = (
+        f"\n{_JOB_ALERT_EXTRACTION_INSTRUCTION}" if extract_job_alert else ""
+    )
+    return (
+        f"{_SCHEMA_INSTRUCTION}{extraction_instruction}\nEmail data:\n"
+        f"{json.dumps(email_data, ensure_ascii=False)}"
+    )
 
 
 def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification:
     deterministic = classify_deterministically(message)
-    if deterministic is not None:
+    extract_job_alert = bool(
+        deterministic is not None
+        and deterministic.kind == "JOB_ALERT"
+        and not deterministic.jobs
+    )
+    if deterministic is not None and not extract_job_alert:
         return deterministic
     if not is_probably_job_related(message):
         return GmailClassification(kind="IRRELEVANT", confidence=1.0, rationale="no deterministic job signal")
 
     try:
         classification = _parse_semantic_classification(
-            gemini.generate_text(_build_semantic_prompt(message), json_mode=True)
+            gemini.generate_text(
+                _build_semantic_prompt(
+                    message,
+                    extract_job_alert=extract_job_alert,
+                ),
+                json_mode=True,
+            )
         )
         classification = _reconcile_semantic_urls(message, classification)
+        if extract_job_alert and (
+            classification.kind != "JOB_ALERT" or not classification.jobs
+        ):
+            raise ValueError("generic job alert extraction returned no usable jobs")
     except Exception:
         return _review_needed("semantic classification unavailable or invalid")
 

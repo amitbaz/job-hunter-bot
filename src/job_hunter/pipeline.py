@@ -17,7 +17,11 @@ from job_hunter.discovery import collect_candidates
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.sources import GmailStagedSource, build_sources
 from job_hunter.store import JobStore
-from job_hunter.telegram import TelegramClient, build_digest, build_gmail_review_digest
+from job_hunter.telegram import (
+    TelegramClient,
+    build_digest,
+    build_gmail_review_digest_chunks,
+)
 from job_hunter.telegram import select_deliverable_items
 
 logger = logging.getLogger(__name__)
@@ -234,10 +238,10 @@ def run_pipeline(
                 )
                 for row in pending_reviews
             ]
-            review_message_id = telegram.send_message(build_gmail_review_digest(review_items))
-            if review_message_id is not None:
-                store.mark_review_delivered(
-                    [item.event_id for item in review_items], review_message_id
-                )
+            for review_text, event_ids in build_gmail_review_digest_chunks(review_items):
+                review_message_id = telegram.send_message(review_text)
+                if review_message_id is None:
+                    break
+                store.mark_review_delivered(event_ids, review_message_id)
 
     return summary

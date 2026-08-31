@@ -114,7 +114,7 @@ Go to **Actions -> Daily Job Hunter -> Run workflow** to trigger an on-demand ru
 
 ## Schedule and state persistence
 
-The daily workflow runs on two cron triggers, `5 7 * * *` and `5 8 * * *` (UTC), to cover both sides of the `Europe/Berlin` DST transition. Each scheduled run calls `python -m job_hunter run --scheduled`, which only proceeds if the current local hour (in the timezone/hour configured by `timezone`/`scheduled_hour` in `config/search.yml`, default `Europe/Berlin` at `9`) matches; the other cron trigger that day exits immediately without side effects. This means you may see two scheduled workflow runs per day in the Actions log, but only one of them actually executes the pipeline.
+The repository workflow exposes `workflow_dispatch` only. Daily execution is expected to come from the configured external scheduler, which dispatches **Daily Job Hunter** at the desired local time; GitHub Actions itself has no cron trigger. Every external or manual dispatch runs the full pipeline directly, including the fail-open Gmail sync followed by `python -m job_hunter run`.
 
 Because GitHub Actions runners are ephemeral, the workflow:
 1. Restores `var/job_hunter.sqlite3` from the most recent non-expired `job-hunter-state` artifact (via `scripts/restore_state.py`, using the run's `GITHUB_TOKEN`) before running — silently starting with a fresh database if none exists.

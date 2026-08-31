@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -42,6 +43,14 @@ def _job_alert(message_id: str, *, sent_at: datetime) -> GmailMessage:
 class FakeGemini:
     def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
         raise AssertionError("irrelevant fixture must not call Gemini")
+
+
+class ResponseGemini:
+    def __init__(self, response: dict) -> None:
+        self.response = response
+
+    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+        return json.dumps(self.response)
 
 
 class FakeGmail:
@@ -293,6 +302,100 @@ def test_three_day_old_job_alert_is_staged(tmp_path):
     ).fetchone()
     assert candidate is not None
     assert candidate["source_message_id"] == "recent-alert"
+
+
+def test_generic_job_board_alert_is_semantically_extracted_and_staged(tmp_path):
+    job_url = "https://talentboard.example/jobs/frontend-42"
+    alert = GmailMessage(
+        message_id="generic-alert",
+        thread_id="thread-generic-alert",
+        sender="alerts@talentboard.example",
+        subject="Job alert",
+        sent_at=NOW,
+        snippet="A new frontend role matches your preferences.",
+        body="A new frontend role matches your preferences.",
+        links=[job_url],
+    )
+    gmail = FakeGmail(message_ids=[alert.message_id], messages={alert.message_id: alert})
+    store = JobStore(tmp_path / "state.sqlite3")
+    gemini = ResponseGemini(
+        {
+            "kind": "JOB_ALERT",
+            "confidence": 0.96,
+            "company": "Acme",
+            "role_title": "Frontend Engineer",
+            "source_job_id": "frontend-42",
+            "job_urls": [job_url],
+            "jobs": [
+                {
+                    "source_platform": "talentboard",
+                    "source_job_id": "frontend-42",
+                    "url": job_url,
+                    "company": "Acme",
+                    "title": "Frontend Engineer",
+                    "location": "Remote",
+                    "remote": True,
+                    "description": "Frontend role from the alert.",
+                }
+            ],
+            "rationale": "Job-board alert with one frontend opening.",
+        }
+    )
+
+    summary = GmailSyncService(gmail=gmail, gemini=gemini, store=store).sync(NOW)
+
+    candidate = store._conn.execute(
+        """
+        SELECT source_platform, source_job_id, url
+        FROM inbound_job_candidates
+        WHERE source_message_id = 'generic-alert'
+        """
+    ).fetchone()
+    assert summary.job_alerts == 1
+    assert tuple(candidate) == ("talentboard", "frontend-42", job_url)
+
+
+def test_semantic_gmail_job_description_is_not_persisted(tmp_path, monkeypatch):
+    private_body = "PRIVATE EMAIL BODY THAT MUST NOT ENTER SQLITE"
+    alert = GmailMessage(
+        message_id="private-alert",
+        thread_id="thread-private-alert",
+        sender="alerts@talentboard.example",
+        subject="Job alert",
+        sent_at=NOW,
+        snippet="A private role summary.",
+        body=private_body,
+        links=["https://talentboard.example/jobs/private-42"],
+    )
+    classification = GmailClassification(
+        kind="JOB_ALERT",
+        confidence=0.96,
+        jobs=[
+            ExtractedJob(
+                source_platform="talentboard",
+                source_job_id="private-42",
+                url="https://talentboard.example/jobs/private-42",
+                company="Acme",
+                title="Frontend Engineer",
+                description=private_body,
+            )
+        ],
+        rationale="Job-board alert with one opening.",
+    )
+    gmail = FakeGmail(message_ids=[alert.message_id], messages={alert.message_id: alert})
+    database_path = tmp_path / "state.sqlite3"
+    store = JobStore(database_path)
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+
+    GmailSyncService(gmail=gmail, gemini=FakeGemini(), store=store).sync(NOW)
+
+    persisted_description = store._conn.execute(
+        "SELECT description FROM inbound_job_candidates WHERE source_message_id = ?",
+        (alert.message_id,),
+    ).fetchone()["description"]
+    store.close()
+    assert persisted_description == ""
+    assert private_body.encode() not in database_path.read_bytes()
 
 
 def test_second_sync_uses_saved_history_id(tmp_path):

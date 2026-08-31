@@ -1,7 +1,9 @@
+import sqlite3
 from pathlib import Path
 
 from job_hunter.gmail_models import GmailSettings, GmailSyncSummary
 from job_hunter.models import RunSummary, SearchPolicy, Settings
+from job_hunter.store import JobStore
 from job_hunter import cli
 
 
@@ -174,3 +176,99 @@ def test_sync_gmail_returns_zero_when_service_completes_with_message_errors(
 
     assert cli.main(["sync-gmail"]) == 0
     assert any("will retry" in record.message for record in caplog.records)
+
+
+def test_sync_gmail_dry_run_does_not_create_missing_database_path(
+    monkeypatch, tmp_path
+):
+    settings = _gmail_settings(tmp_path)
+    settings = GmailSettings(
+        client_id=settings.client_id,
+        client_secret=settings.client_secret,
+        refresh_token=settings.refresh_token,
+        gemini_api_key=settings.gemini_api_key,
+        db_path=str(tmp_path / "missing" / "state.sqlite3"),
+    )
+
+    class InspectingService:
+        def __init__(self, *, store, **kwargs):
+            self.store = store
+
+        def sync(self, now, *, dry_run, force_backfill):
+            assert dry_run is True
+            self.store.save_gmail_sync_state(
+                account_id="dry-run@example.com",
+                history_id="100",
+                last_successful_sync_at=now.isoformat(),
+                backfill_completed_at=now.isoformat(),
+            )
+            return GmailSyncSummary()
+
+    monkeypatch.setattr(cli, "load_gmail_settings", lambda: settings)
+    monkeypatch.setattr(cli, "HttpClient", object)
+    monkeypatch.setattr(cli, "GoogleOAuthTokenProvider", lambda value: object())
+    monkeypatch.setattr(cli, "GmailClient", lambda http, token_provider: object())
+    monkeypatch.setattr(cli, "GeminiClient", lambda api_key, model, http: object())
+    monkeypatch.setattr(cli, "GmailSyncService", InspectingService)
+
+    assert cli.main(["sync-gmail", "--dry-run"]) == 0
+    assert not Path(settings.db_path).parent.exists()
+    assert not Path(settings.db_path).exists()
+
+
+def test_sync_gmail_dry_run_opens_existing_database_read_only(
+    monkeypatch, tmp_path
+):
+    settings = _gmail_settings(tmp_path)
+    store = JobStore(settings.db_path)
+    store.save_gmail_sync_state(
+        account_id="candidate@example.com",
+        history_id="before",
+        last_successful_sync_at="2026-08-30T12:00:00+00:00",
+        backfill_completed_at="2026-08-30T12:00:00+00:00",
+    )
+    store.close()
+
+    with sqlite3.connect(settings.db_path) as connection:
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        rows_before = connection.execute(
+            "SELECT * FROM gmail_sync_state ORDER BY account_id"
+        ).fetchall()
+
+    class InspectingService:
+        write_was_blocked = False
+
+        def __init__(self, *, store, **kwargs):
+            self.store = store
+
+        def sync(self, now, *, dry_run, force_backfill):
+            assert dry_run is True
+            try:
+                self.store.save_gmail_sync_state(
+                    account_id="candidate@example.com",
+                    history_id="after",
+                    last_successful_sync_at=now.isoformat(),
+                    backfill_completed_at=now.isoformat(),
+                )
+            except sqlite3.OperationalError:
+                type(self).write_was_blocked = True
+            return GmailSyncSummary()
+
+    monkeypatch.setattr(cli, "load_gmail_settings", lambda: settings)
+    monkeypatch.setattr(cli, "HttpClient", object)
+    monkeypatch.setattr(cli, "GoogleOAuthTokenProvider", lambda value: object())
+    monkeypatch.setattr(cli, "GmailClient", lambda http, token_provider: object())
+    monkeypatch.setattr(cli, "GeminiClient", lambda api_key, model, http: object())
+    monkeypatch.setattr(cli, "GmailSyncService", InspectingService)
+
+    assert cli.main(["sync-gmail", "--dry-run"]) == 0
+    assert InspectingService.write_was_blocked is True
+    with sqlite3.connect(settings.db_path) as connection:
+        assert connection.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall() == schema_before
+        assert connection.execute(
+            "SELECT * FROM gmail_sync_state ORDER BY account_id"
+        ).fetchall() == rows_before
