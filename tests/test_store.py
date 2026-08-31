@@ -1,3 +1,4 @@
+from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import Evaluation, Job
 from job_hunter.store import JobStore
 
@@ -162,3 +163,217 @@ def test_get_evaluation_and_material_roundtrip(tmp_path):
     fetched_job = store.get_job(job_id)
     assert fetched_job is not None
     assert fetched_job.company == "Acme"
+
+
+def test_gmail_persistence_schema_minimizes_private_email_data(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+
+    tables = {
+        row["name"]
+        for row in store._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+    }
+    assert {
+        "gmail_sync_state",
+        "gmail_messages",
+        "inbound_job_candidates",
+        "application_events",
+        "review_deliveries",
+    } <= tables
+
+    for table in ("gmail_messages", "inbound_job_candidates", "application_events"):
+        columns = {
+            row["name"] for row in store._conn.execute(f"PRAGMA table_info({table})")
+        }
+        assert "body" not in columns
+        assert "email_body" not in columns
+
+
+def test_gmail_message_and_sync_state_roundtrip(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+
+    assert store.has_processed_gmail_message("m1") is False
+    store.record_gmail_message(
+        message_id="m1",
+        thread_id="t1",
+        sender="alerts@example.com",
+        subject="Frontend roles",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        classification="JOB_ALERT",
+        confidence=0.98,
+        rationale="sender rule",
+    )
+    assert store.has_processed_gmail_message("m1") is True
+
+    assert store.get_gmail_sync_state("primary") is None
+    store.save_gmail_sync_state(
+        account_id="primary",
+        history_id="h1",
+        last_successful_sync_at="2026-08-31T10:05:00+00:00",
+        backfill_completed_at="2026-08-31T10:05:00+00:00",
+    )
+    state = store.get_gmail_sync_state("primary")
+    assert state is not None
+    assert dict(state)["history_id"] == "h1"
+    assert dict(state)["backfill_completed_at"] == "2026-08-31T10:05:00+00:00"
+
+
+def test_inbound_candidate_source_message_and_key_are_idempotent(tmp_path, monkeypatch):
+    store = JobStore(tmp_path / "state.sqlite3")
+    timestamps = iter(("2026-08-31T10:00:00+00:00", "2026-08-31T10:01:00+00:00"))
+    monkeypatch.setattr("job_hunter.store._now_iso", lambda: next(timestamps))
+    job = ExtractedJob(
+        source_platform="linkedin",
+        source_job_id="job-1",
+        url="https://jobs.example.com/1",
+        company="Acme",
+        title="Frontend Engineer",
+    )
+
+    first = store.stage_inbound_job("m1", "linkedin:job-1", job)
+    second = store.stage_inbound_job("m1", "linkedin:job-1", job)
+
+    row = store._conn.execute(
+        "SELECT id, created_at, last_seen_at FROM inbound_job_candidates"
+    ).fetchone()
+    assert second == first == row["id"]
+    assert row["created_at"] == "2026-08-31T10:00:00+00:00"
+    assert row["last_seen_at"] == "2026-08-31T10:01:00+00:00"
+
+
+def test_application_event_source_message_is_idempotent(tmp_path):
+    store = JobStore(tmp_path / "db.sqlite3")
+    first = store.save_application_event(
+        job_id=None,
+        event_type="REVIEW_NEEDED",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="m1",
+        source_thread_id="t1",
+        confidence=0.4,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="ambiguous",
+    )
+    second = store.save_application_event(
+        job_id=None,
+        event_type="REVIEW_NEEDED",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="m1",
+        source_thread_id="t1",
+        confidence=0.4,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="ambiguous",
+    )
+    assert second == first
+
+
+def test_pending_reviews_include_subject_and_are_marked_delivered(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(source="manual", source_job_id="1", title="Frontend Engineer")
+    )
+    store.record_gmail_message(
+        message_id="m1",
+        thread_id="t1",
+        sender="recruiter@example.com",
+        subject="A role to discuss",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        classification="REVIEW_NEEDED",
+        confidence=0.4,
+        rationale="ambiguous",
+    )
+    event_id = store.save_application_event(
+        job_id=job_id,
+        event_type="REVIEW_NEEDED",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="m1",
+        source_thread_id="t1",
+        confidence=0.4,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="ambiguous",
+    )
+
+    assert [row["id"] for row in store.list_application_events(job_id)] == [event_id]
+    pending = store.pending_review_events()
+    assert [(row["id"], row["subject"]) for row in pending] == [
+        (event_id, "A role to discuss")
+    ]
+
+    store.mark_review_delivered([event_id], "telegram-1")
+    assert store.pending_review_events() == []
+
+
+def test_candidate_not_emitted_when_any_job_has_same_canonical_url(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.stage_inbound_job(
+        "m1",
+        "linkedin:1",
+        ExtractedJob(
+            source_platform="linkedin",
+            source_job_id="1",
+            url="https://jobs.example.com/role?utm_source=linkedin",
+            company="Different Company",
+            title="Different Title",
+        ),
+    )
+    store.upsert_job(
+        Job(
+            source="public",
+            source_job_id="public-1",
+            url="https://jobs.example.com/role",
+            company="Acme",
+            title="Frontend Engineer",
+        )
+    )
+
+    assert store.list_unmaterialized_inbound_jobs() == []
+
+
+def test_candidate_not_emitted_when_url_missing_but_identity_matches(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.stage_inbound_job(
+        "m1",
+        "linkedin:1",
+        ExtractedJob(
+            source_platform="linkedin",
+            source_job_id="1",
+            company="  ACME  ",
+            title="Senior   Frontend Engineer",
+            location="Berlin",
+        ),
+    )
+    store.upsert_job(
+        Job(
+            source="public",
+            source_job_id="public-1",
+            url="https://jobs.example.com/role",
+            company="Acme",
+            title="senior frontend engineer",
+            location=" berlin ",
+        )
+    )
+
+    assert store.list_unmaterialized_inbound_jobs() == []
+
+
+def test_candidate_emitted_when_no_existing_job_matches(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    candidate_id = store.stage_inbound_job(
+        "m1",
+        "linkedin:1",
+        ExtractedJob(
+            source_platform="linkedin",
+            source_job_id="1",
+            url="https://jobs.example.com/role",
+            company="Acme",
+            title="Frontend Engineer",
+        ),
+    )
+
+    rows = store.list_unmaterialized_inbound_jobs()
+    assert [(row["id"], row["source_candidate_key"]) for row in rows] == [
+        (candidate_id, "linkedin:1")
+    ]
