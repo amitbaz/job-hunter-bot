@@ -269,6 +269,37 @@ def test_application_event_source_message_is_idempotent(tmp_path):
     assert second == first
 
 
+def test_current_application_state_derives_the_latest_eligible_event(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(source="manual", source_job_id="1", title="Frontend Engineer")
+    )
+    store.save_application_event(
+        job_id=job_id,
+        event_type="OFFER",
+        occurred_at="2026-08-01T10:00:00+00:00",
+        source_message_id="m1",
+        source_thread_id="t1",
+        confidence=0.95,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="offer",
+    )
+    store.save_application_event(
+        job_id=job_id,
+        event_type="APPLIED",
+        occurred_at="2026-08-02T10:00:00+00:00",
+        source_message_id="m2",
+        source_thread_id="t1",
+        confidence=0.95,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="application",
+    )
+
+    assert store.current_application_state(job_id) == "APPLIED"
+
+
 def test_pending_reviews_include_subject_and_are_marked_delivered(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job_id, _, _ = store.upsert_job(

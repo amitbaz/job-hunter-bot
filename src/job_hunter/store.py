@@ -269,6 +269,15 @@ class JobStore:
         row = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
         return row[0]
 
+    def list_jobs_for_matching(self) -> list[sqlite3.Row]:
+        return self._conn.execute(
+            """
+            SELECT id, source_job_id, url, company, title, first_seen_at, last_seen_at
+            FROM jobs
+            ORDER BY id
+            """
+        ).fetchall()
+
     # ------------------------------------------------------------------
     # Gmail sync and staging operations
     # ------------------------------------------------------------------
@@ -490,6 +499,11 @@ class JobStore:
             """,
             (job_id,),
         ).fetchall()
+
+    def current_application_state(self, job_id: int) -> str | None:
+        from job_hunter.gmail_matching import derive_application_state
+
+        return derive_application_state(self.list_application_events(job_id))
 
     def pending_review_events(self) -> list[sqlite3.Row]:
         return self._conn.execute(
