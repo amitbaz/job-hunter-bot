@@ -10,14 +10,14 @@ from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
-from job_hunter.models import DigestItem, Material, RunSummary, Settings
+from job_hunter.models import DigestItem, Material, ReviewItem, RunSummary, Settings
 from job_hunter.preferences import extract_candidate_preferences, preferences_source
 from job_hunter.pdf import render_cover_letter_pdf
 from job_hunter.discovery import collect_candidates
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.sources import GmailStagedSource, build_sources
 from job_hunter.store import JobStore
-from job_hunter.telegram import TelegramClient, build_digest
+from job_hunter.telegram import TelegramClient, build_digest, build_gmail_review_digest
 from job_hunter.telegram import select_deliverable_items
 
 logger = logging.getLogger(__name__)
@@ -220,5 +220,24 @@ def run_pipeline(
             document_id = telegram.send_document(pdf_path, caption)
             if document_id is not None:
                 store.mark_delivered(job_id, "telegram_document", document_id)
+
+        pending_reviews = store.pending_review_events()
+        if pending_reviews:
+            review_items = [
+                ReviewItem(
+                    event_id=row["id"],
+                    company=row["company"],
+                    role_title=row["role_title"],
+                    occurred_at=row["occurred_at"],
+                    subject=row["subject"],
+                    rationale=row["rationale"],
+                )
+                for row in pending_reviews
+            ]
+            review_message_id = telegram.send_message(build_gmail_review_digest(review_items))
+            if review_message_id is not None:
+                store.mark_review_delivered(
+                    [item.event_id for item in review_items], review_message_id
+                )
 
     return summary

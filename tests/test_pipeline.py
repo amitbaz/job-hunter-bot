@@ -96,6 +96,20 @@ class FlakyTelegram:
         return f"doc-{len(self.documents)}"
 
 
+class OrderedFakeTelegram(FakeTelegram):
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+
+    def send_message(self, text):
+        self.calls.append(("message", text))
+        return super().send_message(text)
+
+    def send_document(self, path, caption):
+        self.calls.append(("document", caption))
+        return super().send_document(path, caption)
+
+
 class FakeSource:
     def __init__(self, jobs):
         self._jobs = jobs
@@ -134,6 +148,30 @@ def _jobs_for_source(source: str, count: int, *, title="Senior Product Engineer"
         )
         for index in range(count)
     ]
+
+
+def _record_review_event(store, *, message_id, occurred_at, company="Acme", role_title="Frontend Engineer"):
+    store.record_gmail_message(
+        message_id=message_id,
+        thread_id=f"thread-{message_id}",
+        sender="recruiter@example.com",
+        subject=f"Interview update for {company}",
+        occurred_at=occurred_at,
+        classification="REVIEW_NEEDED",
+        confidence=0.4,
+        rationale="ambiguous scheduling language",
+    )
+    return store.save_application_event(
+        job_id=None,
+        event_type="REVIEW_NEEDED",
+        occurred_at=occurred_at,
+        source_message_id=message_id,
+        source_thread_id=f"thread-{message_id}",
+        confidence=0.4,
+        company=company,
+        role_title=role_title,
+        rationale="ambiguous scheduling language",
+    )
 
 
 @pytest.fixture
@@ -228,6 +266,89 @@ def test_pipeline_dry_run_persists_but_does_not_deliver(settings, policy):
     assert len(telegram.documents) == 0
     job_id, _, _ = store.upsert_job(job)
     assert store.has_delivery(job_id) is False
+
+
+def test_pipeline_delivers_all_pending_gmail_reviews_in_one_message(settings):
+    store = JobStore(settings.db_path)
+    first_event_id = _record_review_event(
+        store,
+        message_id="review-2",
+        occurred_at="2026-08-31T11:00:00+00:00",
+        company="Beta",
+    )
+    second_event_id = _record_review_event(
+        store,
+        message_id="review-1",
+        occurred_at="2026-08-31T10:00:00+00:00",
+    )
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[], store=store, gemini=FakeGemini(), telegram=telegram)
+
+    assert telegram.messages == [
+        "Gmail review needed\n"
+        "- Acme — Frontend Engineer | ambiguous scheduling language\n"
+        "- Beta — Frontend Engineer | ambiguous scheduling language"
+    ]
+    assert store.pending_review_events() == []
+    delivered = store._conn.execute(
+        "SELECT event_id, telegram_message_id FROM review_deliveries ORDER BY event_id"
+    ).fetchall()
+    assert [(row["event_id"], row["telegram_message_id"]) for row in delivered] == [
+        (first_event_id, "msg-1"),
+        (second_event_id, "msg-1"),
+    ]
+
+
+def test_pipeline_retries_gmail_reviews_after_a_failed_telegram_send(settings):
+    store = JobStore(settings.db_path)
+    event_id = _record_review_event(
+        store,
+        message_id="review-1",
+        occurred_at="2026-08-31T10:00:00+00:00",
+    )
+    telegram = FlakyTelegram(fail_message_times=1)
+
+    run_pipeline(settings, sources=[], store=store, gemini=FakeGemini(), telegram=telegram)
+
+    assert [row["id"] for row in store.pending_review_events()] == [event_id]
+    assert telegram.messages == []
+
+    run_pipeline(settings, sources=[], store=store, gemini=FakeGemini(), telegram=telegram)
+
+    assert store.pending_review_events() == []
+    assert telegram.messages == [
+        "Gmail review needed\n"
+        "- Acme — Frontend Engineer | ambiguous scheduling language"
+    ]
+
+
+def test_pipeline_sends_gmail_reviews_after_normal_job_delivery_without_scoring_them(settings):
+    store = JobStore(settings.db_path)
+    _record_review_event(
+        store,
+        message_id="review-1",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        company="Review Co",
+        role_title="Review Role",
+    )
+    telegram = OrderedFakeTelegram()
+
+    run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=telegram,
+    )
+
+    assert [kind for kind, _content in telegram.calls] == ["message", "document", "message"]
+    assert telegram.messages[0].startswith("Ready to apply\n- 90 | Acme - Senior Product Engineer")
+    assert "Gmail review needed" not in telegram.messages[0]
+    assert telegram.messages[1] == (
+        "Gmail review needed\n"
+        "- Review Co — Review Role | ambiguous scheduling language"
+    )
 
 
 def test_pipeline_evaluates_staged_gmail_job_through_normal_discovery(settings):

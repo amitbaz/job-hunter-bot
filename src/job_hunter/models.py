@@ -153,6 +153,18 @@ class DigestItem:
 
 
 @dataclass(slots=True)
+class ReviewItem:
+    """Compact, privacy-minimized representation of an ambiguous Gmail event."""
+
+    event_id: int
+    company: str
+    role_title: str
+    occurred_at: str
+    subject: str
+    rationale: str
+
+
+@dataclass(slots=True)
 class RunSummary:
     ready_to_apply: int = 0
     possible_matches: int = 0

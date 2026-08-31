@@ -4,7 +4,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Sequence
 
-from job_hunter.models import DigestItem
+from job_hunter.models import DigestItem, ReviewItem
 
 if TYPE_CHECKING:
     from job_hunter.http import HttpClient
@@ -66,6 +66,16 @@ def build_digest(items: Sequence[DigestItem]) -> str:
         sections.append("\n".join([header, *(_digest_line(item) for item in sorted(group_items, key=_item_sort_key))]))
 
     return "\n\n".join(sections) if sections else "No matching jobs today."
+
+
+def build_gmail_review_digest(items: Sequence[ReviewItem]) -> str:
+    """Format pending Gmail review events without rendering email content."""
+    lines = ["Gmail review needed"]
+    for item in sorted(items, key=lambda item: (item.occurred_at, item.event_id)):
+        company = item.company or "Unknown company"
+        role_title = item.role_title or "Unknown role"
+        lines.append(f"- {company} — {role_title} | {item.rationale[:200]}")
+    return "\n".join(lines)
 
 
 def chunk_message(text: str, limit: int = 3900) -> list[str]:
