@@ -34,7 +34,7 @@ This release does not automate LinkedIn login, browser scraping, job application
 - Shared SQLite persistence with the existing Job Hunter Bot.
 - Fail-open workflow behavior so Gmail problems do not stop the normal daily job search.
 - Logs and metrics for Gmail processing.
-- A dry-run inspection mode that classifies Gmail messages without mutating application state.
+- A Gmail dry-run inspection mode with no persistent writes.
 
 ### Out of scope
 
@@ -70,8 +70,8 @@ GitHub Actions
       |       +--> deterministic classification first
       |       +--> Gemini classification when needed
       |       |
-      |       +--> job alert ----------> discovered job candidate
-      |       +--> recruiter inbound --> inbound opportunity
+      |       +--> job alert ----------> inbound_job_candidates
+      |       +--> recruiter inbound --> inbound_job_candidates and/or application_event
       |       +--> application email --> application_event
       |       +--> rejection ---------> application_event
       |       +--> interview ---------> application_event
@@ -80,9 +80,9 @@ GitHub Actions
       +--> existing job_hunter run
       |       |
       |       +--> public sources
-      |       +--> Gmail-discovered jobs
-      |       +--> dedupe / rank / Gemini
-      |       +--> Telegram
+      |       +--> Gmail staged source
+      |       +--> normal dedupe / ranking / Gemini
+      |       +--> Telegram digest + review-needed section
       |
       +--> persist SQLite artifact
 ```
@@ -97,7 +97,7 @@ Add a new CLI command:
 python -m job_hunter sync-gmail
 ```
 
-The command performs only Gmail synchronization and persistence. It does not run public job discovery or Telegram delivery of the normal daily job digest.
+The command performs only Gmail synchronization and persistence. It does not run public job discovery or the normal Telegram job digest.
 
 The existing command remains:
 
@@ -107,7 +107,7 @@ python -m job_hunter run
 
 The scheduled workflow runs `sync-gmail` before `run`.
 
-A Gmail-specific dry-run option must be supported so classification can be inspected without creating application events or changing derived application state.
+A Gmail-specific dry-run option must be supported. In dry-run mode the command may read Gmail and classify/extract messages, but it must not persist jobs, inbound candidates, application events, review-delivery state, or Gmail sync cursors.
 
 ## 5. Authentication and secrets
 
@@ -115,9 +115,7 @@ A Gmail-specific dry-run option must be supported so classification can be inspe
 
 Use Google OAuth for a personal Gmail account with the minimum required read-only Gmail scope.
 
-A one-time local bootstrap flow performs interactive Google authorization and produces the long-lived refresh token needed by GitHub Actions.
-
-The scheduled GitHub Actions runner must never require interactive login.
+A one-time local bootstrap flow performs interactive Google authorization and produces the refresh token needed by GitHub Actions. The scheduled runner must never require interactive login.
 
 ### Secret storage
 
@@ -151,11 +149,11 @@ gmail_sync_state
 - updated_at
 ```
 
-The exact cursor mechanism may use Gmail history IDs or message timestamps depending on implementation constraints, but the following guarantees are required:
+The implementation may use Gmail history IDs or message timestamps as the concrete cursor, but these guarantees are required:
 
 - The 12-month backfill runs once after the first successful authorization.
 - Subsequent runs process only messages not successfully processed before.
-- The sync cursor advances only after the corresponding processed batch is durably persisted.
+- The sync cursor advances only after the corresponding batch is durably persisted.
 - A crash during a batch must not silently skip messages on the next run.
 - Reprocessing is safe because Gmail message IDs are idempotency keys.
 
@@ -218,7 +216,40 @@ High-confidence outcomes may create application events automatically.
 
 Low-confidence or conflicting outcomes must become `REVIEW_NEEDED` and must not alter the derived application status automatically.
 
-## 9. Job-alert and recruiter-opportunity ingestion
+The implementation plan must define concrete numeric or categorical confidence thresholds, but it may not weaken this high-confidence-only mutation rule.
+
+## 9. Staging Gmail-discovered jobs into the existing pipeline
+
+Gmail discovery must not bypass the existing `JobSource` contract or evaluation policy.
+
+Add a small persistent staging table for Gmail-origin candidates:
+
+```text
+inbound_job_candidates
+- id                       primary key
+- origin                   default 'gmail'
+- source_message_id
+- source_candidate_key
+- source_platform
+- source_job_id            nullable
+- url                      nullable
+- company
+- title
+- location                 nullable
+- remote                   nullable
+- description              nullable
+- created_at
+- last_seen_at
+- unique(origin, source_message_id, source_candidate_key)
+```
+
+`source_candidate_key` is a stable per-message candidate key derived from the best available identifier, preferring normalized job URL, then source job ID, then normalized company/title/index fallback.
+
+The normal `run` command creates the SQLite store before constructing its final source list, then adds a DB-backed Gmail staging source that implements the existing `discover() -> list[Job]` contract. That source reads staged Gmail candidates and returns normal `Job` objects. From that point onward, Gmail-origin jobs follow the same enrichment, deduplication, profession gate, ranking, Gemini evaluation, and delivery rules as every other source.
+
+A staged candidate is not considered an application event merely because it was discovered.
+
+## 10. Job-alert and recruiter-opportunity ingestion
 
 ### Job alerts
 
@@ -233,17 +264,15 @@ The Gmail sync stage extracts candidate fields such as:
 - source platform
 - source job ID when recoverable
 
-Extracted jobs enter the same normalized job flow used by public-source discovery. They must not bypass existing deduplication, ranking, or Gemini evaluation rules.
-
-LinkedIn alert emails are therefore a discovery channel, not a separate scoring system.
+Extracted jobs are inserted/upserted into `inbound_job_candidates`. LinkedIn alert emails are therefore a discovery channel, not a separate scoring system.
 
 ### Recruiter inbound
 
 Recruiter outreach that describes a concrete role or includes a job URL becomes an inbound opportunity candidate.
 
-If enough information is available, the role enters the normal job pipeline. If not, the message can still produce a `RECRUITER_CONTACT` application event or review item without inventing missing job details.
+If enough information is available, the role is staged into `inbound_job_candidates`. If the outreach itself represents a meaningful application-lifecycle signal, it may also create a `RECRUITER_CONTACT` event. If information is insufficient or ambiguous, the system must not invent missing job details and may create `REVIEW_NEEDED` instead.
 
-## 10. Application event model
+## 11. Application event model
 
 Do not make the existing `jobs.status` column the primary history store.
 
@@ -279,11 +308,11 @@ REJECTED
 REVIEW_NEEDED
 ```
 
-The table is append-only from the sync pipeline's perspective. Corrections should be represented explicitly rather than silently rewriting history.
+The sync pipeline does not rewrite existing event facts. Corrections must be represented explicitly rather than silently replacing history.
 
 The current application state is derived from event history, not treated as the only durable record.
 
-## 11. Job matching strategy
+## 12. Job matching strategy
 
 When an application-related email is classified, match it back to an existing job using the following priority order:
 
@@ -297,38 +326,36 @@ Matching must prefer false negatives over false positives. An unresolved event i
 
 No ambiguous email may mutate a derived job/application status automatically.
 
-## 12. Derived application state
+## 13. Derived application state
 
-High-confidence events can update a derived current state exposed by the store/API layer.
+Only high-confidence lifecycle events with a resolved `job_id` participate in derived application state.
 
-The lifecycle is not strictly linear, but the common progression is:
+The current state is the lifecycle-bearing event with the latest `occurred_at` timestamp. If two eligible events have the same timestamp, break ties with this precedence:
 
 ```text
+OFFER
+REJECTED
+TECHNICAL
+INTERVIEW
+RECRUITER_CONTACT
 APPLIED
-  -> RECRUITER_CONTACT
-  -> INTERVIEW
-  -> TECHNICAL
-  -> OFFER
-
-or
-
-APPLIED / RECRUITER_CONTACT / INTERVIEW / TECHNICAL
-  -> REJECTED
 ```
 
 `REVIEW_NEEDED` never becomes a derived lifecycle state.
 
-The implementation plan must define deterministic precedence rules for deriving the current state when several events exist.
+This timestamp-first rule intentionally favors the most recent known real-world signal. Because the underlying event history is preserved, a later correction mechanism can repair a misclassified or delayed message without losing auditability.
 
-## 13. Idempotency
+## 14. Idempotency
 
-Gmail message ID is the primary idempotency key.
+Gmail message ID is the primary idempotency key for message-level processing.
 
-Processing the same Gmail message more than once must not create duplicate application events or duplicate Gmail-origin job candidates.
+Processing the same Gmail message more than once must not create duplicate application events.
+
+For multi-job alert emails, `inbound_job_candidates` uses `(origin, source_message_id, source_candidate_key)` uniqueness so the same alert can safely be reprocessed without duplicating individual jobs.
 
 The sync stage must be safe to rerun after crashes, workflow retries, or restored database artifacts.
 
-## 14. Privacy and data minimization
+## 15. Privacy and data minimization
 
 The SQLite artifact should contain only the data needed for job intelligence and auditability.
 
@@ -352,7 +379,7 @@ The message body may be processed in memory for extraction/classification and th
 
 OAuth credentials must never be stored in SQLite.
 
-## 15. Workflow integration
+## 16. Workflow integration
 
 The scheduled workflow becomes:
 
@@ -381,9 +408,32 @@ If Gmail authorization fails, Google is temporarily unavailable, or an individua
 - continue the normal public-source job-hunter run;
 - avoid repeated noisy notifications for the same persistent Gmail failure.
 
-The daily job search must remain useful even when Gmail is unavailable.
+The workflow step for `sync-gmail` therefore records failure state for observability but must not prevent the later `run` step from executing.
 
-## 16. Observability
+## 17. Review-needed delivery
+
+Ambiguous email classifications or ambiguous job matches create `REVIEW_NEEDED` events.
+
+The existing `run` command appends a compact Gmail review section to Telegram when undelivered review events exist. Review events may have no `job_id`, so their delivery tracking is separate from the existing job-delivery table.
+
+Conceptual schema:
+
+```text
+application_event_deliveries
+- id
+- application_event_id
+- delivery_type            default 'telegram_review'
+- status
+- delivered_at
+- telegram_message_id      nullable
+- unique(application_event_id, delivery_type)
+```
+
+After a review item is successfully surfaced, it is not repeated on every daily run unless a later explicit workflow chooses to re-open it.
+
+Release 1 does not require a conversational correction UI. The important requirement is visibility without automatic status corruption.
+
+## 18. Observability
 
 Log a compact Gmail sync summary on every run.
 
@@ -400,15 +450,7 @@ gmail_errors=1
 
 Logs must not include OAuth secrets, full email bodies, or other unnecessary private content.
 
-## 17. Review-needed behavior
-
-Ambiguous email classifications or ambiguous job matches create `REVIEW_NEEDED` records.
-
-These items should be surfaced in Telegram as a compact review section rather than silently ignored.
-
-The first release does not require a full conversational correction workflow. Manual review may be completed through an explicit follow-up command or later release. The important Release 1 requirement is that ambiguous events are visible and do not corrupt application history.
-
-## 18. Testing strategy
+## 19. Testing strategy
 
 ### Unit tests
 
@@ -417,8 +459,9 @@ The first release does not require a full conversational correction workflow. Ma
 - Confidence threshold behavior.
 - Company/title normalization.
 - Job matching priority order.
-- Derived application-state precedence.
+- Derived application-state timestamp/tie precedence.
 - Gmail message-ID idempotency.
+- Multi-job alert candidate idempotency.
 
 ### Gmail client tests
 
@@ -434,19 +477,21 @@ Use mocked Gmail API responses to test:
 
 Use a temporary SQLite database and fixture emails to verify:
 
-- 12-month backfill writes expected events;
-- rerunning a backfill does not duplicate events;
+- 12-month backfill writes expected events and candidates;
+- rerunning a backfill does not duplicate events or candidates;
 - incremental sync processes only new messages;
 - a crash before cursor advancement is safely recoverable;
 - ambiguous matching creates `REVIEW_NEEDED` rather than a false association;
-- Gmail failure does not block the normal job-hunter pipeline;
-- Gmail-discovered jobs still pass through normal deduplication/ranking/evaluation.
+- Gmail failure does not block the normal public-source pipeline;
+- the DB-backed Gmail source feeds staged jobs through normal deduplication/ranking/evaluation;
+- review-needed Telegram delivery is not repeated after successful delivery;
+- dry-run performs no persistent writes.
 
 ### Privacy tests
 
-Assert that full fixture email bodies are not persisted in SQLite by default.
+Assert that full fixture email bodies and OAuth credentials are not persisted in SQLite.
 
-## 19. Operational safety
+## 20. Operational safety
 
 Release 1 must preserve the existing Job Hunter safety boundary:
 
@@ -458,21 +503,23 @@ Release 1 must preserve the existing Job Hunter safety boundary:
 
 The bot remains an assistant for discovery, analysis, material preparation, and application-state intelligence.
 
-## 20. Success criteria
+## 21. Success criteria
 
 Release 1 is complete when:
 
 1. Gmail can be authorized once locally with read-only access and used non-interactively from GitHub Actions.
 2. A 12-month backfill can complete incrementally and resume safely after interruption.
-3. LinkedIn/job-board alerts produce normalized job candidates without duplicate records.
-4. Recruiter outreach can produce useful inbound opportunities or recruiter-contact events.
-5. Clear application confirmations, rejections, interviews, technical assessments, and offers create idempotent application events.
-6. Ambiguous messages never change application status automatically and are surfaced as review-needed items.
-7. Existing public-source job hunting continues when Gmail fails.
-8. The SQLite artifact does not persist full email bodies or OAuth credentials by default.
-9. Tests cover classifier behavior, matching, idempotency, backfill, incremental sync, and fail-open execution.
+3. LinkedIn/job-board alerts create staged normalized candidates without duplicates.
+4. The DB-backed Gmail source feeds those candidates into the unchanged scoring/delivery policy of the normal run.
+5. Recruiter outreach can produce useful inbound opportunities or recruiter-contact events without inventing missing details.
+6. Clear application confirmations, rejections, interviews, technical assessments, and offers create idempotent application events.
+7. Ambiguous messages never change application status automatically and are surfaced exactly once as review-needed items after successful Telegram delivery.
+8. Existing public-source job hunting continues when Gmail fails.
+9. The SQLite artifact does not persist full email bodies or OAuth credentials.
+10. Gmail dry-run performs no persistent writes.
+11. Tests cover classifier behavior, matching, staging, idempotency, backfill, incremental sync, derived state, review delivery, privacy, and fail-open execution.
 
-## 21. Later releases
+## 22. Later releases
 
 The following work is intentionally deferred:
 
