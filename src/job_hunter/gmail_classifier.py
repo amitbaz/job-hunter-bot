@@ -178,9 +178,6 @@ def classify_deterministically(message: GmailMessage) -> GmailClassification | N
             ("APPLIED", "deterministic application receipt template")
         )
 
-    if len(lifecycle_matches) > 1:
-        kinds = ", ".join(kind.lower() for kind, _ in lifecycle_matches)
-        return _review_needed(f"conflicting deterministic lifecycle signals: {kinds}")
     if lifecycle_matches:
         kind, rationale = lifecycle_matches[0]
         return _classification(kind, message, rationale)

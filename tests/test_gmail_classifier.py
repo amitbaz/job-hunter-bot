@@ -43,25 +43,25 @@ def test_high_signal_templates_are_deterministic(subject, body, expected):
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "expected"),
     [
         (
-            "We are pleased to offer you the position. "
-            "However, we will not be moving forward with your application."
+            "Thanks for applying. We received your application. "
+            "Your interview invitation is ready; choose a time for your interview.",
+            "INTERVIEW",
         ),
         (
-            "We regret to inform you that we will not be moving forward.\n\n"
-            "-----Original Message-----\n"
-            "We are pleased to offer you the position."
+            "We are pleased to offer you the position. "
+            "However, we will not be moving forward with your application.",
+            "OFFER",
         ),
     ],
 )
-def test_conflicting_deterministic_lifecycle_signals_require_review(body):
+def test_multiple_lifecycle_signals_use_deterministic_precedence(body, expected):
     result = classify_deterministically(message("Application update", body))
 
     assert result is not None
-    assert result.kind == "REVIEW_NEEDED"
-    assert "conflicting" in result.rationale
+    assert result.kind == expected
 
 
 def test_linkedin_job_alert_extracts_known_job_url():
