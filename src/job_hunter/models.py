@@ -56,6 +56,34 @@ class Job:
     description: str = ""
     source_job_id: str | None = None
     remote: bool | None = None
+    original_url: str = ""
+    canonical_url: str = ""
+    ats_provider: str | None = None
+    ats_board: str | None = None
+    ats_job_id: str | None = None
+
+
+@dataclass(slots=True)
+class AtsReference:
+    provider: str
+    board: str
+    job_id: str | None
+
+
+@dataclass(slots=True)
+class CanonicalResolution:
+    url: str
+    ats: AtsReference | None
+    confidence: float
+    method: str
+
+
+@dataclass(slots=True)
+class CompanyWatchSeed:
+    company_name: str
+    careers_url: str = ""
+    ats_provider: str | None = None
+    ats_identifier: str | None = None
 
 
 @dataclass(slots=True)
