@@ -2,7 +2,7 @@ import sqlite3
 from pathlib import Path
 
 from job_hunter.gmail_models import GmailSettings, GmailSyncSummary
-from job_hunter.models import RunSummary, SearchPolicy, Settings
+from job_hunter.models import GeminiQuotaSettings, RunSummary, SearchPolicy, Settings
 from job_hunter.store import JobStore
 from job_hunter import cli
 
@@ -22,6 +22,7 @@ def _settings(tmp_path, **overrides):
         timezone="Europe/Berlin",
         scheduled_hour=9,
         policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
         dry_run=True,
         db_path=str(tmp_path / "var" / "state.sqlite3"),
     )
@@ -123,6 +124,7 @@ def _gmail_settings(tmp_path):
         client_secret="secret",
         refresh_token="refresh",
         gemini_api_key="gemini",
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
         db_path=str(tmp_path / "gmail.sqlite3"),
     )
 
@@ -187,6 +189,7 @@ def test_sync_gmail_dry_run_does_not_create_missing_database_path(
         client_secret=settings.client_secret,
         refresh_token=settings.refresh_token,
         gemini_api_key=settings.gemini_api_key,
+        gemini_quota=settings.gemini_quota,
         db_path=str(tmp_path / "missing" / "state.sqlite3"),
     )
 

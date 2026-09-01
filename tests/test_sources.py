@@ -1,7 +1,7 @@
 import pytest
 
 from job_hunter.circuit_breaker import CircuitBreaker
-from job_hunter.models import SearchPolicy, Settings
+from job_hunter.models import GeminiQuotaSettings, SearchPolicy, Settings
 from job_hunter.sources import (
     ArbeitnowSource,
     AshbySource,
@@ -375,6 +375,7 @@ def test_build_sources_includes_always_on_and_configured_ats(fake_http, policy):
         timezone="Europe/Berlin",
         scheduled_hour=9,
         policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
     )
     sources = build_sources(settings, fake_http)
     kinds = [type(s).__name__ for s in sources]

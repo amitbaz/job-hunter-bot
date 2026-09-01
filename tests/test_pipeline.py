@@ -9,6 +9,7 @@ from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import (
     CandidatePreferences,
     CompanyWatchSeed,
+    GeminiQuotaSettings,
     Job,
     RunSummary,
     SearchPolicy,
@@ -235,6 +236,7 @@ def settings(tmp_path, policy):
         timezone="Europe/Berlin",
         scheduled_hour=9,
         policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
         dry_run=False,
         telegram_bot_token="token",
         telegram_chat_id="chat",
@@ -819,6 +821,7 @@ def test_pipeline_dry_run_persists_but_does_not_deliver(settings, policy):
         timezone=settings.timezone,
         scheduled_hour=settings.scheduled_hour,
         policy=policy,
+        gemini_quota=settings.gemini_quota,
         dry_run=True,
         db_path=settings.db_path,
     )

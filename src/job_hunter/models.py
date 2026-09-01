@@ -159,6 +159,16 @@ class CandidatePreferences:
     summary: str
 
 
+@dataclass(frozen=True, slots=True)
+class GeminiQuotaSettings:
+    rpm: int
+    tpm: int
+    rpd: int
+    ceiling_ratio: float = 0.80
+    core_reserve_ratio: float = 0.25
+    rate_pause_seconds: int = 90
+
+
 @dataclass(slots=True)
 class Settings:
     gemini_api_key: str
@@ -167,6 +177,7 @@ class Settings:
     timezone: str
     scheduled_hour: int
     policy: SearchPolicy
+    gemini_quota: GeminiQuotaSettings
     dry_run: bool = False
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None

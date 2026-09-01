@@ -1,6 +1,6 @@
 import json
 
-from job_hunter.models import Job, SearchPolicy, Settings
+from job_hunter.models import GeminiQuotaSettings, Job, SearchPolicy, Settings
 from job_hunter.navigation_store import get_navigation_session
 from job_hunter.pipeline import run_pipeline
 from job_hunter.store import JobStore
@@ -95,6 +95,7 @@ def _settings(tmp_path):
             thresholds={"package": 75, "possible": 65},
             max_jobs_per_run=35,
         ),
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
         dry_run=False,
         telegram_bot_token="token",
         telegram_chat_id="chat",
