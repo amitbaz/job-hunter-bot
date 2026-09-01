@@ -97,7 +97,7 @@ def _merge_fields(richer: Job, weaker: Job) -> Job:
     return richer
 
 
-def _dedupe(jobs: list[Job]) -> list[Job]:
+def _dedupe(jobs: list[Job]) -> tuple[list[Job], int]:
     """
     Collapse in-run duplicates. Two jobs are the same candidate when their
     canonical URLs, ATS identities, or exact source-independent fallback
@@ -150,24 +150,39 @@ def _dedupe(jobs: list[Job]) -> list[Job]:
     ordered_roots = sorted(clusters, key=lambda root: min(clusters[root]))
 
     merged: list[Job] = []
+    cross_source_duplicate_groups = 0
     for root in ordered_roots:
+        cluster = clusters[root]
+        if len({metric_source_label(jobs[index].source) for index in cluster}) > 1:
+            cross_source_duplicate_groups += 1
         cluster_jobs = sorted(
-            (jobs[i] for i in clusters[root]), key=_richness_key, reverse=True
+            (jobs[i] for i in cluster), key=_richness_key, reverse=True
         )
         winner = cluster_jobs[0]
         for weaker in cluster_jobs[1:]:
             winner = _merge_fields(winner, weaker)
         merged.append(winner)
 
-    return merged
+    return merged, cross_source_duplicate_groups
+
+
+def metric_source_label(source: str) -> str:
+    """Return a bounded source label suitable for metrics and logs."""
+    if source.startswith("gmail:"):
+        return "gmail"
+    return source
 
 
 def _format_source_contribution(per_source: dict[str, int]) -> str:
     """Render compact source totals without including any job content."""
-    if not per_source:
+    metric_counts: dict[str, int] = {}
+    for source, count in per_source.items():
+        label = metric_source_label(source)
+        metric_counts[label] = metric_counts.get(label, 0) + count
+    if not metric_counts:
         return "none"
     return " ".join(
-        f"{source}={count}" for source, count in sorted(per_source.items())
+        f"{source}={count}" for source, count in sorted(metric_counts.items())
     )
 
 
@@ -204,7 +219,8 @@ def collect_candidates(
                         resolution = resolver.resolve(job)
                     except Exception:
                         logger.exception(
-                            "canonical resolution failed: source=%s", job.source
+                            "canonical resolution failed: source=%s",
+                            metric_source_label(job.source),
                         )
                         resolution = None
                     if resolution is None:
@@ -224,9 +240,8 @@ def collect_candidates(
     for job in raw_jobs:
         store.upsert_logical_job(job)
 
-    unique_jobs = _dedupe(raw_jobs)
+    unique_jobs, stats.cross_source_duplicates = _dedupe(raw_jobs)
     stats.unique = len(unique_jobs)
-    stats.cross_source_duplicates = stats.raw - stats.unique
 
     eligible: list[tuple[int, Job]] = []
     rediscovered_job_ids: list[int] = []

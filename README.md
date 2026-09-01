@@ -88,7 +88,7 @@ manual_company_watch:
     careers_url: https://example.com/careers
 ```
 
-Manual entries are synchronized idempotently and preserved: automatic promotion cannot replace a manual ownership marker or downgrade its stronger ATS endpoint. Company-watch checks use only the configured public ATS endpoint or public careers URL. Each check records either a success or a failure. After exactly three consecutive failures, the watch pauses for 24 hours; it is retried when that pause expires. A successful retry clears the failure count and removes the pause. A failure for one watch does not stop the remaining discovery sources.
+Manual entries are synchronized idempotently and preserved: automatic promotion cannot replace a manual ownership marker or downgrade its stronger ATS endpoint. Company-watch checks use only the configured public ATS endpoint or public careers URL. Each check records either a success or a failure. After exactly three consecutive failures, the watch pauses for 24 hours; it is retried when that pause expires. A failed retry starts another 24-hour pause, while a successful retry clears the failure count and removes the pause. A failure for one watch does not stop the remaining discovery sources.
 
 ## Required GitHub secrets
 

@@ -221,7 +221,7 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
     assert result.rediscovered_job_ids == [job_id]
 
 
-def test_collect_candidates_logs_canonical_dedupe_metrics_without_job_content(
+def test_collect_candidates_logs_cross_source_dedupe_metrics_without_job_content(
     store, policy, caplog
 ):
     sources = [
@@ -266,7 +266,7 @@ def test_collect_candidates_logs_canonical_dedupe_metrics_without_job_content(
     assert result.stats.unique == 1
     assert result.stats.canonical_resolved == 3
     assert result.stats.canonical_unresolved == 0
-    assert result.stats.cross_source_duplicates == 2
+    assert result.stats.cross_source_duplicates == 1
     assert store.count_jobs() == 1
     job_id = result.eligible[0][0]
     provenance = store.list_job_sources(job_id)
@@ -280,11 +280,42 @@ def test_collect_candidates_logs_canonical_dedupe_metrics_without_job_content(
         "https://yc.test/2",
         "https://specialist.test/3",
     }
-    assert "gmail:linkedin=1 specialist=1 yc=1" in caplog.text
+    assert "gmail=1 specialist=1 yc=1" in caplog.text
     assert "canonical_resolved=3" in caplog.text
     assert "canonical_unresolved=0" in caplog.text
-    assert "cross_source_duplicates=2" in caplog.text
+    assert "cross_source_duplicates=1" in caplog.text
     assert "PRIVATE_GMAIL_BODY" not in caplog.text
+
+
+def test_collect_candidates_does_not_count_same_source_duplicates_as_cross_source(
+    store, policy
+):
+    jobs = [
+        Job(
+            source="yc",
+            title="Senior Product Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://yc.test/jobs/acme",
+            description="React TypeScript",
+            remote=True,
+        ),
+        Job(
+            source="yc",
+            title="Senior Product Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://yc.test/jobs/acme",
+            description="React TypeScript",
+            remote=True,
+        ),
+    ]
+
+    result = collect_candidates([FakeSource(jobs)], store, NoOpHttp(), policy)
+
+    assert result.stats.raw == 2
+    assert result.stats.unique == 1
+    assert result.stats.cross_source_duplicates == 0
 
 
 def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, policy):

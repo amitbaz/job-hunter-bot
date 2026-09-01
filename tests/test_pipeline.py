@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -365,6 +365,121 @@ def test_pipeline_promotes_package_match_only_after_evaluation_is_persisted(
     assert "watch_paused=1" in caplog.text
     assert "PRIVATE_CV_TEXT" not in caplog.text
     assert "PRIVATE_GMAIL_BODY" not in caplog.text
+
+
+def test_pipeline_aggregates_untrusted_gmail_source_labels_in_logs(settings, caplog):
+    settings.dry_run = True
+    store = JobStore(settings.db_path)
+    platform = "MODEL_PLATFORM\nPRIVATE_PLATFORM_SECRET"
+    store.stage_inbound_job(
+        "message-1",
+        "candidate-1",
+        ExtractedJob(
+            source_platform=platform,
+            company="Acme",
+            title="Senior Product Engineer",
+            location="Remote",
+            remote=True,
+            description="React TypeScript remote role",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[],
+            store=store,
+            gemini=FakeGemini(),
+            telegram=FakeTelegram(),
+        )
+
+    assert summary.ready_to_apply == 1
+    assert "gmail=1" in caplog.text
+    assert platform not in caplog.text
+    assert "PRIVATE_PLATFORM_SECRET" not in caplog.text
+
+
+def test_pipeline_counts_only_meaningful_company_watch_promotions(settings, caplog):
+    settings.dry_run = True
+    store = JobStore(settings.db_path)
+    watch_seeds = (
+        ("Repeat", "automatic"),
+        ("Manual", "manual"),
+        ("Upgrade", "automatic"),
+    )
+    for company_name, promotion_source in watch_seeds:
+        store.upsert_company_watch(
+            company_name=company_name,
+            careers_url="",
+            ats_provider=None,
+            ats_identifier=None,
+            discovered_from_job_id=None,
+            promotion_source=promotion_source,
+            confidence=1.0,
+        )
+    jobs = [
+        _job(company="Repeat", source_job_id="repeat"),
+        _job(company="Manual", source_job_id="manual"),
+        _job(company="New", source_job_id="new"),
+        _job(
+            company="Upgrade",
+            source_job_id="upgrade",
+            canonical_url="https://upgrade.test/careers",
+        ),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[FakeSource(jobs)],
+            store=store,
+            gemini=FakeGemini(),
+            telegram=FakeTelegram(),
+        )
+
+    assert summary.ready_to_apply == 4
+    assert store.get_company_watch("Repeat")["promotion_source"] == "automatic"
+    assert store.get_company_watch("Manual")["promotion_source"] == "manual"
+    assert store.get_company_watch("Upgrade")["careers_url"] == "https://upgrade.test/careers"
+    assert "companies_promoted=2" in caplog.text
+
+
+def test_pipeline_counts_a_failed_expired_watch_retry_as_a_new_pause(settings, caplog):
+    settings.dry_run = True
+    store = JobStore(settings.db_path)
+    watch_id = store.upsert_company_watch(
+        company_name="Retry Watch",
+        careers_url="https://retry.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    past = datetime.now(timezone.utc) - timedelta(days=2)
+    for _ in range(3):
+        store.record_watch_failure(watch_id, past)
+    previous_pause = store.get_company_watch("Retry Watch")["paused_until"]
+
+    class FailingWatchHttp:
+        def get(self, url, **kwargs):
+            raise RuntimeError("retry unavailable")
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(
+            settings,
+            sources=[],
+            store=store,
+            gemini=FakeGemini(),
+            telegram=FakeTelegram(),
+            http=FailingWatchHttp(),
+        )
+
+    watch = store.get_company_watch("Retry Watch")
+    assert watch["consecutive_failures"] == 4
+    assert watch["paused_until"] != previous_pause
+    assert "watch_checks=1" in caplog.text
+    assert "watch_paused=1" in caplog.text
 
 
 def test_pipeline_does_not_promote_possible_match(settings, monkeypatch):

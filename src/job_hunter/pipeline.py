@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 
 from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
 from job_hunter.cover_letter import generate_cover_letter
-from job_hunter.discovery import collect_candidates
+from job_hunter.discovery import collect_candidates, metric_source_label
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
@@ -103,7 +103,14 @@ def _select_candidates(ranked, policy, preferences):
 
 
 def _source_counts(items) -> dict[str, int]:
-    return dict(sorted(Counter(job.source for _job_id, job, _score in items).items()))
+    return dict(
+        sorted(
+            Counter(
+                metric_source_label(job.source)
+                for _job_id, job, _score in items
+            ).items()
+        )
+    )
 
 
 def _format_source_counts(counts: dict[str, int]) -> str:
@@ -149,9 +156,25 @@ def _watch_check_outcomes(
         )
         if check_recorded:
             checks += 1
-        if paused_until is None and watch["paused_until"] is not None:
+        if (
+            watch["paused_until"] is not None
+            and watch["paused_until"] != paused_until
+        ):
             paused += 1
     return checks, paused
+
+
+def _watch_promotion_state(watch) -> tuple[object, ...] | None:
+    """Return the persisted fields that constitute a meaningful promotion."""
+    if watch is None:
+        return None
+    return (
+        watch["promotion_source"],
+        watch["careers_url"],
+        watch["ats_provider"],
+        watch["ats_identifier"],
+        watch["confidence"],
+    )
 
 
 def cover_letter_output_dir(settings: Settings) -> Path:
@@ -290,6 +313,9 @@ def run_pipeline(
 
         store.save_evaluation(job_id, evaluation)
         try:
+            promotion_before = _watch_promotion_state(
+                store.get_company_watch(job.company)
+            )
             promoted_watch_id = promote_company(
                 store,
                 job_id=job_id,
@@ -297,7 +323,10 @@ def run_pipeline(
                 evaluation=evaluation,
                 package_threshold=settings.policy.thresholds["package"],
             )
-            if promoted_watch_id is not None:
+            promotion_after = _watch_promotion_state(
+                store.get_company_watch(job.company)
+            )
+            if promoted_watch_id is not None and promotion_after != promotion_before:
                 companies_promoted += 1
         except Exception:
             logger.exception("company watch promotion failed for job_id=%s", job_id)
