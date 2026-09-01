@@ -183,6 +183,47 @@ def test_backfill_limits_unprocessed_messages_and_defers_remaining(tmp_path):
     assert store.get_gmail_sync_state("candidate@example.com") is None
 
 
+def test_failed_backfill_attempt_consumes_the_sole_batch_slot(tmp_path):
+    gmail = FakeGmail(
+        message_ids=["broken", "ok"],
+        messages={"broken": RuntimeError("decode failed"), "ok": _message("ok")},
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    service = GmailSyncService(
+        gmail=gmail,
+        gemini=FakeGemini(),
+        store=store,
+        backfill_batch_size=1,
+    )
+
+    summary = service.sync(NOW)
+
+    assert gmail.message_calls == ["broken"]
+    assert summary.errors == 1
+    assert summary.processed == 0
+    assert store.has_processed_gmail_message("ok") is False
+    assert store.get_gmail_sync_state("candidate@example.com") is None
+
+
+def test_default_backfill_processes_only_first_100_unprocessed_messages(tmp_path):
+    message_ids = [f"message-{index}" for index in range(101)]
+    gmail = FakeGmail(
+        message_ids=message_ids,
+        messages={message_id: _message(message_id) for message_id in message_ids},
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    service = GmailSyncService(gmail=gmail, gemini=FakeGemini(), store=store)
+
+    summary = service.sync(NOW)
+
+    assert len(gmail.message_calls) == 100
+    assert summary.fetched == 101
+    assert summary.processed == 100
+    assert store.has_processed_gmail_message("message-99") is True
+    assert store.has_processed_gmail_message("message-100") is False
+    assert store.get_gmail_sync_state("candidate@example.com") is None
+
+
 def test_backfill_resumes_and_marks_complete_after_final_batch(tmp_path):
     gmail = FakeGmail(
         message_ids=["m1", "m2", "m3"],
