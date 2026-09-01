@@ -120,6 +120,18 @@ def _parse_manual_company_watch(entries: object) -> list[CompanyWatchSeed]:
                 f"manual_company_watch[{index}] must be a non-empty string or mapping"
             )
 
+        allowed_fields = {
+            "company_name",
+            "careers_url",
+            "ats_provider",
+            "ats_identifier",
+        }
+        unknown_fields = sorted(set(entry) - allowed_fields, key=str)
+        if unknown_fields:
+            raise ValueError(
+                f"manual_company_watch[{index}].{unknown_fields[0]} is not allowed"
+            )
+
         company_name = entry.get("company_name")
         if not isinstance(company_name, str) or not company_name.strip():
             raise ValueError(

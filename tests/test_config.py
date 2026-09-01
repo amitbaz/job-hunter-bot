@@ -281,3 +281,17 @@ def test_load_settings_rejects_non_string_manual_watch_optional_field(
             tmp_path,
             f"[{{company_name: Acme, {field}: {value}}}]",
         )
+
+
+def test_load_settings_rejects_unknown_manual_watch_mapping_key(
+    monkeypatch, tmp_path
+):
+    with pytest.raises(
+        ValueError,
+        match=r"manual_company_watch\[0\]\.ats_identifer is not allowed",
+    ):
+        _load_manual_watch_config(
+            monkeypatch,
+            tmp_path,
+            "[{company_name: Acme, ats_identifer: acme}]",
+        )
