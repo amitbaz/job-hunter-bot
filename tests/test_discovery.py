@@ -27,6 +27,17 @@ class FakeResolver:
         return self._resolution
 
 
+class FailFirstResolver:
+    def __init__(self):
+        self.calls = 0
+
+    def resolve(self, job):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("resolver unavailable")
+        return None
+
+
 class BrokenSource:
     def discover(self):
         raise RuntimeError("source is down")
@@ -287,3 +298,45 @@ def test_collect_candidates_counts_unresolved_canonical_urls(store, policy):
     assert result.stats.canonical_resolved == 0
     assert result.stats.canonical_unresolved == 1
     assert result.eligible[0][1].url == "https://yc.test/unresolved"
+
+
+def test_resolver_exception_preserves_candidate_and_continues_collection(store, policy):
+    first = Job(
+        source="first",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://first.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    second = Job(
+        source="second",
+        title="Senior Product Engineer",
+        company="Beta",
+        url="https://second.test/jobs/2",
+        description="React TypeScript",
+        remote=True,
+    )
+
+    result = collect_candidates(
+        [FakeSource([first]), FakeSource([second])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FailFirstResolver(),
+    )
+
+    assert result.stats.raw == 2
+    assert result.stats.unique == 2
+    assert result.stats.canonical_unresolved == 2
+    assert first.url == "https://first.test/jobs/1"
+    assert {job.source for _job_id, job in result.eligible} == {"first", "second"}
+    assert store.count_jobs() == 2
+    stored_urls = {
+        row["source"]: row["url"]
+        for row in store._conn.execute("SELECT source, url FROM jobs")
+    }
+    assert stored_urls == {
+        "first": "https://first.test/jobs/1",
+        "second": "https://second.test/jobs/2",
+    }

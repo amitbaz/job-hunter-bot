@@ -391,9 +391,16 @@ class JobStore:
 
             if candidate_ids:
                 job_id = candidate_ids[0]
+                previous_hash = self._conn.execute(
+                    "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()["description_hash"]
                 for duplicate_id in candidate_ids[1:]:
                     self._merge_jobs(job_id, duplicate_id)
-                description_changed = self._update_logical_job(job_id, job)
+                self._update_logical_job(job_id, job)
+                current_hash = self._conn.execute(
+                    "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()["description_hash"]
+                description_changed = previous_hash != current_hash
                 is_new = False
             else:
                 job_id = self._insert_logical_job(job, fingerprint)

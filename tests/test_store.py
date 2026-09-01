@@ -748,3 +748,53 @@ def test_merge_jobs_preserves_associations_provenance_and_richer_fields(tmp_path
         assert row["job_id"] == survivor_id
     watch = store._conn.execute("SELECT discovered_from_job_id FROM company_watch").fetchone()
     assert watch["discovered_from_job_id"] == survivor_id
+
+
+def test_logical_upsert_reports_description_change_caused_by_merge(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    canonical_url = "https://jobs.lever.co/acme/abc"
+    survivor_id, _, _ = store.upsert_job(
+        Job(
+            source="lever",
+            source_job_id="abc",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            url=canonical_url,
+            canonical_url=canonical_url,
+            description="Short description",
+        )
+    )
+    duplicate_description = "A much richer React and TypeScript role description"
+    duplicate_id, _, _ = store.upsert_job(
+        Job(
+            source="yc",
+            source_job_id="yc-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            url="https://yc.test/jobs/1",
+            description=duplicate_description,
+        )
+    )
+
+    job_id, is_new, description_changed = store.upsert_logical_job(
+        Job(
+            source="yc",
+            source_job_id="yc-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            url="https://yc.test/jobs/1",
+            original_url="https://yc.test/jobs/1",
+            canonical_url=canonical_url,
+            description=duplicate_description,
+        )
+    )
+
+    assert duplicate_id != survivor_id
+    assert job_id == survivor_id
+    assert is_new is False
+    assert description_changed is True
+    assert store.count_jobs() == 1
+    merged = store._conn.execute(
+        "SELECT description FROM jobs WHERE id = ?", (survivor_id,)
+    ).fetchone()
+    assert merged["description"] == duplicate_description

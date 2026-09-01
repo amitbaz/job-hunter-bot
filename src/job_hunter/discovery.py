@@ -191,7 +191,13 @@ def collect_candidates(
             if job.url:
                 job.original_url = job.original_url or job.url
                 if resolver is not None:
-                    resolution = resolver.resolve(job)
+                    try:
+                        resolution = resolver.resolve(job)
+                    except Exception:
+                        logger.exception(
+                            "canonical resolution failed: source=%s", job.source
+                        )
+                        resolution = None
                     if resolution is None:
                         stats.canonical_unresolved += 1
                     else:
