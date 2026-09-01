@@ -59,6 +59,43 @@ def test_generate_search_queries_includes_specialist_domain_queries_within_limit
     assert len(queries) <= policy.max_search_queries_per_run
 
 
+def test_generate_search_queries_reserves_specialist_slots_without_dropping_role_coverage():
+    policy = SearchPolicy(
+        target_titles=[],
+        positive_keywords=[],
+        blocked_title_keywords=[],
+        salary_floor_eur=90000,
+        thresholds={"package": 75, "possible": 65},
+        search_queries=[],
+        role_families=[
+            "senior product engineer",
+            "senior frontend engineer",
+            "staff frontend engineer",
+            "product engineer",
+        ],
+        search_query_templates=[
+            '"{role}" remote React TypeScript',
+            '"{role}" remote Europe',
+        ],
+        search_domains=["jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io"],
+        specialist_search_domains=["wellfound.com", "app.welcometothejungle.com"],
+        specialist_query_templates=['"{role}" remote Europe', '"{role}" Berlin'],
+        max_search_queries_per_run=30,
+    )
+
+    queries = generate_search_queries(policy)
+
+    assert len(queries) == 30
+    for role in policy.role_families:
+        assert f'"{role}" remote React TypeScript' in queries
+    assert queries[-4:] == [
+        'site:wellfound.com "senior product engineer" remote Europe',
+        'site:app.welcometothejungle.com "senior product engineer" remote Europe',
+        'site:wellfound.com "senior product engineer" Berlin',
+        'site:app.welcometothejungle.com "senior product engineer" Berlin',
+    ]
+
+
 def test_generate_search_queries_with_empty_role_families():
     policy = SearchPolicy(
         target_titles=[],
