@@ -85,6 +85,16 @@ search_domains:
   - jobs.ashbyhq.com
   - jobs.lever.co
   - boards.greenhouse.io
+specialist_search_domains:
+  - wellfound.com
+  - app.welcometothejungle.com
+specialist_query_templates:
+  - '"{role}" remote Europe'
+  - '"{role}" Berlin'
+yc_job_pages:
+  - https://www.ycombinator.com/jobs/role
+  - https://www.ycombinator.com/jobs/location/berlin
+manual_company_watch: []
 search_queries: []
 ats:
   ashby: []

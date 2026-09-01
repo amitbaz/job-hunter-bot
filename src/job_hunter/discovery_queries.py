@@ -17,6 +17,10 @@ def generate_search_queries(policy: SearchPolicy) -> list[str]:
             add(base)
             for domain in policy.search_domains:
                 add(f"site:{domain} {base}")
+        for template in policy.specialist_query_templates:
+            base = template.format(role=role)
+            for domain in policy.specialist_search_domains:
+                add(f"site:{domain} {base}")
 
     for query in policy.search_queries:
         add(query)

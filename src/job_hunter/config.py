@@ -56,6 +56,10 @@ def load_settings(config_path: Path) -> Settings:
         role_families=data.get("role_families", []),
         search_query_templates=data.get("search_query_templates", []),
         search_domains=data.get("search_domains", []),
+        specialist_search_domains=data.get("specialist_search_domains", []),
+        specialist_query_templates=data.get("specialist_query_templates", []),
+        yc_job_pages=data.get("yc_job_pages", []),
+        manual_company_watch=data.get("manual_company_watch", []),
         max_search_queries_per_run=data.get("max_search_queries_per_run", 30),
         engineering_title_keywords=list(
             data.get("engineering_title_keywords", DEFAULT_ENGINEERING_TITLE_KEYWORDS)

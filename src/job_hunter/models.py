@@ -131,6 +131,10 @@ class SearchPolicy:
     role_families: list[str] = field(default_factory=list)
     search_query_templates: list[str] = field(default_factory=list)
     search_domains: list[str] = field(default_factory=list)
+    specialist_search_domains: list[str] = field(default_factory=list)
+    specialist_query_templates: list[str] = field(default_factory=list)
+    yc_job_pages: list[str] = field(default_factory=list)
+    manual_company_watch: list[str] = field(default_factory=list)
     max_search_queries_per_run: int = 30
     engineering_title_keywords: list[str] = field(
         default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_KEYWORDS)

@@ -110,6 +110,15 @@ def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
         "  - '\"{role}\" React TypeScript remote Europe'\n"
         "search_domains:\n"
         "  - jobs.ashbyhq.com\n"
+        "specialist_search_domains:\n"
+        "  - wellfound.com\n"
+        "  - app.welcometothejungle.com\n"
+        "specialist_query_templates:\n"
+        "  - '\"{role}\" remote Europe'\n"
+        "yc_job_pages:\n"
+        "  - https://www.ycombinator.com/jobs/role\n"
+        "manual_company_watch:\n"
+        "  - Acme\n"
         "search_queries:\n"
         "  - '\"Senior Product Engineer\" remote'\n"
         "ats:\n  ashby: []\n  lever: []\n  greenhouse: []\n"
@@ -143,6 +152,13 @@ def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
         '"{role}" React TypeScript remote Europe'
     ]
     assert settings.policy.search_domains == ["jobs.ashbyhq.com"]
+    assert settings.policy.specialist_search_domains == [
+        "wellfound.com",
+        "app.welcometothejungle.com",
+    ]
+    assert settings.policy.specialist_query_templates == ['"{role}" remote Europe']
+    assert settings.policy.yc_job_pages == ["https://www.ycombinator.com/jobs/role"]
+    assert settings.policy.manual_company_watch == ["Acme"]
     assert settings.policy.search_queries == ['"Senior Product Engineer" remote']
 
 

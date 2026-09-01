@@ -32,6 +32,33 @@ def test_generate_search_queries_enforces_limit():
     assert len(generate_search_queries(make_policy(limit=3))) == 3
 
 
+def test_generate_search_queries_includes_specialist_domain_queries_within_limit():
+    policy = SearchPolicy(
+        target_titles=[],
+        positive_keywords=[],
+        blocked_title_keywords=[],
+        salary_floor_eur=90000,
+        thresholds={"package": 75, "possible": 65},
+        search_queries=[],
+        role_families=["senior frontend engineer"],
+        search_query_templates=[],
+        search_domains=[],
+        max_search_queries_per_run=2,
+        specialist_search_domains=["wellfound.com", "app.welcometothejungle.com"],
+        specialist_query_templates=['"{role}" remote Europe'],
+        yc_job_pages=[],
+        manual_company_watch=[],
+    )
+
+    queries = generate_search_queries(policy)
+
+    assert queries == [
+        'site:wellfound.com "senior frontend engineer" remote Europe',
+        'site:app.welcometothejungle.com "senior frontend engineer" remote Europe',
+    ]
+    assert len(queries) <= policy.max_search_queries_per_run
+
+
 def test_generate_search_queries_with_empty_role_families():
     policy = SearchPolicy(
         target_titles=[],
