@@ -13,5 +13,5 @@ def test_gmail_sync_step_is_bounded_and_fail_open():
     )
 
     assert job["timeout-minutes"] == 60
-    assert gmail_step["timeout-minutes"] == 10
+    assert gmail_step["timeout-minutes"] == 20
     assert gmail_step["continue-on-error"] is True
