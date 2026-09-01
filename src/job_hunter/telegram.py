@@ -70,9 +70,13 @@ def build_digest(items: Sequence[DigestItem]) -> str:
 
 
 def _gmail_review_line(item: ReviewItem) -> str:
-    company = item.company or "Unknown company"
-    role_title = item.role_title or "Unknown role"
-    return f"- {company} — {role_title} | {item.rationale[:200]}"
+    if item.company or item.role_title:
+        company = item.company or "Unknown company"
+        role_title = item.role_title or "Unknown role"
+        context = f"{company} — {role_title}"
+    else:
+        context = item.subject or "Gmail message"
+    return f"- {context} | {item.rationale[:200]}"
 
 
 def build_gmail_review_digest(items: Sequence[ReviewItem]) -> str:

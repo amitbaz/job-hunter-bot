@@ -389,5 +389,5 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
         raise SemanticClassificationError("invalid_semantic_response") from exc
 
     if classification.kind == "REVIEW_NEEDED" or classification.confidence < AUTO_CONFIDENCE_THRESHOLD:
-        return _review_needed("semantic classification requires review")
+        return replace(classification, kind="REVIEW_NEEDED")
     return classification
