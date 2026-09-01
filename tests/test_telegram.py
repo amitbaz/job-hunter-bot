@@ -1,10 +1,13 @@
 from pathlib import Path
 
+import pytest
+
 from job_hunter.models import DigestItem, ReviewItem
 from job_hunter.telegram import (
     TelegramClient,
     build_digest,
     build_gmail_review_digest,
+    build_gmail_review_digest_chunks,
     chunk_message,
     select_deliverable_items,
 )
@@ -52,6 +55,8 @@ def _review_item(**overrides):
         occurred_at="2026-08-31T10:00:00+00:00",
         subject="Interview details inside",
         rationale="ambiguous scheduling language",
+        event_type="RECRUITER_CONTACT",
+        source_message_id="gmail-message-1",
     )
     defaults.update(overrides)
     return ReviewItem(**defaults)
@@ -114,33 +119,111 @@ def test_select_deliverable_items_keeps_only_scores_above_sixty():
     assert [item.company for item in selected] == ["Keep", "KeepPossible"]
 
 
-def test_build_gmail_review_digest_sorts_events_by_time_then_id_without_subject():
+def test_build_gmail_review_digest_uses_user_facing_activity_copy():
     digest = build_gmail_review_digest(
         [
-            _review_item(event_id=4, company="Beta", occurred_at="2026-08-31T11:00:00+00:00"),
-            _review_item(event_id=3, company="Gamma", occurred_at="2026-08-31T10:00:00+00:00"),
-            _review_item(event_id=2, company="Acme", occurred_at="2026-08-31T10:00:00+00:00"),
+            _review_item(
+                company="Montash",
+                role_title="Senior Frontend Engineer",
+                rationale="deterministic recruiter template",
+            )
         ]
     )
 
     assert digest == (
-        "Gmail review needed\n"
-        "- Acme — Frontend Engineer | ambiguous scheduling language\n"
-        "- Gamma — Frontend Engineer | ambiguous scheduling language\n"
-        "- Beta — Frontend Engineer | ambiguous scheduling language"
+        "Gmail activity I couldn't link\n\n"
+        "Montash — Senior Frontend Engineer\n"
+        "A recruiter contacted you, but I couldn't link this email to a tracked job.\n"
+        "Open email: https://mail.google.com/mail/#all/gmail-message-1"
     )
-    assert "Interview details inside" not in digest
+    assert "deterministic recruiter template" not in digest
 
 
-def test_build_gmail_review_digest_uses_subject_fallback_and_truncates_rationale():
+@pytest.mark.parametrize(
+    ("event_type", "expected"),
+    [
+        ("APPLIED", "This looks like an application confirmation, but I couldn't link it to a tracked job."),
+        ("INTERVIEW", "This looks like an interview email, but I couldn't link it to a tracked job."),
+        ("TECHNICAL", "This looks like a technical assessment, but I couldn't link it to a tracked job."),
+        ("OFFER", "This looks like a job offer, but I couldn't link it to a tracked job."),
+        ("REJECTED", "This looks like a rejection email, but I couldn't link it to a tracked job."),
+        ("REVIEW_NEEDED", "This looks job-related, but I couldn't classify or link it confidently."),
+        ("SOMETHING_LEGACY", "This looks job-related, but I couldn't classify or link it confidently."),
+    ],
+)
+def test_gmail_activity_copy_describes_original_event_type(event_type, expected):
+    digest = build_gmail_review_digest([_review_item(event_type=event_type)])
+
+    assert expected in digest
+    assert "ambiguous scheduling language" not in digest
+
+
+def test_gmail_activity_identity_falls_back_to_company_event_label_then_subject():
     digest = build_gmail_review_digest(
-        [_review_item(company="", role_title="", rationale="x" * 201)]
+        [
+            _review_item(
+                event_id=1,
+                company="Supabase",
+                role_title="",
+                event_type="REVIEW_NEEDED",
+                subject="Supabase product update",
+                source_message_id="m-company",
+            ),
+            _review_item(
+                event_id=2,
+                company="",
+                role_title="",
+                event_type="INTERVIEW",
+                subject="Interview details inside",
+                source_message_id="m-subject",
+                occurred_at="2026-08-31T11:00:00+00:00",
+            ),
+        ]
     )
 
-    assert digest == (
-        "Gmail review needed\n"
-        f"- Interview details inside | {'x' * 200}"
+    assert "Supabase — Job-related activity" in digest
+    assert "Interview details inside" in digest
+    assert "https://mail.google.com/mail/#all/m-company" in digest
+    assert "https://mail.google.com/mail/#all/m-subject" in digest
+
+
+def test_gmail_activity_digest_sorts_events_by_time_then_id():
+    digest = build_gmail_review_digest(
+        [
+            _review_item(event_id=4, company="Beta", occurred_at="2026-08-31T11:00:00+00:00", source_message_id="m4"),
+            _review_item(event_id=3, company="Gamma", occurred_at="2026-08-31T10:00:00+00:00", source_message_id="m3"),
+            _review_item(event_id=2, company="Acme", occurred_at="2026-08-31T10:00:00+00:00", source_message_id="m2"),
+        ]
     )
+
+    assert digest.index("Acme — Frontend Engineer") < digest.index("Gamma — Frontend Engineer")
+    assert digest.index("Gamma — Frontend Engineer") < digest.index("Beta — Frontend Engineer")
+
+
+def test_gmail_activity_chunking_keeps_each_event_atomic():
+    items = [
+        _review_item(
+            event_id=index,
+            company=f"Company {index}",
+            source_message_id=f"m-{index}",
+            rationale="internal detail that must not be shown",
+        )
+        for index in range(1, 8)
+    ]
+
+    chunks = build_gmail_review_digest_chunks(items, limit=420)
+
+    assert len(chunks) > 1
+    delivered_ids = []
+    for text, event_ids in chunks:
+        assert len(text) <= 420
+        assert text.startswith("Gmail activity I couldn't link")
+        assert "internal detail that must not be shown" not in text
+        delivered_ids.extend(event_ids)
+        for event_id in event_ids:
+            assert f"Company {event_id} — Frontend Engineer" in text
+            assert f"https://mail.google.com/mail/#all/m-{event_id}" in text
+    assert delivered_ids == list(range(1, 8))
 
 
 def test_send_message_posts_to_send_message_endpoint():
