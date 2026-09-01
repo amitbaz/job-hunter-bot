@@ -18,6 +18,10 @@ test = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
 ]
+webhook = [
+    "Flask>=3.1,<4",
+    "gunicorn>=23,<24",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
