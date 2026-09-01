@@ -11,13 +11,22 @@ def _job_has_dependencies(conn, job_id: int) -> bool:
     return False
 
 
+def _is_legacy_poisoned_linkedin_job(company: str, title: str) -> bool:
+    if company.strip():
+        return False
+    normalized_title = title.strip().casefold()
+    return normalized_title in {"", "sign in"}
+
+
 def release_legacy_blank_linkedin_jobs(store) -> int:
-    """Release only safe blank LinkedIn Gmail artifacts for reprocessing.
+    """Release only safe blank/poisoned LinkedIn Gmail artifacts for reprocessing.
 
     Older deterministic LinkedIn JOB_ALERT handling staged URL-only candidates and
-    materialized blank jobs. A message is released only when all of its LinkedIn
-    candidates are blank and every matching gmail:linkedin job is also blank and
-    has no dependent evaluation, material, delivery, or application event.
+    materialized blank jobs. Historical LinkedIn login-page scraping could also
+    materialize the title ``Sign in``. A message is released only when all of its
+    LinkedIn candidates are blank and every matching gmail:linkedin job is blank
+    or carries that known poison title, with no dependent evaluation, material,
+    delivery, or application event.
     """
 
     conn = store._conn
@@ -76,7 +85,9 @@ def release_legacy_blank_linkedin_jobs(store) -> int:
                     (candidate["source_candidate_key"],),
                 ).fetchall()
                 for job in jobs:
-                    if job["company"].strip() or job["title"].strip():
+                    if not _is_legacy_poisoned_linkedin_job(
+                        job["company"], job["title"]
+                    ):
                         safe = False
                         break
                     if _job_has_dependencies(conn, job["id"]):
