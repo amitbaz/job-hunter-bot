@@ -166,7 +166,7 @@ class TelegramClient:
             f"{self._base_url}/editMessageText",
             json={
                 "chat_id": str(chat_id),
-                "message_id": str(message_id),
+                "message_id": message_id,
                 "text": text,
                 "reply_markup": {"inline_keyboard": keyboard},
             },
