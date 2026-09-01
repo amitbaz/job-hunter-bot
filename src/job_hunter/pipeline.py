@@ -6,16 +6,30 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from job_hunter.canonical import CanonicalResolver
 from job_hunter.cover_letter import generate_cover_letter
+from job_hunter.discovery import collect_candidates
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
-from job_hunter.models import DigestItem, Material, ReviewItem, RunSummary, Settings
+from job_hunter.models import (
+    AtsReference,
+    DigestItem,
+    Job,
+    Material,
+    ReviewItem,
+    RunSummary,
+    Settings,
+)
 from job_hunter.preferences import extract_candidate_preferences, preferences_source
 from job_hunter.pdf import render_cover_letter_pdf
-from job_hunter.discovery import collect_candidates
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
-from job_hunter.sources import GmailStagedSource, build_sources
+from job_hunter.sources import (
+    CompanyWatchSource,
+    DuckDuckGoSource,
+    GmailStagedSource,
+    build_sources,
+)
 from job_hunter.store import JobStore
 from job_hunter.telegram import (
     TelegramClient,
@@ -23,11 +37,46 @@ from job_hunter.telegram import (
     build_gmail_review_digest_chunks,
 )
 from job_hunter.telegram import select_deliverable_items
+from job_hunter.watchlist import promote_company, sync_manual_watch_seeds
 
 logger = logging.getLogger(__name__)
 
 _READY_DECISIONS = {"high_priority", "package_match"}
 _MIN_DELIVERABLE_SCORE = 61
+_SUPPORTED_WATCH_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
+_CANONICAL_SEARCH_SITES = (
+    "site:jobs.ashbyhq.com OR site:jobs.lever.co OR "
+    "site:boards.greenhouse.io OR careers"
+)
+
+
+def _targeted_canonical_candidates(http: HttpClient, job: Job) -> list[Job]:
+    """Run one bounded public search for the employer's original posting."""
+    company = " ".join(job.company.replace('"', " ").split())
+    title = " ".join(job.title.replace('"', " ").split())
+    if not company or not title:
+        return []
+
+    query = f'"{company}" "{title}" ({_CANONICAL_SEARCH_SITES})'
+    candidates = DuckDuckGoSource(http, [query]).discover()
+    for candidate in candidates:
+        candidate.company = job.company
+    return candidates
+
+
+def _persisted_watch_target(
+    store: JobStore, company_name: str
+) -> AtsReference | None:
+    """Return only a persisted, complete, supported ATS watch target."""
+    watch = store.get_company_watch(company_name)
+    if watch is None:
+        return None
+
+    provider = (watch["ats_provider"] or "").strip().lower()
+    identifier = (watch["ats_identifier"] or "").strip()
+    if provider not in _SUPPORTED_WATCH_ATS_PROVIDERS or not identifier:
+        return None
+    return AtsReference(provider=provider, board=identifier, job_id=None)
 
 
 def _select_candidates(ranked, policy, preferences):
@@ -124,8 +173,22 @@ def run_pipeline(
 ) -> RunSummary:
     http = http or HttpClient()
     store = store or JobStore(settings.db_path)
+    try:
+        sync_manual_watch_seeds(store, settings.policy.manual_company_watch)
+    except Exception:
+        logger.exception("manual company watch sync failed")
+
     base_sources = sources if sources is not None else build_sources(settings, http)
-    sources = [*base_sources, GmailStagedSource(store)]
+    sources = [
+        *base_sources,
+        GmailStagedSource(store),
+        CompanyWatchSource(store, http),
+    ]
+    resolver = CanonicalResolver(
+        http,
+        search_candidates=lambda job: _targeted_canonical_candidates(http, job),
+        watch_target=lambda company: _persisted_watch_target(store, company),
+    )
     gemini = gemini or GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
     if telegram is None and not settings.dry_run:
         telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id, http)
@@ -134,7 +197,13 @@ def run_pipeline(
     digest_items: list[DigestItem] = []
     pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
     out_dir = cover_letter_output_dir(settings)
-    discovery = collect_candidates(sources, store, http, settings.policy)
+    discovery = collect_candidates(
+        sources,
+        store,
+        http,
+        settings.policy,
+        resolver=resolver,
+    )
     preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy)
     profile_mode = preferences_source(preferences)
     logger.info("profile extraction: source=%s", profile_mode)
@@ -170,6 +239,17 @@ def run_pipeline(
             continue
 
         store.save_evaluation(job_id, evaluation)
+        try:
+            promote_company(
+                store,
+                job_id=job_id,
+                job=job,
+                evaluation=evaluation,
+                package_threshold=settings.policy.thresholds["package"],
+            )
+        except Exception:
+            logger.exception("company watch promotion failed for job_id=%s", job_id)
+            summary.errors += 1
 
         item = DigestItem(
             job_id=job_id,

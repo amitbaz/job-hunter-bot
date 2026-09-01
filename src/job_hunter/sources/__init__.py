@@ -5,6 +5,7 @@ from job_hunter.models import Settings
 from .arbeitnow import ArbeitnowSource
 from .ashby import AshbySource
 from .base import JobSource
+from .company_watch import CompanyWatchSource
 from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
 from .gmail_staged import GmailStagedSource
@@ -25,6 +26,7 @@ __all__ = [
     "JobicySource",
     "HimalayasSource",
     "GmailStagedSource",
+    "CompanyWatchSource",
     "DuckDuckGoSource",
     "AshbySource",
     "LeverSource",

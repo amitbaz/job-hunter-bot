@@ -6,19 +6,29 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from job_hunter.gmail_models import ExtractedJob
-from job_hunter.models import CandidatePreferences, Job, RunSummary, SearchPolicy, Settings
+from job_hunter.models import (
+    CandidatePreferences,
+    CompanyWatchSeed,
+    Job,
+    RunSummary,
+    SearchPolicy,
+    Settings,
+)
 from job_hunter.pipeline import run_pipeline, should_run_scheduled
 from job_hunter.sources import GmailStagedSource
+from job_hunter.sources.company_watch import CompanyWatchSource
 from job_hunter.store import JobStore
+from job_hunter.watchlist import promote_company as persist_promoted_company
 
 
 class FakeGemini:
-    def __init__(self, *, preference_payload=None):
+    def __init__(self, *, preference_payload=None, evaluation_payload=None):
         self.model = "gemini-test"
         self.preference_calls = 0
         self.eval_calls = 0
         self.cover_letter_calls = 0
         self.preference_payload = preference_payload
+        self.evaluation_payload = evaluation_payload
 
     def generate_text(self, prompt, *, json_mode=False):
         if json_mode and "preferred_roles" in prompt:
@@ -35,7 +45,7 @@ class FakeGemini:
             return json.dumps(payload)
         if json_mode:
             self.eval_calls += 1
-            payload = {
+            payload = self.evaluation_payload or {
                 "scores": {
                     "role_seniority": 28,
                     "technical": 22,
@@ -153,6 +163,20 @@ def _job(**overrides):
     return Job(**defaults)
 
 
+def _evaluation_payload(scores, decision):
+    return {
+        "scores": scores,
+        "total_score": sum(scores.values()),
+        "hard_blockers": [],
+        "strengths": ["React expertise"],
+        "gaps": [],
+        "salary_note": "Not disclosed",
+        "location_note": "Remote EU friendly",
+        "decision": decision,
+        "rationale": "Strong fit",
+    }
+
+
 def _jobs_for_source(source: str, count: int, *, title="Senior Product Engineer", description="React TypeScript remote role"):
     return [
         _job(
@@ -239,6 +263,314 @@ def test_pipeline_delivers_strong_match_and_dedupes_within_run(settings):
     source2 = FakeSource([strong_job])
     run_pipeline(settings, sources=[source2], store=store, gemini=gemini, telegram=telegram)
     assert gemini.eval_calls == 1
+
+
+def test_pipeline_promotes_package_match_only_after_evaluation_is_persisted(
+    settings, monkeypatch
+):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini(
+        evaluation_payload=_evaluation_payload(
+            {
+                "role_seniority": 25,
+                "technical": 20,
+                "product_architecture": 15,
+                "career_direction": 7,
+                "location_language": 8,
+                "company_environment": 5,
+            },
+            "package_match",
+        )
+    )
+    promotion_calls = []
+
+    def assert_persisted_then_promote(
+        passed_store, *, job_id, job, evaluation, package_threshold
+    ):
+        assert passed_store.get_evaluation(job_id) is not None
+        promotion_calls.append((job_id, package_threshold))
+        return persist_promoted_company(
+            passed_store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=package_threshold,
+        )
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        assert_persisted_then_promote,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=gemini,
+        telegram=FakeTelegram(),
+    )
+
+    row = store.get_company_watch("Acme")
+    assert row is not None
+    assert row["promotion_source"] == "automatic"
+    assert promotion_calls == [(1, 75)]
+    assert summary.ready_to_apply == 1
+
+
+def test_pipeline_does_not_promote_possible_match(settings, monkeypatch):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini(
+        evaluation_payload=_evaluation_payload(
+            {
+                "role_seniority": 20,
+                "technical": 18,
+                "product_architecture": 14,
+                "career_direction": 6,
+                "location_language": 7,
+                "company_environment": 5,
+            },
+            "possible_match",
+        )
+    )
+    promotion_calls = []
+
+    def record_promotion_attempt(
+        passed_store, *, job_id, job, evaluation, package_threshold
+    ):
+        promotion_calls.append((job_id, package_threshold))
+        return persist_promoted_company(
+            passed_store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=package_threshold,
+        )
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        record_promotion_attempt,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=gemini,
+        telegram=FakeTelegram(),
+    )
+
+    assert store.get_company_watch("Acme") is None
+    assert promotion_calls == [(1, 75)]
+    assert summary.possible_matches == 1
+
+
+def test_pipeline_passes_configured_package_threshold_to_promotion(
+    settings, monkeypatch
+):
+    settings.policy.thresholds["package"] = 95
+    store = JobStore(settings.db_path)
+    promotion_calls = []
+
+    def record_threshold(
+        passed_store, *, job_id, job, evaluation, package_threshold
+    ):
+        promotion_calls.append(package_threshold)
+        return persist_promoted_company(
+            passed_store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=package_threshold,
+        )
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        record_threshold,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+    )
+
+    assert summary.ready_to_apply == 1
+    assert promotion_calls == [95]
+    assert store.get_company_watch("Acme") is None
+
+
+def test_pipeline_isolates_company_watch_source_failure(
+    settings, monkeypatch
+):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    attempts = []
+
+    def raise_watch_failure(self):
+        attempts.append(self)
+        raise RuntimeError("watch down")
+
+    monkeypatch.setattr(CompanyWatchSource, "discover", raise_watch_failure)
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=gemini,
+        telegram=FakeTelegram(),
+    )
+
+    assert gemini.eval_calls == 1
+    assert len(attempts) == 1
+    assert summary.ready_to_apply == 1
+    assert summary.errors == 0
+
+
+def test_pipeline_syncs_structured_manual_watch_seeds(settings):
+    settings.policy.manual_company_watch = [
+        CompanyWatchSeed(company_name="Manual Co")
+    ]
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+    )
+
+    row = store.get_company_watch("Manual Co")
+    assert row is not None
+    assert row["promotion_source"] == "manual"
+
+
+def test_pipeline_injects_resolver_for_direct_ats_canonical_metadata(settings):
+    job = _job(
+        source="remotive",
+        url="https://jobs.lever.co/acme/job-1",
+    )
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[FakeSource([job])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+        http=ExplodingHttp(),
+    )
+
+    persisted = store._conn.execute(
+        "SELECT canonical_url, ats_provider, ats_board, ats_job_id "
+        "FROM jobs WHERE id = 1"
+    ).fetchone()
+    assert persisted is not None
+    assert persisted["canonical_url"] == "https://jobs.lever.co/acme/job-1"
+    assert persisted["ats_provider"] == "lever"
+    assert persisted["ats_board"] == "acme"
+    assert persisted["ats_job_id"] == "job-1"
+
+
+def test_pipeline_uses_one_targeted_duckduckgo_query_for_canonical_resolution(
+    settings
+):
+    class Response:
+        def __init__(self, *, url, text):
+            self.url = url
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    class TargetedSearchHttp:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if url == "https://aggregator.test/jobs/1":
+                return Response(url=url, text="<html></html>")
+            if url == "https://duckduckgo.com/html/":
+                return Response(
+                    url=url,
+                    text=(
+                        '<a class="result__a" '
+                        'href="https://jobs.ashbyhq.com/acme/ats-1">'
+                        "Senior Product Engineer</a>"
+                    ),
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+    http = TargetedSearchHttp()
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[
+            FakeSource(
+                [
+                    _job(
+                        source="aggregator",
+                        url="https://aggregator.test/jobs/1",
+                    )
+                ]
+            )
+        ],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+        http=http,
+    )
+
+    persisted = store._conn.execute(
+        "SELECT canonical_url FROM jobs WHERE id = 1"
+    ).fetchone()
+    assert persisted is not None
+    assert persisted["canonical_url"] == "https://jobs.ashbyhq.com/acme/ats-1"
+    search_calls = [
+        kwargs["params"]["q"]
+        for url, kwargs in http.calls
+        if url == "https://duckduckgo.com/html/"
+    ]
+    assert len(search_calls) == 1
+    assert '"Acme"' in search_calls[0]
+    assert '"Senior Product Engineer"' in search_calls[0]
+    assert "site:jobs.ashbyhq.com" in search_calls[0]
+
+
+def test_pipeline_counts_promotion_failure_but_continues_delivery(
+    settings, monkeypatch
+):
+    store = JobStore(settings.db_path)
+    telegram = FakeTelegram()
+
+    def raise_promotion_failure(*args, **kwargs):
+        raise RuntimeError("watch persistence down")
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        raise_promotion_failure,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=telegram,
+    )
+
+    assert summary.errors == 1
+    assert summary.ready_to_apply == 1
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
 
 
 def test_pipeline_isolates_broken_source(settings):
