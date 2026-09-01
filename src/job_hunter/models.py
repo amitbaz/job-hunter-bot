@@ -181,6 +181,28 @@ class GeminiQuotaSettings:
     rate_pause_seconds: int = 90
 
 
+@dataclass(frozen=True, slots=True)
+class GeminiUsageSummary:
+    """A point-in-time rollup of Gemini usage against configured free-tier quotas.
+
+    Percentages are against the configured provider limit, not the internal
+    80% ceiling. Token totals and `requests_today` cover only attempts that
+    reached the provider (blocked_budget rows never happened at Google).
+    """
+
+    requests_today: int
+    rpd_percent: float
+    rpm_peak_percent: float
+    tpm_peak_percent: float
+    input_tokens_today: int
+    output_tokens_today: int
+    thinking_tokens_today: int
+    cached_tokens_today: int
+    purpose_counts: dict[str, int]
+    internal_budget_exhausted: bool
+    provider_paused: bool
+
+
 @dataclass(slots=True)
 class Settings:
     gemini_api_key: str
