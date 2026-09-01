@@ -226,6 +226,8 @@ def collect_candidates(
         if job.url and not job.description:
             enrich_job(job, http)
 
+        # Late canonicalization may consolidate stored rows; use the store's
+        # history-preserving survivor ID for all downstream decisions.
         job_id, _is_new, _description_changed = store.upsert_logical_job(job)
 
         if not store.needs_evaluation(job_id):

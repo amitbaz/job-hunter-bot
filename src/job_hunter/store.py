@@ -397,12 +397,13 @@ class JobStore:
             )
 
             if candidate_ids:
-                job_id = candidate_ids[0]
+                job_id = min(candidate_ids, key=self._job_survivor_sort_key)
                 previous_hash = self._conn.execute(
                     "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
                 ).fetchone()["description_hash"]
-                for duplicate_id in candidate_ids[1:]:
-                    self._merge_jobs(job_id, duplicate_id)
+                for duplicate_id in candidate_ids:
+                    if duplicate_id != job_id:
+                        job_id = self._merge_jobs(job_id, duplicate_id)
                 self._update_logical_job(job_id, job)
                 current_hash = self._conn.execute(
                     "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
@@ -522,6 +523,11 @@ class JobStore:
         if survivor_id == duplicate_id:
             return survivor_id
 
+        if self._job_survivor_sort_key(duplicate_id) < self._job_survivor_sort_key(
+            survivor_id
+        ):
+            survivor_id, duplicate_id = duplicate_id, survivor_id
+
         survivor = self._conn.execute(
             "SELECT * FROM jobs WHERE id = ?", (survivor_id,)
         ).fetchone()
@@ -544,7 +550,7 @@ class JobStore:
             if prefer_duplicate_identity
             else survivor["url"] or duplicate["url"]
         )
-        if prefer_duplicate_identity and canonical_url:
+        if canonical_url and (survivor_has_ats or duplicate_has_ats):
             url = canonical_url
         description = self._richer_text(
             survivor["description"], duplicate["description"]
@@ -637,6 +643,34 @@ class JobStore:
         )
         self._conn.execute("DELETE FROM jobs WHERE id = ?", (duplicate_id,))
         return survivor_id
+
+    def _job_survivor_sort_key(self, job_id: int) -> tuple[int, int, str, int]:
+        """Rank a stored job for deterministic, history-preserving merges."""
+        row = self._conn.execute(
+            """
+            SELECT
+                j.first_seen_at,
+                EXISTS(
+                    SELECT 1 FROM application_events a WHERE a.job_id = j.id
+                ) AS has_application_events,
+                (
+                    EXISTS(SELECT 1 FROM evaluations e WHERE e.job_id = j.id)
+                    OR EXISTS(SELECT 1 FROM materials m WHERE m.job_id = j.id)
+                    OR EXISTS(SELECT 1 FROM deliveries d WHERE d.job_id = j.id)
+                ) AS has_other_history
+            FROM jobs j
+            WHERE j.id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"job does not exist: {job_id}")
+        return (
+            -int(row["has_application_events"]),
+            -int(row["has_other_history"]),
+            row["first_seen_at"],
+            job_id,
+        )
 
     @staticmethod
     def _has_complete_ats_identity(row: sqlite3.Row) -> bool:

@@ -277,6 +277,85 @@ def test_collect_candidates_collapses_three_sources_to_one_logical_job(store, po
     }
 
 
+def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, policy):
+    legacy_url = "https://aggregator.test/jobs/acme-frontend"
+    canonical_url = "https://jobs.lever.co/acme/abc"
+    legacy = Job(
+        source="aggregator",
+        source_job_id="legacy-1",
+        title="Senior Product Engineer",
+        company="Acme GmbH",
+        location="Berlin",
+        url=legacy_url,
+        description="React TypeScript",
+        remote=True,
+    )
+    legacy_id, _, _ = store.upsert_job(legacy)
+    store.save_evaluation(
+        legacy_id,
+        Evaluation(
+            job_id=legacy_id,
+            total_score=90,
+            scores={},
+            decision="high_priority",
+            hard_blockers=[],
+            strengths=[],
+            gaps=[],
+            salary_note="",
+            location_note="",
+            rationale="",
+            model="gemini-test",
+            status="ok",
+        ),
+    )
+    canonical_id, _, _ = store.upsert_job(
+        Job(
+            source="lever",
+            source_job_id="abc",
+            title="senior product engineer",
+            company="ACME",
+            location="Berlin",
+            url=canonical_url,
+            canonical_url=canonical_url,
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        )
+    )
+    resolution = CanonicalResolution(
+        url=canonical_url,
+        ats=AtsReference(provider="lever", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="test",
+    )
+
+    result = collect_candidates(
+        [FakeSource([legacy])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert canonical_id != legacy_id
+    assert store.count_jobs() == 1
+    assert result.eligible == []
+    assert result.rediscovered_job_ids == [legacy_id]
+    assert store.get_evaluation(legacy_id) is not None
+    assert store.get_job(legacy_id).url == canonical_url
+
+    rerun = collect_candidates(
+        [FakeSource([legacy])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert store.count_jobs() == 1
+    assert rerun.rediscovered_job_ids == [legacy_id]
+
+
 def test_collect_candidates_counts_unresolved_canonical_urls(store, policy):
     job = Job(
         source="yc",

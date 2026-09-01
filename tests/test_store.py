@@ -856,10 +856,10 @@ def test_same_title_at_different_companies_does_not_merge(tmp_path):
 
 def test_merge_jobs_preserves_associations_provenance_and_richer_fields(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
-    survivor_id, _, _ = store.upsert_job(
+    plain_id, _, _ = store.upsert_job(
         Job(source="gmail:linkedin", source_job_id="1", title="Frontend Engineer")
     )
-    duplicate_id, _, _ = store.upsert_job(
+    history_id, _, _ = store.upsert_job(
         Job(
             source="yc",
             source_job_id="2",
@@ -873,19 +873,19 @@ def test_merge_jobs_preserves_associations_provenance_and_richer_fields(tmp_path
         )
     )
     store.record_job_source(
-        survivor_id,
+        plain_id,
         source="gmail:linkedin",
         source_job_id="1",
         source_url="https://linkedin.test/1",
     )
     store.record_job_source(
-        duplicate_id,
+        history_id,
         source="yc",
         source_job_id="2",
         source_url="https://yc.test/2",
     )
     store.save_application_event(
-        job_id=duplicate_id,
+        job_id=history_id,
         event_type="APPLIED",
         occurred_at="2026-08-31T10:00:00+00:00",
         source_message_id="merge-message",
@@ -895,12 +895,12 @@ def test_merge_jobs_preserves_associations_provenance_and_richer_fields(tmp_path
         role_title="Frontend Engineer",
         rationale="application confirmation",
     )
-    store.save_evaluation(duplicate_id, _evaluation(duplicate_id))
+    store.save_evaluation(history_id, _evaluation(history_id))
     store.save_material(
-        duplicate_id,
-        Material(job_id=duplicate_id, cover_letter_text="Tailored letter"),
+        history_id,
+        Material(job_id=history_id, cover_letter_text="Tailored letter"),
     )
-    store.mark_delivered(duplicate_id, "telegram_message", "delivery-1")
+    store.mark_delivered(history_id, "telegram_message", "delivery-1")
     now = "2026-08-31T10:00:00+00:00"
     store._conn.execute(
         """
@@ -909,27 +909,291 @@ def test_merge_jobs_preserves_associations_provenance_and_richer_fields(tmp_path
              promotion_source, confidence, first_seen_at, created_at, updated_at)
         VALUES ('Acme', 'acme', ?, 'automatic', 1.0, ?, ?, ?)
         """,
-        (duplicate_id, now, now, now),
+        (history_id, now, now, now),
     )
     store._conn.commit()
 
-    assert store.merge_jobs(survivor_id, duplicate_id) == survivor_id
+    assert store.merge_jobs(plain_id, history_id) == history_id
 
-    merged = store._conn.execute("SELECT * FROM jobs WHERE id = ?", (survivor_id,)).fetchone()
+    merged = store._conn.execute("SELECT * FROM jobs WHERE id = ?", (history_id,)).fetchone()
     assert merged["company"] == "Acme"
     assert merged["description"] == "A detailed React role description"
     assert merged["url"] == "https://jobs.lever.co/acme/abc"
     assert merged["ats_provider"] == "lever"
     assert store.count_jobs() == 1
-    assert {row["source"] for row in store.list_job_sources(survivor_id)} == {
+    assert {row["source"] for row in store.list_job_sources(history_id)} == {
         "gmail:linkedin",
         "yc",
     }
     for table in ("application_events", "evaluations", "materials", "deliveries"):
         row = store._conn.execute(f"SELECT job_id FROM {table}").fetchone()
-        assert row["job_id"] == survivor_id
+        assert row["job_id"] == history_id
     watch = store._conn.execute("SELECT discovered_from_job_id FROM company_watch").fetchone()
-    assert watch["discovered_from_job_id"] == survivor_id
+    assert watch["discovered_from_job_id"] == history_id
+
+
+def test_late_canonical_merge_keeps_application_history_job_and_all_associations(
+    tmp_path,
+):
+    store = JobStore(tmp_path / "state.sqlite3")
+    legacy_url = "https://aggregator.test/jobs/acme-frontend"
+    canonical_url = "https://jobs.lever.co/acme/abc"
+    legacy_id, _, _ = store.upsert_job(
+        Job(
+            source="aggregator",
+            source_job_id="legacy-1",
+            title="Senior Frontend Engineer",
+            company="Acme GmbH",
+            location="Berlin",
+            url=legacy_url,
+            description="React and TypeScript role",
+        )
+    )
+    store.record_job_source(
+        legacy_id,
+        source="aggregator",
+        source_job_id="legacy-1",
+        source_url=legacy_url,
+    )
+    store.save_evaluation(legacy_id, _evaluation(legacy_id))
+    store.save_material(
+        legacy_id,
+        Material(job_id=legacy_id, cover_letter_text="Tailored letter"),
+    )
+    store.mark_delivered(legacy_id, "telegram_message", "delivery-1")
+    store.save_application_event(
+        job_id=legacy_id,
+        event_type="INTERVIEW",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="late-canonical-interview",
+        source_thread_id=None,
+        confidence=1.0,
+        company="Acme",
+        role_title="Senior Frontend Engineer",
+        rationale="interview invitation",
+    )
+
+    canonical_id, _, _ = store.upsert_job(
+        Job(
+            source="lever",
+            source_job_id="abc",
+            title="senior frontend engineer",
+            company="ACME",
+            location="Berlin",
+            url=canonical_url,
+            canonical_url=canonical_url,
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        )
+    )
+    store.record_job_source(
+        canonical_id,
+        source="lever",
+        source_job_id="abc",
+        source_url=canonical_url,
+    )
+
+    survivor_id, is_new, _description_changed = store.upsert_logical_job(
+        Job(
+            source="aggregator",
+            source_job_id="legacy-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url=canonical_url,
+            original_url=legacy_url,
+            canonical_url=canonical_url,
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+            description="React and TypeScript role",
+        )
+    )
+
+    assert canonical_id != legacy_id
+    assert survivor_id == legacy_id
+    assert is_new is False
+    assert store.count_jobs() == 1
+    assert store.get_evaluation(survivor_id) is not None
+    assert store.get_material(survivor_id) is not None
+    assert store.has_delivery(survivor_id, "telegram_message")
+    assert store.current_application_state(survivor_id) == "INTERVIEW"
+    assert store.get_job(survivor_id).url == canonical_url
+    assert {row["source"] for row in store.list_job_sources(survivor_id)} == {
+        "aggregator",
+        "lever",
+    }
+
+
+def test_late_canonical_upsert_enriches_single_existing_job_in_place(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    legacy_url = "https://aggregator.test/jobs/acme-frontend"
+    canonical_url = "https://jobs.lever.co/acme/abc"
+    existing_id, _, _ = store.upsert_job(
+        Job(
+            source="aggregator",
+            source_job_id="legacy-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url=legacy_url,
+        )
+    )
+
+    job_id, is_new, _description_changed = store.upsert_logical_job(
+        Job(
+            source="aggregator",
+            source_job_id="legacy-1",
+            title="Senior Frontend Engineer",
+            company="Acme GmbH",
+            location="Berlin",
+            url=canonical_url,
+            original_url=legacy_url,
+            canonical_url=canonical_url,
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        )
+    )
+
+    assert job_id == existing_id
+    assert is_new is False
+    assert store.count_jobs() == 1
+    assert store.get_job(existing_id).url == canonical_url
+
+
+def test_merge_survivor_prefers_other_history_over_age_and_lower_id(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    older_id, _, _ = store.upsert_job(
+        Job(source="older", source_job_id="1", title="Frontend Engineer")
+    )
+    history_id, _, _ = store.upsert_job(
+        Job(source="history", source_job_id="2", title="Frontend Engineer")
+    )
+    store.save_material(
+        history_id,
+        Material(job_id=history_id, cover_letter_text="Existing material"),
+    )
+
+    assert store.merge_jobs(older_id, history_id) == history_id
+    assert store.get_job(older_id) is None
+    assert store.get_material(history_id) is not None
+
+
+def test_merge_survivor_prefers_application_events_over_other_history(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    other_history_id, _, _ = store.upsert_job(
+        Job(source="history", source_job_id="1", title="Frontend Engineer")
+    )
+    application_id, _, _ = store.upsert_job(
+        Job(source="application", source_job_id="2", title="Frontend Engineer")
+    )
+    store.save_evaluation(other_history_id, _evaluation(other_history_id))
+    store.save_material(
+        other_history_id,
+        Material(job_id=other_history_id, cover_letter_text="Existing material"),
+    )
+    store.mark_delivered(other_history_id, "telegram_message", "delivery-1")
+    store.save_application_event(
+        job_id=application_id,
+        event_type="INTERVIEW",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="application-priority",
+        source_thread_id=None,
+        confidence=1.0,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="interview invitation",
+    )
+
+    assert store.merge_jobs(other_history_id, application_id) == application_id
+    assert store.current_application_state(application_id) == "INTERVIEW"
+    assert store.get_evaluation(application_id) is not None
+    assert store.get_material(application_id) is not None
+    assert store.has_delivery(application_id, "telegram_message")
+
+
+def test_merge_survivor_prefers_older_first_seen_over_lower_id(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    lower_id, _, _ = store.upsert_job(
+        Job(source="lower", source_job_id="1", title="Frontend Engineer")
+    )
+    older_id, _, _ = store.upsert_job(
+        Job(source="older", source_job_id="2", title="Frontend Engineer")
+    )
+    store._conn.execute(
+        "UPDATE jobs SET first_seen_at = ? WHERE id = ?",
+        ("2026-08-31T10:00:00+00:00", lower_id),
+    )
+    store._conn.execute(
+        "UPDATE jobs SET first_seen_at = ? WHERE id = ?",
+        ("2026-08-30T10:00:00+00:00", older_id),
+    )
+    store._conn.commit()
+
+    assert store.merge_jobs(lower_id, older_id) == older_id
+    assert store.get_job(lower_id) is None
+    assert store.get_job(older_id) is not None
+
+
+def test_merge_survivor_uses_lower_id_when_history_and_age_are_equal(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    lower_id, _, _ = store.upsert_job(
+        Job(source="lower", source_job_id="1", title="Frontend Engineer")
+    )
+    higher_id, _, _ = store.upsert_job(
+        Job(source="higher", source_job_id="2", title="Frontend Engineer")
+    )
+    first_seen_at = "2026-08-31T10:00:00+00:00"
+    store._conn.execute(
+        "UPDATE jobs SET first_seen_at = ? WHERE id IN (?, ?)",
+        (first_seen_at, lower_id, higher_id),
+    )
+    store._conn.commit()
+
+    assert store.merge_jobs(higher_id, lower_id) == lower_id
+    assert store.get_job(lower_id) is not None
+    assert store.get_job(higher_id) is None
+
+
+def test_merge_job_sources_preserves_seen_bounds_on_identity_conflict(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    survivor_id, _, _ = store.upsert_job(
+        Job(source="first", source_job_id="1", title="Frontend Engineer")
+    )
+    duplicate_id, _, _ = store.upsert_job(
+        Job(source="second", source_job_id="2", title="Frontend Engineer")
+    )
+    for job_id in (survivor_id, duplicate_id):
+        store.record_job_source(
+            job_id,
+            source="shared",
+            source_job_id="same-id",
+            source_url="https://source.test/jobs/same-id",
+        )
+    store._conn.execute(
+        """
+        UPDATE job_sources SET first_seen_at = ?, last_seen_at = ?
+        WHERE job_id = ?
+        """,
+        ("2026-08-10T00:00:00+00:00", "2026-08-20T00:00:00+00:00", survivor_id),
+    )
+    store._conn.execute(
+        """
+        UPDATE job_sources SET first_seen_at = ?, last_seen_at = ?
+        WHERE job_id = ?
+        """,
+        ("2026-08-01T00:00:00+00:00", "2026-08-31T00:00:00+00:00", duplicate_id),
+    )
+    store._conn.commit()
+
+    merged_id = store.merge_jobs(survivor_id, duplicate_id)
+
+    sources = store.list_job_sources(merged_id)
+    assert len(sources) == 1
+    assert sources[0]["first_seen_at"] == "2026-08-01T00:00:00+00:00"
+    assert sources[0]["last_seen_at"] == "2026-08-31T00:00:00+00:00"
 
 
 def test_logical_upsert_reports_description_change_caused_by_merge(tmp_path):
