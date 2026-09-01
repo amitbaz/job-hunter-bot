@@ -4,8 +4,13 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from job_hunter.gmail_classifier import classify_email, source_candidate_key
+from job_hunter.gmail_classifier import (
+    SemanticClassificationError,
+    classify_email,
+    source_candidate_key,
+)
 from job_hunter.gmail_client import GmailHistoryExpired
+from job_hunter.gmail_linkedin_cleanup import release_legacy_blank_linkedin_jobs
 from job_hunter.gmail_matching import match_job
 from job_hunter.gmail_models import (
     AUTO_CONFIDENCE_THRESHOLD,
@@ -24,6 +29,7 @@ _QUERY_TERMS = (
 _LIFECYCLE_KINDS = frozenset(
     {"RECRUITER_CONTACT", "APPLIED", "INTERVIEW", "TECHNICAL", "OFFER", "REJECTED"}
 )
+DEFAULT_BACKFILL_BATCH_SIZE = 100
 
 
 def _query_after(year: int, month: int, day: int) -> str:
@@ -37,10 +43,20 @@ def build_backfill_query(now: datetime) -> str:
 
 
 class GmailSyncService:
-    def __init__(self, *, gmail, gemini, store) -> None:
+    def __init__(
+        self,
+        *,
+        gmail,
+        gemini,
+        store,
+        backfill_batch_size: int = DEFAULT_BACKFILL_BATCH_SIZE,
+    ) -> None:
+        if backfill_batch_size <= 0:
+            raise ValueError("backfill_batch_size must be positive")
         self.gmail = gmail
         self.gemini = gemini
         self.store = store
+        self.backfill_batch_size = backfill_batch_size
         self._backfill_now: datetime | None = None
 
     def sync(
@@ -52,6 +68,28 @@ class GmailSyncService:
         summary = GmailSyncSummary()
         account_id, checkpoint_history_id = self.gmail.get_profile()
         state = self.store.get_gmail_sync_state(account_id)
+
+        if not dry_run:
+            released_legacy = self.store.release_legacy_gmail_semantic_failures()
+            released_linkedin = release_legacy_blank_linkedin_jobs(self.store)
+            if released_legacy:
+                _LOGGER.info(
+                    "gmail_legacy_semantic_failures_released=%s", released_legacy
+                )
+            if released_linkedin:
+                _LOGGER.info(
+                    "gmail_legacy_blank_linkedin_jobs_released=%s", released_linkedin
+                )
+            if (
+                released_legacy or released_linkedin
+            ) and state is not None and state["backfill_completed_at"] is not None:
+                self.store.save_gmail_sync_state(
+                    account_id=account_id,
+                    history_id=state["history_id"],
+                    last_successful_sync_at=state["last_successful_sync_at"],
+                    backfill_completed_at=None,
+                )
+                state = self.store.get_gmail_sync_state(account_id)
 
         backfill_pending = state is None or state["backfill_completed_at"] is None
         if force_backfill and state is not None and not dry_run:
@@ -66,14 +104,21 @@ class GmailSyncService:
             message_ids = self._search_message_ids(build_backfill_query(now))
             self._backfill_now = now
             try:
-                had_hard_errors = self._process_message_ids(
+                had_hard_errors, deferred_unprocessed = self._process_message_ids(
                     message_ids,
                     summary=summary,
                     dry_run=dry_run,
+                    max_unprocessed=self.backfill_batch_size,
+                )
+                _LOGGER.info(
+                    "gmail_backfill_batch candidates=%s batch_size=%s deferred=%s",
+                    len(message_ids),
+                    self.backfill_batch_size,
+                    deferred_unprocessed,
                 )
             finally:
                 self._backfill_now = None
-            if not dry_run and not had_hard_errors:
+            if not dry_run and not had_hard_errors and deferred_unprocessed == 0:
                 self.store.save_gmail_sync_state(
                     account_id=account_id,
                     history_id=checkpoint_history_id,
@@ -120,11 +165,12 @@ class GmailSyncService:
             )
             next_history_id = checkpoint_history_id
 
-        had_hard_errors = self._process_message_ids(
+        had_hard_errors, deferred_unprocessed = self._process_message_ids(
             message_ids,
             summary=summary,
             dry_run=dry_run,
         )
+        assert deferred_unprocessed == 0
         if dry_run or had_hard_errors:
             return
 
@@ -257,17 +303,48 @@ class GmailSyncService:
         *,
         summary: GmailSyncSummary,
         dry_run: bool,
-    ) -> bool:
+        max_unprocessed: int | None = None,
+    ) -> tuple[bool, int]:
         had_hard_errors = False
+        attempted_unprocessed = 0
+        deferred_unprocessed = 0
         for message_id in message_ids:
             summary.fetched += 1
-            try:
-                if not dry_run and self.store.has_processed_gmail_message(message_id):
+            if not dry_run:
+                try:
+                    if self.store.has_processed_gmail_message(message_id):
+                        continue
+                except Exception:
+                    _LOGGER.exception(
+                        "gmail_message_processing_failed message_id=%s", message_id
+                    )
+                    summary.errors += 1
+                    had_hard_errors = True
                     continue
+
+            if (
+                max_unprocessed is not None
+                and attempted_unprocessed >= max_unprocessed
+            ):
+                deferred_unprocessed += 1
+                continue
+
+            attempted_unprocessed += 1
+            try:
                 classification = self.process_message(
                     self.gmail.get_message(message_id),
                     dry_run=dry_run,
                 )
+            except SemanticClassificationError as exc:
+                _LOGGER.warning(
+                    "gmail_semantic_classification_failed message_id=%s reason=%s detail=%s",
+                    message_id,
+                    exc.reason,
+                    exc.detail or "unknown",
+                )
+                summary.errors += 1
+                had_hard_errors = True
+                continue
             except Exception:
                 _LOGGER.exception("gmail_message_processing_failed message_id=%s", message_id)
                 summary.errors += 1
@@ -283,7 +360,7 @@ class GmailSyncService:
                 summary.irrelevant += 1
             elif classification.kind in _LIFECYCLE_KINDS:
                 summary.application_events += 1
-        return had_hard_errors
+        return had_hard_errors, deferred_unprocessed
 
     @staticmethod
     def _log_summary(summary: GmailSyncSummary) -> None:

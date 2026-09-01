@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from job_hunter.gemini import GeminiClient
 
 _VISIBLE_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_LINKEDIN_JOB_ID_PATTERN = re.compile(r"/(?:comm/)?jobs/view/(\d+)(?:/|$)", re.IGNORECASE)
 _KNOWN_PLATFORM_SENDERS = (
     "linkedin.com",
     "greenhouse.io",
@@ -27,18 +28,7 @@ _KNOWN_PLATFORM_SENDERS = (
     "ashbyhq.com",
     "workable.com",
 )
-_CLASSIFICATION_FIELDS = frozenset(
-    {
-        "kind",
-        "confidence",
-        "company",
-        "role_title",
-        "source_job_id",
-        "job_urls",
-        "jobs",
-        "rationale",
-    }
-)
+_REQUIRED_CLASSIFICATION_FIELDS = frozenset({"kind", "confidence", "rationale"})
 _JOB_FIELDS = frozenset(
     {
         "source_platform",
@@ -51,6 +41,48 @@ _JOB_FIELDS = frozenset(
         "description",
     }
 )
+_GMAIL_CLASSIFICATION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "kind": {"type": "STRING", "enum": sorted(SUPPORTED_KINDS)},
+        "confidence": {"type": "NUMBER", "minimum": 0, "maximum": 1},
+        "company": {"type": "STRING", "nullable": True},
+        "role_title": {"type": "STRING", "nullable": True},
+        "source_job_id": {"type": "STRING", "nullable": True},
+        "job_urls": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+        },
+        "jobs": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "source_platform": {"type": "STRING"},
+                    "source_job_id": {"type": "STRING", "nullable": True},
+                    "url": {"type": "STRING"},
+                    "company": {"type": "STRING", "nullable": True},
+                    "title": {"type": "STRING", "nullable": True},
+                    "location": {"type": "STRING", "nullable": True},
+                    "remote": {"type": "BOOLEAN", "nullable": True},
+                    "description": {"type": "STRING", "nullable": True},
+                },
+                "required": [
+                    "source_platform",
+                    "source_job_id",
+                    "url",
+                    "company",
+                    "title",
+                    "location",
+                    "remote",
+                    "description",
+                ],
+            },
+        },
+        "rationale": {"type": "STRING"},
+    },
+    "required": ["kind", "confidence", "rationale"],
+}
 _SCHEMA_INSTRUCTION = """Return one JSON object only with keys:
 kind, confidence, company, role_title, source_job_id, job_urls, jobs, rationale.
 kind must be one of JOB_ALERT, RECRUITER_CONTACT, APPLIED, INTERVIEW, TECHNICAL, OFFER, REJECTED, REVIEW_NEEDED, IRRELEVANT.
@@ -64,6 +96,15 @@ Use a URL only when it appears in the supplied email links or body.
 """
 
 
+class SemanticClassificationError(RuntimeError):
+    """Raised when Gmail semantic classification fails for technical reasons."""
+
+    def __init__(self, reason: str, detail: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.detail = detail
+
+
 def _is_absolute_http_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
@@ -72,6 +113,22 @@ def _is_absolute_http_url(value: str) -> bool:
 def _host_matches_domain(host: str, domain: str) -> bool:
     host = host.lower().rstrip(".")
     return host == domain or host.endswith("." + domain)
+
+
+def _linkedin_job_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not _host_matches_domain(host, "linkedin.com"):
+        return None
+    match = _LINKEDIN_JOB_ID_PATTERN.search(parsed.path)
+    return match.group(1) if match else None
+
+
+def _normalize_url(url: str) -> str:
+    linkedin_job_id = _linkedin_job_id(url)
+    if linkedin_job_id:
+        return f"https://www.linkedin.com/jobs/view/{linkedin_job_id}/"
+    return canonicalize_url(url)
 
 
 def _is_known_platform_host(host: str) -> bool:
@@ -99,7 +156,7 @@ def _message_urls(message: GmailMessage) -> list[str]:
         value = value.rstrip(".,;:!?)]}")
         if not _is_absolute_http_url(value):
             continue
-        url = canonicalize_url(value)
+        url = _normalize_url(value)
         if url not in urls:
             urls.append(url)
     return urls
@@ -127,7 +184,14 @@ def _known_jobs(message: GmailMessage) -> list[ExtractedJob]:
     for index, url in enumerate(_message_urls(message)):
         platform = _job_url_platform(url)
         if platform:
-            jobs.append(ExtractedJob(source_platform=platform, url=url, index=index))
+            jobs.append(
+                ExtractedJob(
+                    source_platform=platform,
+                    source_job_id=_linkedin_job_id(url) if platform == "linkedin" else None,
+                    url=url,
+                    index=index,
+                )
+            )
     return jobs
 
 
@@ -150,10 +214,12 @@ def is_probably_job_related(message: GmailMessage) -> bool:
         "recruiter",
         "hiring",
         "job alert",
-        "position",
+        "job offer",
+        "offer letter",
         "technical assessment",
         "coding challenge",
-        "offer",
+        "thanks for applying",
+        "received your application",
     )
     return any(term in text for term in strong_terms) or _is_known_platform_sender(message)
 
@@ -189,8 +255,16 @@ def classify_deterministically(message: GmailMessage) -> GmailClassification | N
 
 
 def source_candidate_key(job: ExtractedJob) -> str:
+    if job.source_platform.lower() == "linkedin":
+        if job.source_job_id:
+            return f"id:linkedin:{job.source_job_id}"
+        parsed = urlparse(job.url)
+        if "/comm/jobs/view/" in parsed.path.lower():
+            linkedin_job_id = _linkedin_job_id(job.url)
+            if linkedin_job_id:
+                return f"id:linkedin:{linkedin_job_id}"
     if job.url:
-        return "url:" + canonicalize_url(job.url)
+        return "url:" + _normalize_url(job.url)
     if job.source_job_id:
         return f"id:{job.source_platform.lower()}:{job.source_job_id}"
     return "fallback:" + "|".join(
@@ -209,14 +283,27 @@ def _validate_string(data: dict, key: str) -> str:
     return value.strip()
 
 
-def _validate_optional_string(data: dict, key: str) -> str | None:
+def _optional_text(data: dict, key: str) -> str:
     value = data.get(key)
-    if value is not None and not isinstance(value, str):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
         raise ValueError(f"{key} must be a string or null")
-    return value.strip() if isinstance(value, str) else None
+    return value.strip()
+
+
+def _optional_nullable_text(data: dict, key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string or null")
+    return value.strip() or None
 
 
 def _parse_urls(values: object) -> list[str]:
+    if values is None:
+        return []
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
         raise ValueError("job_urls must be an array of strings")
 
@@ -224,13 +311,15 @@ def _parse_urls(values: object) -> list[str]:
     for value in values:
         if not _is_absolute_http_url(value):
             raise ValueError("job URLs must be absolute HTTP(S) URLs")
-        url = canonicalize_url(value)
+        url = _normalize_url(value)
         if url not in urls:
             urls.append(url)
     return urls
 
 
 def _parse_jobs(values: object) -> list[ExtractedJob]:
+    if values is None:
+        return []
     if not isinstance(values, list):
         raise ValueError("jobs must be an array")
 
@@ -247,16 +336,20 @@ def _parse_jobs(values: object) -> list[ExtractedJob]:
         remote = value.get("remote")
         if remote is not None and not isinstance(remote, bool):
             raise ValueError("remote must be a boolean or null")
+        normalized_url = _normalize_url(url) if url else ""
+        source_job_id = _optional_nullable_text(value, "source_job_id")
+        if source_platform.lower() == "linkedin" and normalized_url:
+            source_job_id = source_job_id or _linkedin_job_id(normalized_url)
         jobs.append(
             ExtractedJob(
                 source_platform=source_platform,
-                source_job_id=_validate_optional_string(value, "source_job_id"),
-                url=canonicalize_url(url) if url else "",
-                company=_validate_string(value, "company"),
-                title=_validate_string(value, "title"),
-                location=_validate_string(value, "location"),
+                source_job_id=source_job_id,
+                url=normalized_url,
+                company=_optional_text(value, "company"),
+                title=_optional_text(value, "title"),
+                location=_optional_text(value, "location"),
                 remote=remote,
-                description=_validate_string(value, "description"),
+                description=_optional_text(value, "description"),
                 index=index,
             )
         )
@@ -268,8 +361,10 @@ def _parse_semantic_classification(raw: str) -> GmailClassification:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError("invalid JSON") from exc
-    if not isinstance(data, dict) or set(data) != _CLASSIFICATION_FIELDS:
-        raise ValueError("response must contain exactly the supported fields")
+    if not isinstance(data, dict):
+        raise ValueError("response must be an object")
+    if not _REQUIRED_CLASSIFICATION_FIELDS.issubset(data):
+        raise ValueError("response missing required classification fields")
 
     kind = _validate_string(data, "kind")
     if kind not in SUPPORTED_KINDS:
@@ -281,45 +376,38 @@ def _parse_semantic_classification(raw: str) -> GmailClassification:
     if len(rationale) >= 160:
         raise ValueError("rationale must be under 160 characters")
 
-    classification = GmailClassification(
+    if kind == "IRRELEVANT":
+        return GmailClassification(
+            kind="IRRELEVANT",
+            confidence=float(confidence),
+            rationale=rationale,
+        )
+
+    return GmailClassification(
         kind=kind,
         confidence=float(confidence),
-        company=_validate_string(data, "company"),
-        role_title=_validate_string(data, "role_title"),
-        source_job_id=_validate_optional_string(data, "source_job_id"),
+        company=_optional_text(data, "company"),
+        role_title=_optional_text(data, "role_title"),
+        source_job_id=_optional_nullable_text(data, "source_job_id"),
         job_urls=_parse_urls(data.get("job_urls")),
         jobs=_parse_jobs(data.get("jobs")),
         rationale=rationale,
     )
-    if classification.kind == "IRRELEVANT" and (
-        classification.company
-        or classification.role_title
-        or classification.source_job_id
-        or classification.job_urls
-        or classification.jobs
-    ):
-        raise ValueError("irrelevant response conflicts with extracted job data")
-    return classification
 
 
 def _reconcile_semantic_urls(
     message: GmailMessage, classification: GmailClassification
 ) -> GmailClassification:
-    semantic_urls = set(classification.job_urls)
-    semantic_job_urls = {job.url for job in classification.jobs if job.url}
-    if semantic_urls != semantic_job_urls:
-        raise ValueError("job_urls and jobs URLs conflict")
-
     message_urls = set(_message_urls(message))
-    if not semantic_urls.issubset(message_urls):
-        raise ValueError("semantic job URL was not present in the email")
+    job_urls = [url for url in classification.job_urls if url in message_urls]
+    jobs = [
+        replace(job, url="")
+        if job.url and job.url not in message_urls
+        else job
+        for job in classification.jobs
+    ]
 
     known_jobs = _known_jobs(message)
-    if classification.kind == "IRRELEVANT" and known_jobs:
-        raise ValueError("irrelevant response conflicts with known job URLs")
-
-    job_urls = list(classification.job_urls)
-    jobs = list(classification.jobs)
     known_urls = {job.url for job in jobs if job.url}
     for job in known_jobs:
         if job.url not in known_urls:
@@ -349,12 +437,37 @@ def _build_semantic_prompt(
     )
 
 
+def _generate_semantic_text(
+    message: GmailMessage,
+    gemini: GeminiClient,
+    *,
+    extract_job_alert: bool,
+) -> str:
+    prompt = _build_semantic_prompt(message, extract_job_alert=extract_job_alert)
+    try:
+        return gemini.generate_text(
+            prompt,
+            json_mode=True,
+            json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument 'json_schema'" not in str(exc):
+            raise
+        return gemini.generate_text(prompt, json_mode=True)
+
+
 def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification:
     deterministic = classify_deterministically(message)
     extract_job_alert = bool(
         deterministic is not None
         and deterministic.kind == "JOB_ALERT"
-        and not deterministic.jobs
+        and (
+            not deterministic.jobs
+            or any(
+                job.source_platform.lower() == "linkedin" and job.source_job_id
+                for job in deterministic.jobs
+            )
+        )
     )
     if deterministic is not None and not extract_job_alert:
         return deterministic
@@ -362,23 +475,24 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
         return GmailClassification(kind="IRRELEVANT", confidence=1.0, rationale="no deterministic job signal")
 
     try:
-        classification = _parse_semantic_classification(
-            gemini.generate_text(
-                _build_semantic_prompt(
-                    message,
-                    extract_job_alert=extract_job_alert,
-                ),
-                json_mode=True,
-            )
+        raw = _generate_semantic_text(
+            message,
+            gemini,
+            extract_job_alert=extract_job_alert,
         )
-        classification = _reconcile_semantic_urls(message, classification)
-        if extract_job_alert and (
-            classification.kind != "JOB_ALERT" or not classification.jobs
-        ):
-            raise ValueError("generic job alert extraction returned no usable jobs")
-    except Exception:
-        return _review_needed("semantic classification unavailable or invalid")
+    except Exception as exc:
+        raise SemanticClassificationError("gemini_error") from exc
+
+    try:
+        classification = _parse_semantic_classification(raw)
+        if classification.kind != "IRRELEVANT":
+            classification = _reconcile_semantic_urls(message, classification)
+    except ValueError as exc:
+        raise SemanticClassificationError(
+            "invalid_semantic_response",
+            detail=str(exc),
+        ) from exc
 
     if classification.kind == "REVIEW_NEEDED" or classification.confidence < AUTO_CONFIDENCE_THRESHOLD:
-        return _review_needed("semantic classification requires review")
+        return replace(classification, kind="REVIEW_NEEDED")
     return classification

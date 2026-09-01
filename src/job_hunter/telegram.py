@@ -70,9 +70,13 @@ def build_digest(items: Sequence[DigestItem]) -> str:
 
 
 def _gmail_review_line(item: ReviewItem) -> str:
-    company = item.company or "Unknown company"
-    role_title = item.role_title or "Unknown role"
-    return f"- {company} — {role_title} | {item.rationale[:200]}"
+    if item.company or item.role_title:
+        company = item.company or "Unknown company"
+        role_title = item.role_title or "Unknown role"
+        context = f"{company} — {role_title}"
+    else:
+        context = item.subject or "Gmail message"
+    return f"- {context} | {item.rationale[:200]}"
 
 
 def build_gmail_review_digest(items: Sequence[ReviewItem]) -> str:
@@ -99,9 +103,7 @@ def build_gmail_review_digest_chunks(
 
         added_length = 1 + len(line)
         if current_lines and current_length + added_length > limit:
-            chunks.append(
-                ("\n".join([_REVIEW_HEADER, *current_lines]), current_ids)
-            )
+            chunks.append(("\n".join([_REVIEW_HEADER, *current_lines]), current_ids))
             current_lines = []
             current_ids = []
             current_length = len(_REVIEW_HEADER)
@@ -155,17 +157,26 @@ def _truncate_caption(caption: str, limit: int = _CAPTION_LIMIT) -> str:
 
 
 class TelegramClient:
-    def __init__(self, bot_token: str, chat_id: str, http: "HttpClient") -> None:
+    def __init__(self, bot_token: str, chat_id: str | None, http: "HttpClient") -> None:
         self._chat_id = chat_id
         self._http = http
         self._base_url = _BASE_URL.format(token=bot_token)
 
+    def _configured_chat_id(self) -> str | None:
+        if not self._chat_id:
+            logger.warning("telegram operation requires a configured chat id")
+            return None
+        return self._chat_id
+
     def send_message(self, text: str) -> str | None:
+        chat_id = self._configured_chat_id()
+        if chat_id is None:
+            return None
         last_message_id = None
         for chunk in chunk_message(text):
             response = self._http.post(
                 f"{self._base_url}/sendMessage",
-                json={"chat_id": self._chat_id, "text": chunk},
+                json={"chat_id": chat_id, "text": chunk},
             )
             if response.status_code >= 400:
                 logger.warning("telegram sendMessage failed: %s", response.text)
@@ -174,14 +185,78 @@ class TelegramClient:
 
         return str(last_message_id) if last_message_id is not None else None
 
+    def send_job_card(self, text: str, keyboard: list[list[dict[str, str]]]) -> str | None:
+        chat_id = self._configured_chat_id()
+        if chat_id is None:
+            return None
+        response = self._http.post(
+            f"{self._base_url}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "reply_markup": {"inline_keyboard": keyboard},
+            },
+        )
+        if response.status_code >= 400:
+            logger.warning("telegram navigator sendMessage failed: %s", response.text)
+            return None
+        message_id = response.json().get("result", {}).get("message_id")
+        return str(message_id) if message_id is not None else None
+
+    def edit_job_card(
+        self,
+        *,
+        chat_id: str | int,
+        message_id: str | int,
+        text: str,
+        keyboard: list[list[dict[str, str]]],
+    ) -> bool:
+        response = self._http.post(
+            f"{self._base_url}/editMessageText",
+            json={
+                "chat_id": str(chat_id),
+                "message_id": message_id,
+                "text": text,
+                "reply_markup": {"inline_keyboard": keyboard},
+            },
+        )
+        if response.status_code >= 400:
+            logger.warning("telegram editMessageText failed: %s", response.text)
+            return False
+        return True
+
+    def answer_callback(
+        self,
+        callback_id: str,
+        text: str | None = None,
+        show_alert: bool = False,
+    ) -> bool:
+        payload: dict[str, object] = {
+            "callback_query_id": callback_id,
+            "show_alert": show_alert,
+        }
+        if text is not None:
+            payload["text"] = text
+        response = self._http.post(
+            f"{self._base_url}/answerCallbackQuery",
+            json=payload,
+        )
+        if response.status_code >= 400:
+            logger.warning("telegram answerCallbackQuery failed: %s", response.text)
+            return False
+        return True
+
     def send_document(self, path: Path, caption: str) -> str | None:
+        chat_id = self._configured_chat_id()
+        if chat_id is None:
+            return None
         path = Path(path)
         caption = _truncate_caption(caption)
 
         content = path.read_bytes()
         response = self._http.post(
             f"{self._base_url}/sendDocument",
-            data={"chat_id": self._chat_id, "caption": caption},
+            data={"chat_id": chat_id, "caption": caption},
             files={"document": (path.name, content)},
         )
 
