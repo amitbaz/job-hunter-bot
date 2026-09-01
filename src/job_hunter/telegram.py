@@ -23,7 +23,27 @@ _GROUP_HEADERS = {
 _GROUP_ORDER = ("Ready to apply", "Possible matches", "Needs review / blockers")
 _DELIVERABLE_DECISIONS = frozenset(_GROUP_HEADERS)
 _DELIVERABLE_SCORE_FLOOR = 60
-_REVIEW_HEADER = "Gmail review needed"
+_REVIEW_HEADER = "Gmail activity I couldn't link"
+_REVIEW_EVENT_LABELS = {
+    "RECRUITER_CONTACT": "Recruiter contact",
+    "APPLIED": "Application update",
+    "INTERVIEW": "Interview",
+    "TECHNICAL": "Technical assessment",
+    "OFFER": "Job offer",
+    "REJECTED": "Rejection",
+    "REVIEW_NEEDED": "Job-related activity",
+}
+_REVIEW_EXPLANATIONS = {
+    "RECRUITER_CONTACT": "A recruiter contacted you, but I couldn't link this email to a tracked job.",
+    "APPLIED": "This looks like an application confirmation, but I couldn't link it to a tracked job.",
+    "INTERVIEW": "This looks like an interview email, but I couldn't link it to a tracked job.",
+    "TECHNICAL": "This looks like a technical assessment, but I couldn't link it to a tracked job.",
+    "OFFER": "This looks like a job offer, but I couldn't link it to a tracked job.",
+    "REJECTED": "This looks like a rejection email, but I couldn't link it to a tracked job.",
+}
+_REVIEW_FALLBACK_EXPLANATION = (
+    "This looks job-related, but I couldn't classify or link it confidently."
+)
 
 
 def select_deliverable_items(items: Sequence[DigestItem]) -> list[DigestItem]:
@@ -69,51 +89,77 @@ def build_digest(items: Sequence[DigestItem]) -> str:
     return "\n\n".join(sections) if sections else "No matching jobs today."
 
 
-def _gmail_review_line(item: ReviewItem) -> str:
-    if item.company or item.role_title:
-        company = item.company or "Unknown company"
-        role_title = item.role_title or "Unknown role"
-        context = f"{company} — {role_title}"
-    else:
-        context = item.subject or "Gmail message"
-    return f"- {context} | {item.rationale[:200]}"
+def _gmail_review_title(item: ReviewItem) -> str:
+    if item.company and item.role_title:
+        return f"{item.company} — {item.role_title}"
+    if item.company:
+        label = _REVIEW_EVENT_LABELS.get(item.event_type, "Job-related activity")
+        return f"{item.company} — {label}"
+    return item.subject or "Gmail message"
+
+
+def _gmail_review_explanation(item: ReviewItem) -> str:
+    return _REVIEW_EXPLANATIONS.get(item.event_type, _REVIEW_FALLBACK_EXPLANATION)
+
+
+def _gmail_review_block(item: ReviewItem) -> str:
+    gmail_url = f"https://mail.google.com/mail/#all/{item.source_message_id}"
+    return "\n".join(
+        [
+            _gmail_review_title(item),
+            _gmail_review_explanation(item),
+            f"Open email: {gmail_url}",
+        ]
+    )
+
+
+def _fit_gmail_review_block(item: ReviewItem, max_length: int) -> str:
+    block = _gmail_review_block(item)
+    if len(block) <= max_length:
+        return block
+
+    title, explanation, link = block.split("\n", 2)
+    suffix = f"{explanation}\n{link}"
+    available_title = max_length - len(suffix) - 1
+    if available_title <= 1:
+        return block[: max(1, max_length - 1)].rstrip() + "…"
+    if len(title) > available_title:
+        title = title[: available_title - 1].rstrip() + "…"
+    return f"{title}\n{suffix}"
 
 
 def build_gmail_review_digest(items: Sequence[ReviewItem]) -> str:
-    """Format pending Gmail review events without rendering email content."""
+    """Format unresolved Gmail activity without exposing classifier diagnostics."""
     ordered = sorted(items, key=lambda item: (item.occurred_at, item.event_id))
-    return "\n".join([_REVIEW_HEADER, *(_gmail_review_line(item) for item in ordered)])
+    blocks = [_gmail_review_block(item) for item in ordered]
+    return "\n\n".join([_REVIEW_HEADER, *blocks])
 
 
 def build_gmail_review_digest_chunks(
     items: Sequence[ReviewItem], limit: int = 3900
 ) -> list[tuple[str, list[int]]]:
-    """Chunk review items without splitting one event across acknowledgements."""
+    """Chunk Gmail activity while keeping each event with its explanation and link."""
     ordered = sorted(items, key=lambda item: (item.occurred_at, item.event_id))
     chunks: list[tuple[str, list[int]]] = []
-    current_lines: list[str] = []
+    current_blocks: list[str] = []
     current_ids: list[int] = []
-    current_length = len(_REVIEW_HEADER)
-    max_line_length = max(1, limit - len(_REVIEW_HEADER) - 1)
+    max_block_length = max(1, limit - len(_REVIEW_HEADER) - 2)
 
     for item in ordered:
-        line = _gmail_review_line(item)
-        if len(line) > max_line_length:
-            line = line[: max_line_length - 1].rstrip() + "…"
+        block = _fit_gmail_review_block(item, max_block_length)
+        candidate = "\n\n".join([_REVIEW_HEADER, *current_blocks, block])
+        if current_blocks and len(candidate) > limit:
+            chunks.append(
+                ("\n\n".join([_REVIEW_HEADER, *current_blocks]), current_ids)
+            )
+            current_blocks = [block]
+            current_ids = [item.event_id]
+        else:
+            current_blocks.append(block)
+            current_ids.append(item.event_id)
 
-        added_length = 1 + len(line)
-        if current_lines and current_length + added_length > limit:
-            chunks.append(("\n".join([_REVIEW_HEADER, *current_lines]), current_ids))
-            current_lines = []
-            current_ids = []
-            current_length = len(_REVIEW_HEADER)
-
-        current_lines.append(line)
-        current_ids.append(item.event_id)
-        current_length += 1 + len(line)
-
-    if current_lines:
-        chunks.append(("\n".join([_REVIEW_HEADER, *current_lines]), current_ids))
+    if current_blocks:
+        chunks.append(("\n\n".join([_REVIEW_HEADER, *current_blocks]), current_ids))
     return chunks
 
 

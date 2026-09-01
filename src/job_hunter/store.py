@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from job_hunter.gmail_models import (
+    AUTO_CONFIDENCE_THRESHOLD,
     LEGACY_SEMANTIC_FAILURE_RATIONALE,
     ExtractedJob,
 )
@@ -1241,9 +1242,23 @@ class JobStore:
             FROM application_events e
             JOIN gmail_messages m ON m.message_id = e.source_message_id
             LEFT JOIN review_deliveries d ON d.event_id = e.id
-            WHERE e.event_type = 'REVIEW_NEEDED' AND d.event_id IS NULL
+            WHERE d.event_id IS NULL
+              AND (
+                  e.event_type = 'REVIEW_NEEDED'
+                  OR (
+                      e.event_type IN (
+                          'RECRUITER_CONTACT', 'APPLIED', 'INTERVIEW',
+                          'TECHNICAL', 'OFFER', 'REJECTED'
+                      )
+                      AND (
+                          e.job_id IS NULL
+                          OR e.confidence < ?
+                      )
+                  )
+              )
             ORDER BY e.occurred_at, e.id
-            """
+            """,
+            (AUTO_CONFIDENCE_THRESHOLD,),
         ).fetchall()
 
     def mark_review_delivered(

@@ -854,9 +854,13 @@ def test_pipeline_delivers_all_pending_gmail_reviews_in_one_message(settings):
     run_pipeline(settings, sources=[], store=store, gemini=FakeGemini(), telegram=telegram)
 
     assert telegram.messages == [
-        "Gmail review needed\n"
-        "- Acme — Frontend Engineer | ambiguous scheduling language\n"
-        "- Beta — Frontend Engineer | ambiguous scheduling language"
+        "Gmail activity I couldn't link\n\n"
+        "Acme — Frontend Engineer\n"
+        "This looks job-related, but I couldn't classify or link it confidently.\n"
+        "Open email: https://mail.google.com/mail/#all/review-1\n\n"
+        "Beta — Frontend Engineer\n"
+        "This looks job-related, but I couldn't classify or link it confidently.\n"
+        "Open email: https://mail.google.com/mail/#all/review-2"
     ]
     assert store.pending_review_events() == []
     delivered = store._conn.execute(
@@ -886,8 +890,10 @@ def test_pipeline_retries_gmail_reviews_after_a_failed_telegram_send(settings):
 
     assert store.pending_review_events() == []
     assert telegram.messages == [
-        "Gmail review needed\n"
-        "- Acme — Frontend Engineer | ambiguous scheduling language"
+        "Gmail activity I couldn't link\n\n"
+        "Acme — Frontend Engineer\n"
+        "This looks job-related, but I couldn't classify or link it confidently.\n"
+        "Open email: https://mail.google.com/mail/#all/review-1"
     ]
 
 
@@ -946,10 +952,12 @@ def test_pipeline_sends_gmail_reviews_after_normal_job_delivery_without_scoring_
 
     assert [kind for kind, _content in telegram.calls] == ["message", "document", "message"]
     assert telegram.messages[0].startswith("Ready to apply\n- 90 | Acme - Senior Product Engineer")
-    assert "Gmail review needed" not in telegram.messages[0]
+    assert "Gmail activity I couldn't link" not in telegram.messages[0]
     assert telegram.messages[1] == (
-        "Gmail review needed\n"
-        "- Review Co — Review Role | ambiguous scheduling language"
+        "Gmail activity I couldn't link\n\n"
+        "Review Co — Review Role\n"
+        "This looks job-related, but I couldn't classify or link it confidently.\n"
+        "Open email: https://mail.google.com/mail/#all/review-1"
     )
 
 

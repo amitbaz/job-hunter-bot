@@ -216,6 +216,9 @@ def is_probably_job_related(message: GmailMessage) -> bool:
         "job alert",
         "job offer",
         "offer letter",
+        "offer of employment",
+        "offer you the position",
+        "pleased to offer you the position",
         "technical assessment",
         "coding challenge",
         "thanks for applying",
@@ -227,7 +230,13 @@ def is_probably_job_related(message: GmailMessage) -> bool:
 def classify_deterministically(message: GmailMessage) -> GmailClassification | None:
     text = normalize_text(" ".join([message.subject, message.snippet, message.body]))
     lifecycle_matches: list[tuple[str, str]] = []
-    if "offer you the position" in text or "pleased to offer" in text:
+    offer_signals = (
+        "offer you the position",
+        "pleased to offer you the position",
+        "offer of employment",
+        "offer letter",
+    )
+    if any(signal in text for signal in offer_signals):
         lifecycle_matches.append(("OFFER", "deterministic offer template"))
     if "not be moving forward" in text or "we regret to inform" in text:
         lifecycle_matches.append(("REJECTED", "deterministic rejection template"))
@@ -457,6 +466,13 @@ def _generate_semantic_text(
 
 
 def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification:
+    if not is_probably_job_related(message):
+        return GmailClassification(
+            kind="IRRELEVANT",
+            confidence=1.0,
+            rationale="no deterministic job signal",
+        )
+
     deterministic = classify_deterministically(message)
     extract_job_alert = bool(
         deterministic is not None
@@ -471,8 +487,6 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
     )
     if deterministic is not None and not extract_job_alert:
         return deterministic
-    if not is_probably_job_related(message):
-        return GmailClassification(kind="IRRELEVANT", confidence=1.0, rationale="no deterministic job signal")
 
     try:
         raw = _generate_semantic_text(
