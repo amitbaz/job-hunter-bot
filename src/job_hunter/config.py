@@ -76,6 +76,9 @@ def load_settings(config_path: Path) -> Settings:
             data.get("manual_company_watch", [])
         ),
         max_search_queries_per_run=data.get("max_search_queries_per_run", 30),
+        max_canonical_resolutions_per_run=data.get(
+            "max_canonical_resolutions_per_run", 80
+        ),
         engineering_title_keywords=list(
             data.get("engineering_title_keywords", DEFAULT_ENGINEERING_TITLE_KEYWORDS)
         ),

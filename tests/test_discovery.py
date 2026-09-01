@@ -264,7 +264,8 @@ def test_collect_candidates_logs_cross_source_dedupe_metrics_without_job_content
 
     assert result.stats.raw == 3
     assert result.stats.unique == 1
-    assert result.stats.canonical_resolved == 3
+    # Resolution runs per surviving unique candidate, not per raw source copy.
+    assert result.stats.canonical_resolved == 1
     assert result.stats.canonical_unresolved == 0
     assert result.stats.cross_source_duplicates == 1
     assert store.count_jobs() == 1
@@ -281,7 +282,7 @@ def test_collect_candidates_logs_cross_source_dedupe_metrics_without_job_content
         "https://specialist.test/3",
     }
     assert "gmail=1 specialist=1 yc=1" in caplog.text
-    assert "canonical_resolved=3" in caplog.text
+    assert "canonical_resolved=1" in caplog.text
     assert "canonical_unresolved=0" in caplog.text
     assert "cross_source_duplicates=1" in caplog.text
     assert "PRIVATE_GMAIL_BODY" not in caplog.text
@@ -460,3 +461,147 @@ def test_resolver_exception_preserves_candidate_and_continues_collection(store, 
         "first": "https://first.test/jobs/1",
         "second": "https://second.test/jobs/2",
     }
+
+
+class CountingResolver:
+    def __init__(self, resolution=None):
+        self.calls = []
+        self._resolution = resolution
+
+    def resolve(self, job):
+        self.calls.append(job.title)
+        return self._resolution
+
+
+def test_collect_candidates_skips_canonical_resolution_for_prefiltered_jobs(
+    store, policy
+):
+    off_target = Job(
+        source="arbeitnow",
+        source_job_id="1",
+        title="Fachärztin / Facharzt für Allgemeinmedizin",
+        company="PraxisEins",
+        url="https://arbeitnow.test/jobs/1",
+        description="Praxis in Berlin",
+        remote=True,
+    )
+    eligible_job = Job(
+        source="arbeitnow",
+        source_job_id="2",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://arbeitnow.test/jobs/2",
+        description="React TypeScript",
+        remote=True,
+    )
+    resolver = CountingResolver()
+
+    result = collect_candidates(
+        [FakeSource([off_target, eligible_job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+    )
+
+    assert resolver.calls == ["Senior Product Engineer"]
+    assert result.stats.profession_rejected == 1
+    assert len(result.eligible) == 1
+
+
+def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
+    jobs = [
+        Job(
+            source="arbeitnow",
+            source_job_id=str(index),
+            title="Senior Product Engineer",
+            company=f"Acme {index}",
+            url=f"https://arbeitnow.test/jobs/{index}",
+            description="React TypeScript",
+            remote=True,
+        )
+        for index in range(5)
+    ]
+    policy.max_canonical_resolutions_per_run = 2
+    resolver = CountingResolver()
+
+    result = collect_candidates(
+        [FakeSource(jobs)], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    assert len(resolver.calls) == 2
+    assert result.stats.canonical_budget_exhausted == 3
+    assert len(result.eligible) == 5
+
+
+def test_collect_candidates_still_canonicalizes_eligible_jobs(store, policy):
+    job = Job(
+        source="aggregator",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://aggregator.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    resolver = CountingResolver(
+        CanonicalResolution(
+            url="https://jobs.lever.co/acme/abc",
+            ats=AtsReference(provider="lever", board="acme", job_id="abc"),
+            confidence=0.9,
+            method="targeted_search",
+        )
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    assert result.stats.canonical_resolved == 1
+    resolved = result.eligible[0][1]
+    assert resolved.url == "https://jobs.lever.co/acme/abc"
+    assert resolved.canonical_url == "https://jobs.lever.co/acme/abc"
+    assert resolved.ats_provider == "lever"
+    assert resolved.original_url == "https://aggregator.test/jobs/1"
+
+
+def test_collect_candidates_emits_one_entry_when_canonicalization_merges_jobs(
+    store, policy
+):
+    jobs = [
+        Job(
+            source="aggregator",
+            source_job_id="1",
+            title="Senior Product Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://aggregator.test/jobs/1",
+            description="React TypeScript",
+            remote=True,
+        ),
+        Job(
+            source="specialist",
+            source_job_id="2",
+            title="Senior Product Engineer",
+            company="Acme GmbH",
+            location="Remote",
+            url="https://specialist.test/jobs/2",
+            description="React TypeScript",
+            remote=True,
+        ),
+    ]
+    resolver = CountingResolver(
+        CanonicalResolution(
+            url="https://jobs.lever.co/acme/abc",
+            ats=AtsReference(provider="lever", board="acme", job_id="abc"),
+            confidence=0.9,
+            method="targeted_search",
+        )
+    )
+
+    result = collect_candidates(
+        [FakeSource(jobs)], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    assert result.stats.unique == 2
+    assert len(result.eligible) == 1
