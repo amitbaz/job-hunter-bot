@@ -132,14 +132,14 @@ def test_build_gmail_review_digest_sorts_events_by_time_then_id_without_subject(
     assert "Interview details inside" not in digest
 
 
-def test_build_gmail_review_digest_uses_fallbacks_and_truncates_rationale():
+def test_build_gmail_review_digest_uses_subject_fallback_and_truncates_rationale():
     digest = build_gmail_review_digest(
         [_review_item(company="", role_title="", rationale="x" * 201)]
     )
 
     assert digest == (
         "Gmail review needed\n"
-        f"- Unknown company — Unknown role | {'x' * 200}"
+        f"- Interview details inside | {'x' * 200}"
     )
 
 
