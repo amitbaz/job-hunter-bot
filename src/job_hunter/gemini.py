@@ -18,15 +18,24 @@ class GeminiClient:
         self.model = model
         self._http = http
 
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         url = f"{_BASE_URL}/{self.model}:generateContent"
         headers = {
             "x-goog-api-key": self._api_key,
             "Content-Type": "application/json",
         }
         payload: dict = {"contents": [{"parts": [{"text": prompt}]}]}
-        if json_mode:
-            payload["generationConfig"] = {"responseMimeType": "application/json"}
+        if json_mode or json_schema is not None:
+            generation_config: dict = {"responseMimeType": "application/json"}
+            if json_schema is not None:
+                generation_config["responseSchema"] = json_schema
+            payload["generationConfig"] = generation_config
 
         response = self._http.post(url, json=payload, headers=headers)
         if response.status_code >= 400:

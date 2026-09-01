@@ -55,6 +55,23 @@ def test_generate_text_json_mode_sets_response_mime_type():
     assert kwargs["json"]["generationConfig"]["responseMimeType"] == "application/json"
 
 
+def test_generate_text_json_schema_sets_structured_output_config():
+    http = FakeHttp(FakeResponse(200, _candidate_response("{}")))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
+    schema = {
+        "type": "OBJECT",
+        "properties": {"kind": {"type": "STRING"}},
+        "required": ["kind"],
+    }
+
+    client.generate_text("classify this", json_schema=schema)
+
+    _, kwargs = http.calls[0]
+    generation_config = kwargs["json"]["generationConfig"]
+    assert generation_config["responseMimeType"] == "application/json"
+    assert generation_config["responseSchema"] == schema
+
+
 def test_generate_text_raises_on_non_2xx():
     http = FakeHttp(FakeResponse(429, None, "rate limited"))
     client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
