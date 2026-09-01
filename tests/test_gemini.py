@@ -1,6 +1,11 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from job_hunter.gemini import GeminiClient, GeminiError
+from job_hunter.gemini_usage import GeminiQuotaPaused, GeminiUsageTracker
+from job_hunter.models import GeminiQuotaSettings
+from job_hunter.store import JobStore
 
 
 class FakeResponse:
@@ -23,12 +28,72 @@ class FakeHttp:
         return self.response
 
 
+class FakeTracker:
+    """Records calls without touching a real store, for tests that only need to
+    assert what GeminiClient told the tracker (as opposed to the 429 tests below,
+    which use a real tracker to exercise the actual pause it computes)."""
+
+    def __init__(self):
+        self.preflight_calls = []
+        self.success_calls = []
+        self.error_calls = []
+        self.calls_429 = []
+
+    def preflight(self, purpose, prompt, now):
+        self.preflight_calls.append((purpose, prompt, now))
+
+    def record_success(self, purpose, prompt, now, **kwargs):
+        self.success_calls.append((purpose, prompt, now, kwargs))
+
+    def record_error(self, purpose, prompt, now, **kwargs):
+        self.error_calls.append((purpose, prompt, now, kwargs))
+
+    def record_429(self, purpose, prompt, now, **kwargs):
+        self.calls_429.append((purpose, prompt, now, kwargs))
+
+
 def _candidate_response(text="hello world"):
     return {
         "candidates": [
             {"content": {"parts": [{"text": text}]}}
         ]
     }
+
+
+def _usage_response(text="{}"):
+    return {
+        "candidates": [{"content": {"parts": [{"text": text}]}}],
+        "usageMetadata": {
+            "promptTokenCount": 120,
+            "candidatesTokenCount": 40,
+            "thoughtsTokenCount": 30,
+            "cachedContentTokenCount": 0,
+            "totalTokenCount": 190,
+        },
+    }
+
+
+def _real_tracker():
+    store = JobStore(":memory:")
+    quota = GeminiQuotaSettings(rpm=10, tpm=1000, rpd=100)
+    tracker = GeminiUsageTracker(store, quota, "gemini-2.5-flash-lite", run_id="run-1")
+    return tracker, store
+
+
+def _quota_error_response(message: str, quota_id: str | None = None):
+    details = []
+    if quota_id is not None:
+        details.append(
+            {
+                "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                "violations": [{"quotaId": quota_id}],
+            }
+        )
+    return FakeResponse(
+        429,
+        {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": message, "details": details}},
+        message,
+    )
 
 
 def test_generate_text_posts_to_expected_url_with_key_header():
@@ -94,3 +159,204 @@ def test_generate_text_concatenates_multiple_parts():
     client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
 
     assert client.generate_text("say hi") == "hello world"
+
+
+def test_generate_text_posts_with_retry_status_codes_excluding_429():
+    http = FakeHttp(FakeResponse(200, _candidate_response("hi")))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
+
+    client.generate_text("say hi")
+
+    _, kwargs = http.calls[0]
+    assert kwargs["retry_status_codes"] == {500, 502, 503, 504}
+
+
+def test_generate_text_builds_generation_config_for_thinking_and_output_controls():
+    http = FakeHttp(FakeResponse(200, _candidate_response("hi")))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
+
+    client.generate_text("say hi", thinking_level="minimal", max_output_tokens=800)
+
+    _, kwargs = http.calls[0]
+    assert kwargs["json"]["generationConfig"] == {
+        "thinkingConfig": {"thinkingLevel": "minimal"},
+        "maxOutputTokens": 800,
+    }
+
+
+def test_generate_text_generation_config_combines_thinking_output_and_json():
+    http = FakeHttp(FakeResponse(200, _candidate_response("{}")))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
+
+    client.generate_text(
+        "classify",
+        thinking_level="low",
+        max_output_tokens=1200,
+        json_mode=True,
+    )
+
+    _, kwargs = http.calls[0]
+    assert kwargs["json"]["generationConfig"] == {
+        "thinkingConfig": {"thinkingLevel": "low"},
+        "maxOutputTokens": 1200,
+        "responseMimeType": "application/json",
+    }
+
+
+def test_generate_text_calls_tracker_preflight_with_purpose_and_prompt(monkeypatch):
+    http = FakeHttp(FakeResponse(200, _candidate_response("hi")))
+    tracker = FakeTracker()
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    fixed_now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: fixed_now)
+
+    client.generate_text("say hi", purpose="gmail_semantic")
+
+    assert tracker.preflight_calls == [("gmail_semantic", "say hi", fixed_now)]
+
+
+def test_generate_text_records_success_with_exact_usage_metadata(monkeypatch):
+    http = FakeHttp(FakeResponse(200, _usage_response()))
+    tracker = FakeTracker()
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    fixed_now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: fixed_now)
+
+    client.generate_text("say hi", purpose="gmail_semantic")
+
+    purpose, prompt, now, kwargs = tracker.success_calls[0]
+    assert (purpose, prompt, now) == ("gmail_semantic", "say hi", fixed_now)
+    assert kwargs == {
+        "prompt_tokens": 120,
+        "output_tokens": 40,
+        "thinking_tokens": 30,
+        "cached_tokens": 0,
+        "total_tokens": 190,
+    }
+
+
+def test_generate_text_missing_usage_metadata_records_estimate_and_warns(monkeypatch, caplog):
+    http = FakeHttp(FakeResponse(200, _candidate_response("hi")))
+    tracker = FakeTracker()
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    fixed_now = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: fixed_now)
+
+    with caplog.at_level("WARNING"):
+        result = client.generate_text("say hi", purpose="gmail_semantic")
+
+    assert result == "hi"
+    purpose, prompt, now, kwargs = tracker.success_calls[0]
+    assert (purpose, prompt, now) == ("gmail_semantic", "say hi", fixed_now)
+    assert kwargs == {}
+    assert any("usageMetadata" in record.message for record in caplog.records)
+
+
+def test_generate_text_records_error_for_non_429_failure():
+    http = FakeHttp(FakeResponse(500, None, "server error"))
+    tracker = FakeTracker()
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+
+    with pytest.raises(GeminiError):
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    purpose, prompt, _now, kwargs = tracker.error_calls[0]
+    assert purpose == "job_evaluation"
+    assert prompt == "say hi"
+    assert kwargs == {"http_status": 500}
+
+
+def test_generate_text_429_without_tracker_raises_generic_gemini_error():
+    # A tracker-less client is a test affordance, not a supported production
+    # path (Task 8 forbids building one); it keeps the old plain-error behavior.
+    http = FakeHttp(FakeResponse(429, None, "rate limited"))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http)
+
+    with pytest.raises(GeminiError):
+        client.generate_text("say hi")
+
+
+def test_generate_text_daily_quota_429_pauses_until_pacific_reset(monkeypatch):
+    tracker, store = _real_tracker()
+    http = FakeHttp(
+        _quota_error_response(
+            "Quota exceeded: quota_exceeded for requests per day.",
+            quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+        )
+    )
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    now = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: now)
+
+    with pytest.raises(GeminiQuotaPaused) as excinfo:
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    assert excinfo.value.reason == "daily_quota"
+    assert len(http.calls) == 1
+    assert http.calls[0][1]["retry_status_codes"] == {500, 502, 503, 504}
+    pause = store.get_gemini_pause("gemini-2.5-flash-lite")
+    assert pause["reason"] == "daily_quota"
+
+
+def test_generate_text_rate_limit_429_pauses_ninety_seconds(monkeypatch):
+    tracker, store = _real_tracker()
+    http = FakeHttp(
+        _quota_error_response(
+            "Resource exhausted: rate_limit_exceeded, too_many_requests.",
+            quota_id="GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+        )
+    )
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    now = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: now)
+
+    with pytest.raises(GeminiQuotaPaused) as excinfo:
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    assert excinfo.value.reason == "rate_limit"
+    assert len(http.calls) == 1
+    pause = store.get_gemini_pause("gemini-2.5-flash-lite")
+    assert pause["reason"] == "rate_limit"
+    paused_until = datetime.fromisoformat(pause["paused_until"])
+    assert paused_until == now + timedelta(seconds=90)
+
+
+def test_generate_text_unknown_429_pauses_conservatively(monkeypatch):
+    tracker, store = _real_tracker()
+    http = FakeHttp(_quota_error_response("Something went wrong."))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    now = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: now)
+
+    with pytest.raises(GeminiQuotaPaused) as excinfo:
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    assert excinfo.value.reason == "unknown"
+    assert len(http.calls) == 1
+    pause = store.get_gemini_pause("gemini-2.5-flash-lite")
+    assert pause["reason"] == "unknown"
+
+
+def test_generate_text_pause_blocks_subsequent_call_without_new_http_request(monkeypatch):
+    tracker, _store = _real_tracker()
+    http = FakeHttp(
+        _quota_error_response(
+            "quota_exceeded",
+            quota_id="GenerateRequestsPerDayPerProjectPerModel-FreeTier",
+        )
+    )
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    now = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: now)
+
+    with pytest.raises(GeminiQuotaPaused):
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    assert len(http.calls) == 1
+
+    with pytest.raises(GeminiQuotaPaused):
+        client.generate_text("say hi again", purpose="job_evaluation")
+
+    # The second call was refused locally by the tracker's preflight; no
+    # second HTTP request was ever sent.
+    assert len(http.calls) == 1
