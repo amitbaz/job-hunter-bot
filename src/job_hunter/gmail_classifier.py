@@ -99,9 +99,10 @@ Use a URL only when it appears in the supplied email links or body.
 class SemanticClassificationError(RuntimeError):
     """Raised when Gmail semantic classification fails for technical reasons."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, detail: str | None = None) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.detail = detail
 
 
 def _is_absolute_http_url(value: str) -> bool:
@@ -487,7 +488,10 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
         if classification.kind != "IRRELEVANT":
             classification = _reconcile_semantic_urls(message, classification)
     except ValueError as exc:
-        raise SemanticClassificationError("invalid_semantic_response") from exc
+        raise SemanticClassificationError(
+            "invalid_semantic_response",
+            detail=str(exc),
+        ) from exc
 
     if classification.kind == "REVIEW_NEEDED" or classification.confidence < AUTO_CONFIDENCE_THRESHOLD:
         return replace(classification, kind="REVIEW_NEEDED")
