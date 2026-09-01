@@ -4,6 +4,7 @@ import pytest
 
 from job_hunter.config import load_settings
 from job_hunter.config import load_gmail_settings
+from job_hunter.models import CompanyWatchSeed
 
 
 def test_load_gmail_settings_does_not_require_candidate_profile(monkeypatch):
@@ -118,7 +119,11 @@ def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
         "yc_job_pages:\n"
         "  - https://www.ycombinator.com/jobs/role\n"
         "manual_company_watch:\n"
-        "  - Acme\n"
+        "  - company_name: Acme GmbH\n"
+        "    ats_provider: greenhouse\n"
+        "    ats_identifier: acme\n"
+        "  - company_name: Beta\n"
+        "    careers_url: https://beta.test/careers\n"
         "search_queries:\n"
         "  - '\"Senior Product Engineer\" remote'\n"
         "ats:\n  ashby: []\n  lever: []\n  greenhouse: []\n"
@@ -158,7 +163,17 @@ def test_load_settings_discovery_config(monkeypatch, tmp_path: Path):
     ]
     assert settings.policy.specialist_query_templates == ['"{role}" remote Europe']
     assert settings.policy.yc_job_pages == ["https://www.ycombinator.com/jobs/role"]
-    assert settings.policy.manual_company_watch == ["Acme"]
+    assert settings.policy.manual_company_watch == [
+        CompanyWatchSeed(
+            company_name="Acme GmbH",
+            ats_provider="greenhouse",
+            ats_identifier="acme",
+        ),
+        CompanyWatchSeed(
+            company_name="Beta",
+            careers_url="https://beta.test/careers",
+        ),
+    ]
     assert settings.policy.search_queries == ['"Senior Product Engineer" remote']
 
 
@@ -179,3 +194,25 @@ def test_load_settings_uses_profile_discovery_defaults(monkeypatch, tmp_path: Pa
     assert settings.policy.max_jobs_per_run == 35
     assert settings.policy.source_minimum_per_run == 2
     assert settings.policy.source_max_share == 0.5
+    assert settings.policy.manual_company_watch == []
+
+
+def test_load_settings_supports_legacy_manual_company_names(monkeypatch, tmp_path: Path):
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds:\n  package: 75\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "manual_company_watch:\n  - Acme GmbH\n"
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("CANDIDATE_PROFILE_B64", base64.b64encode(b"profile").decode())
+    monkeypatch.setenv(
+        "COVER_LETTER_TEMPLATE_B64", base64.b64encode(b"template").decode()
+    )
+    monkeypatch.setenv("JOB_HUNTER_DRY_RUN", "1")
+
+    settings = load_settings(cfg)
+
+    assert settings.policy.manual_company_watch == [
+        CompanyWatchSeed(company_name="Acme GmbH")
+    ]

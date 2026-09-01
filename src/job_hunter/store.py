@@ -742,6 +742,127 @@ class JobStore:
         rows = self._conn.execute(query, parameters).fetchall()
         return rows[0]["id"] if len(rows) == 1 else None
 
+    # ------------------------------------------------------------------
+    # Company watch operations
+    # ------------------------------------------------------------------
+
+    def upsert_company_watch(
+        self,
+        *,
+        company_name: str,
+        careers_url: str,
+        ats_provider: str | None,
+        ats_identifier: str | None,
+        discovered_from_job_id: int | None,
+        promotion_source: str,
+        confidence: float,
+    ) -> int:
+        """Insert or safely upgrade one normalized company watch target.
+
+        Supported ATS targets outrank generic URLs, which outrank company-only
+        entries. Equal-strength replacements require greater confidence, and a
+        manual promotion source is never downgraded to automatic.
+        """
+        normalized_name = normalize_company_name(company_name)
+        if not normalized_name:
+            raise ValueError("company_name must normalize to a non-empty value")
+
+        provider = (ats_provider or "").strip().lower() or None
+        identifier = (ats_identifier or "").strip() or None
+        careers_url = (careers_url or "").strip()
+        now = _now_iso()
+
+        with self._conn:
+            row = self._conn.execute(
+                "SELECT * FROM company_watch WHERE normalized_company_name = ?",
+                (normalized_name,),
+            ).fetchone()
+            if row is None:
+                cursor = self._conn.execute(
+                    """
+                    INSERT INTO company_watch
+                        (company_name, normalized_company_name, careers_url,
+                         ats_provider, ats_identifier, discovered_from_job_id,
+                         promotion_source, confidence, first_seen_at,
+                         created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        company_name,
+                        normalized_name,
+                        careers_url,
+                        provider,
+                        identifier,
+                        discovered_from_job_id,
+                        promotion_source,
+                        confidence,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                return int(cursor.lastrowid)
+
+            existing_strength = self._watch_endpoint_strength(
+                row["careers_url"], row["ats_provider"], row["ats_identifier"]
+            )
+            candidate_strength = self._watch_endpoint_strength(
+                careers_url, provider, identifier
+            )
+            replace_target = candidate_strength > existing_strength or (
+                candidate_strength == existing_strength
+                and confidence > row["confidence"]
+            )
+            retained_source = (
+                "manual"
+                if row["promotion_source"] == "manual" or promotion_source == "manual"
+                else "automatic"
+            )
+            self._conn.execute(
+                """
+                UPDATE company_watch SET
+                    careers_url = ?,
+                    ats_provider = ?,
+                    ats_identifier = ?,
+                    discovered_from_job_id = COALESCE(?, discovered_from_job_id),
+                    promotion_source = ?,
+                    confidence = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    careers_url if replace_target else row["careers_url"],
+                    provider if replace_target else row["ats_provider"],
+                    identifier if replace_target else row["ats_identifier"],
+                    discovered_from_job_id,
+                    retained_source,
+                    confidence if replace_target else row["confidence"],
+                    now,
+                    row["id"],
+                ),
+            )
+            return int(row["id"])
+
+    def get_company_watch(self, company_name: str) -> sqlite3.Row | None:
+        """Return the normalized company watch row, if one exists."""
+        normalized_name = normalize_company_name(company_name)
+        if not normalized_name:
+            return None
+        return self._conn.execute(
+            "SELECT * FROM company_watch WHERE normalized_company_name = ?",
+            (normalized_name,),
+        ).fetchone()
+
+    @staticmethod
+    def _watch_endpoint_strength(
+        careers_url: str, ats_provider: str | None, ats_identifier: str | None
+    ) -> int:
+        if ats_provider in _SUPPORTED_ATS_PROVIDERS and ats_identifier:
+            return 3
+        if careers_url:
+            return 2
+        return 1
+
     def count_jobs(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
         return row[0]

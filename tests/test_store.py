@@ -79,6 +79,130 @@ def test_r2_schema_upgrades_legacy_jobs_table(tmp_path):
     assert "company_watch" in tables
 
 
+def test_company_watch_upsert_deduplicates_normalized_company_name(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+
+    first_id = store.upsert_company_watch(
+        company_name="Acme GmbH",
+        careers_url="",
+        ats_provider="greenhouse",
+        ats_identifier="acme",
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    second_id = store.upsert_company_watch(
+        company_name="ACME",
+        careers_url="",
+        ats_provider="greenhouse",
+        ats_identifier="acme",
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+
+    assert second_id == first_id
+    assert store.get_company_watch("acme")["promotion_source"] == "manual"
+    assert store._conn.execute("SELECT COUNT(*) FROM company_watch").fetchone()[0] == 1
+
+
+def test_automatic_generic_url_cannot_replace_manual_greenhouse_target(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.upsert_company_watch(
+        company_name="Acme",
+        careers_url="",
+        ats_provider="greenhouse",
+        ats_identifier="acme",
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+
+    store.upsert_company_watch(
+        company_name="Acme GmbH",
+        careers_url="https://acme.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="automatic",
+        confidence=1.0,
+    )
+
+    row = store.get_company_watch("ACME")
+    assert row["ats_provider"] == "greenhouse"
+    assert row["ats_identifier"] == "acme"
+    assert row["careers_url"] == ""
+    assert row["promotion_source"] == "manual"
+
+
+def test_supported_ats_target_upgrades_automatic_generic_entry(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.upsert_company_watch(
+        company_name="Acme",
+        careers_url="https://acme.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="automatic",
+        confidence=0.4,
+    )
+
+    store.upsert_company_watch(
+        company_name="Acme GmbH",
+        careers_url="",
+        ats_provider="greenhouse",
+        ats_identifier="acme",
+        discovered_from_job_id=None,
+        promotion_source="automatic",
+        confidence=0.9,
+    )
+
+    row = store.get_company_watch("Acme")
+    assert row["ats_provider"] == "greenhouse"
+    assert row["ats_identifier"] == "acme"
+    assert row["careers_url"] == ""
+    assert row["confidence"] == 0.9
+
+
+def test_equal_strength_target_replaces_only_at_higher_confidence(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.upsert_company_watch(
+        company_name="Beta",
+        careers_url="https://beta.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=0.8,
+    )
+
+    store.upsert_company_watch(
+        company_name="Beta",
+        careers_url="https://beta.test/jobs",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="automatic",
+        confidence=0.8,
+    )
+    assert store.get_company_watch("Beta")["careers_url"] == "https://beta.test/careers"
+
+    store.upsert_company_watch(
+        company_name="Beta",
+        careers_url="https://beta.test/jobs",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="automatic",
+        confidence=0.9,
+    )
+
+    row = store.get_company_watch("Beta")
+    assert row["careers_url"] == "https://beta.test/jobs"
+    assert row["confidence"] == 0.9
+    assert row["promotion_source"] == "manual"
+
+
 def test_record_job_source_is_idempotent(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job_id, _, _ = store.upsert_job(

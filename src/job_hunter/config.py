@@ -9,6 +9,7 @@ from .models import (
     DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES,
     DEFAULT_ENGINEERING_TITLE_KEYWORDS,
     DEFAULT_ENGINEERING_TITLE_PHRASES,
+    CompanyWatchSeed,
     Settings,
     SearchPolicy,
 )
@@ -59,7 +60,9 @@ def load_settings(config_path: Path) -> Settings:
         specialist_search_domains=data.get("specialist_search_domains", []),
         specialist_query_templates=data.get("specialist_query_templates", []),
         yc_job_pages=data.get("yc_job_pages", []),
-        manual_company_watch=data.get("manual_company_watch", []),
+        manual_company_watch=_parse_manual_company_watch(
+            data.get("manual_company_watch", [])
+        ),
         max_search_queries_per_run=data.get("max_search_queries_per_run", 30),
         engineering_title_keywords=list(
             data.get("engineering_title_keywords", DEFAULT_ENGINEERING_TITLE_KEYWORDS)
@@ -95,3 +98,22 @@ def _require_env(name: str) -> str:
     if not val:
         raise ValueError(f"Required environment variable {name!r} is not set")
     return val
+
+
+def _parse_manual_company_watch(entries: list) -> list[CompanyWatchSeed]:
+    seeds: list[CompanyWatchSeed] = []
+    for entry in entries or []:
+        if isinstance(entry, str):
+            seeds.append(CompanyWatchSeed(company_name=entry))
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError("manual_company_watch entries must be names or mappings")
+        seeds.append(
+            CompanyWatchSeed(
+                company_name=entry.get("company_name", ""),
+                careers_url=entry.get("careers_url", "") or "",
+                ats_provider=entry.get("ats_provider"),
+                ats_identifier=entry.get("ats_identifier"),
+            )
+        )
+    return seeds
