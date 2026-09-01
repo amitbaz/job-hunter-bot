@@ -436,6 +436,25 @@ def _build_semantic_prompt(
     )
 
 
+def _generate_semantic_text(
+    message: GmailMessage,
+    gemini: GeminiClient,
+    *,
+    extract_job_alert: bool,
+) -> str:
+    prompt = _build_semantic_prompt(message, extract_job_alert=extract_job_alert)
+    try:
+        return gemini.generate_text(
+            prompt,
+            json_mode=True,
+            json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument 'json_schema'" not in str(exc):
+            raise
+        return gemini.generate_text(prompt, json_mode=True)
+
+
 def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification:
     deterministic = classify_deterministically(message)
     extract_job_alert = bool(
@@ -455,13 +474,10 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
         return GmailClassification(kind="IRRELEVANT", confidence=1.0, rationale="no deterministic job signal")
 
     try:
-        raw = gemini.generate_text(
-            _build_semantic_prompt(
-                message,
-                extract_job_alert=extract_job_alert,
-            ),
-            json_mode=True,
-            json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
+        raw = _generate_semantic_text(
+            message,
+            gemini,
+            extract_job_alert=extract_job_alert,
         )
     except Exception as exc:
         raise SemanticClassificationError("gemini_error") from exc
