@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from job_hunter.gmail_models import ExtractedJob
@@ -854,6 +854,54 @@ class JobStore:
             "SELECT * FROM company_watch WHERE normalized_company_name = ?",
             (normalized_name,),
         ).fetchone()
+
+    def list_due_company_watches(self, now: datetime) -> list[sqlite3.Row]:
+        """Return active watch targets whose health pause has expired."""
+        return self._conn.execute(
+            """
+            SELECT * FROM company_watch
+            WHERE active = 1
+              AND (paused_until IS NULL OR paused_until <= ?)
+            ORDER BY id
+            """,
+            (now.isoformat(),),
+        ).fetchall()
+
+    def record_watch_success(self, watch_id: int, now: datetime) -> None:
+        """Record a verified endpoint check and clear its failure backoff."""
+        timestamp = now.isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE company_watch SET
+                    last_successful_check_at = ?,
+                    last_verified_at = ?,
+                    consecutive_failures = 0,
+                    paused_until = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, timestamp, watch_id),
+            )
+
+    def record_watch_failure(self, watch_id: int, now: datetime) -> None:
+        """Increment endpoint failures and apply the deterministic 24h pause."""
+        timestamp = now.isoformat()
+        paused_until = (now + timedelta(hours=24)).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE company_watch SET
+                    consecutive_failures = consecutive_failures + 1,
+                    paused_until = CASE
+                        WHEN consecutive_failures + 1 >= 3 THEN ?
+                        ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (paused_until, timestamp, watch_id),
+            )
 
     @staticmethod
     def _watch_endpoint_strength(

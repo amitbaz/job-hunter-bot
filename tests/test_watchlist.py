@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from job_hunter.models import CompanyWatchSeed, Evaluation, Job
@@ -234,3 +236,106 @@ def test_automatic_promotion_rejects_non_promotable_decision(tmp_path):
 
     assert watch_id is None
     assert store.get_company_watch("Acme") is None
+
+
+def _manual_watch(store, company_name="Acme"):
+    return store.upsert_company_watch(
+        company_name=company_name,
+        careers_url=f"https://{company_name.lower()}.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+
+
+def test_due_watches_include_unpaused_and_expired_active_rows(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    unpaused_id = _manual_watch(store, "Acme")
+    expired_id = _manual_watch(store, "Beta")
+    paused_id = _manual_watch(store, "Gamma")
+    inactive_id = _manual_watch(store, "Delta")
+    store._conn.execute(
+        "UPDATE company_watch SET paused_until = ? WHERE id = ?",
+        ("2026-08-31T11:59:59+00:00", expired_id),
+    )
+    store._conn.execute(
+        "UPDATE company_watch SET paused_until = ? WHERE id = ?",
+        ("2026-08-31T12:00:01+00:00", paused_id),
+    )
+    store._conn.execute(
+        "UPDATE company_watch SET active = 0 WHERE id = ?",
+        (inactive_id,),
+    )
+
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    assert [row["id"] for row in store.list_due_company_watches(now)] == [
+        unpaused_id,
+        expired_id,
+    ]
+
+
+def test_first_two_failures_remain_due(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    store.record_watch_failure(watch_id, now)
+    store.record_watch_failure(watch_id, now)
+
+    row = store.get_company_watch("Acme")
+    assert row["consecutive_failures"] == 2
+    assert row["paused_until"] is None
+    assert [row["id"] for row in store.list_due_company_watches(now)] == [watch_id]
+
+
+def test_third_failure_pauses_for_24_hours(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    store.record_watch_failure(watch_id, now)
+    store.record_watch_failure(watch_id, now)
+    store.record_watch_failure(watch_id, now)
+
+    row = store.get_company_watch("Acme")
+    assert row["consecutive_failures"] == 3
+    assert row["paused_until"] == "2026-09-01T12:00:00+00:00"
+    assert store.list_due_company_watches(now) == []
+
+
+def test_failed_retry_after_pause_expiry_pauses_for_another_24_hours(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    first_check = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    retry = datetime(2026, 9, 1, 12, 0, tzinfo=timezone.utc)
+    for _ in range(3):
+        store.record_watch_failure(watch_id, first_check)
+
+    assert [row["id"] for row in store.list_due_company_watches(retry)] == [watch_id]
+
+    store.record_watch_failure(watch_id, retry)
+
+    row = store.get_company_watch("Acme")
+    assert row["consecutive_failures"] == 4
+    assert row["paused_until"] == "2026-09-02T12:00:00+00:00"
+
+
+def test_success_clears_failures_and_pause_and_updates_health_timestamps(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    failed_at = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    succeeded_at = datetime(2026, 9, 1, 13, 30, tzinfo=timezone.utc)
+    for _ in range(3):
+        store.record_watch_failure(watch_id, failed_at)
+
+    store.record_watch_success(watch_id, succeeded_at)
+
+    row = store.get_company_watch("Acme")
+    assert row["consecutive_failures"] == 0
+    assert row["paused_until"] is None
+    assert row["last_successful_check_at"] == "2026-09-01T13:30:00+00:00"
+    assert row["last_verified_at"] == "2026-09-01T13:30:00+00:00"
+    assert row["promotion_source"] == "manual"
