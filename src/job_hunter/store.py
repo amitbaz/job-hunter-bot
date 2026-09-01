@@ -373,22 +373,23 @@ class JobStore:
             candidate_ids: list[int] = []
 
             if canonical_url:
-                self._append_unique_id(
-                    candidate_ids, self.find_job_by_canonical_url(canonical_url)
-                )
+                for candidate_id in self._find_job_ids_by_canonical_url(
+                    canonical_url
+                ):
+                    self._append_unique_id(candidate_ids, candidate_id)
             if (
                 ats_provider in _SUPPORTED_ATS_PROVIDERS
                 and job.ats_board
                 and job.ats_job_id
             ):
-                self._append_unique_id(
-                    candidate_ids,
-                    self.find_job_by_ats(ats_provider, job.ats_board, job.ats_job_id),
-                )
-            self._append_unique_id(
-                candidate_ids,
-                self.find_job_by_identity(job.company, job.title, job.location),
-            )
+                for candidate_id in self._find_job_ids_by_ats(
+                    ats_provider, job.ats_board, job.ats_job_id
+                ):
+                    self._append_unique_id(candidate_ids, candidate_id)
+            for candidate_id in self._find_job_ids_by_identity(
+                job.company, job.title, job.location
+            ):
+                self._append_unique_id(candidate_ids, candidate_id)
             self._append_unique_id(
                 candidate_ids,
                 self._find_single_job_id(
@@ -742,8 +743,13 @@ class JobStore:
 
     def find_job_by_canonical_url(self, url: str) -> int | None:
         """Return a job ID only when a canonical URL identifies one job."""
-        return self._find_single_job_id(
-            "SELECT id FROM jobs WHERE canonical_url = ?", (canonicalize_url(url),)
+        matching_ids = self._find_job_ids_by_canonical_url(url)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    def _find_job_ids_by_canonical_url(self, url: str) -> list[int]:
+        return self._find_job_ids(
+            "SELECT id FROM jobs WHERE canonical_url = ? ORDER BY id",
+            (canonicalize_url(url),),
         )
 
     def find_job_by_ats(
@@ -752,10 +758,17 @@ class JobStore:
         """Return a job ID only when an ATS tuple identifies one job."""
         if not job_id:
             return None
-        return self._find_single_job_id(
+        matching_ids = self._find_job_ids_by_ats(provider, board, job_id)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    def _find_job_ids_by_ats(
+        self, provider: str, board: str, job_id: str
+    ) -> list[int]:
+        return self._find_job_ids(
             """
             SELECT id FROM jobs
             WHERE ats_provider = ? AND ats_board = ? AND ats_job_id = ?
+            ORDER BY id
             """,
             (provider, board, job_id),
         )
@@ -764,24 +777,44 @@ class JobStore:
         self, company: str, title: str, location: str
     ) -> int | None:
         """Return a job ID only for one normalized company/title/location match."""
+        matching_ids = self._find_job_ids_by_identity(company, title, location)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    def _find_job_ids_by_identity(
+        self, company: str, title: str, location: str
+    ) -> list[int]:
+        """Return all normalized identity matches only when locations agree."""
         company_key = normalize_company_name(company)
         title_key = normalize_job_title(title)
         if not company_key or not title_key:
-            return None
-        matching_ids = [
-            row["id"]
+            return []
+        matching_rows = [
+            row
             for row in self._conn.execute("SELECT id, company, title, location FROM jobs")
             if normalize_company_name(row["company"]) == company_key
             and normalize_job_title(row["title"]) == title_key
             and locations_compatible(location, row["location"])
         ]
-        return matching_ids[0] if len(matching_ids) == 1 else None
+        if any(
+            not locations_compatible(left["location"], right["location"])
+            for index, left in enumerate(matching_rows)
+            for right in matching_rows[index + 1 :]
+        ):
+            return []
+        return [row["id"] for row in matching_rows]
+
+    def _find_job_ids(
+        self, query: str, parameters: tuple[str, ...]
+    ) -> list[int]:
+        return [
+            row["id"] for row in self._conn.execute(query, parameters).fetchall()
+        ]
 
     def _find_single_job_id(
         self, query: str, parameters: tuple[str, ...]
     ) -> int | None:
-        rows = self._conn.execute(query, parameters).fetchall()
-        return rows[0]["id"] if len(rows) == 1 else None
+        matching_ids = self._find_job_ids(query, parameters)
+        return matching_ids[0] if len(matching_ids) == 1 else None
 
     # ------------------------------------------------------------------
     # Company watch operations

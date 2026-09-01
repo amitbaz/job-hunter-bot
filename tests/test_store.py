@@ -1063,6 +1063,191 @@ def test_late_canonical_upsert_enriches_single_existing_job_in_place(tmp_path):
     assert store.get_job(existing_id).url == canonical_url
 
 
+def test_logical_upsert_merges_all_exact_matches_into_global_history_survivor(
+    tmp_path,
+):
+    store = JobStore(tmp_path / "state.sqlite3")
+    canonical_url = "https://jobs.lever.co/acme/abc"
+    rows = [
+        Job(
+            source="canonical-evaluation",
+            source_job_id="canonical-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="New York",
+            url=canonical_url,
+            canonical_url=canonical_url,
+        ),
+        Job(
+            source="canonical-material",
+            source_job_id="canonical-2",
+            title="senior frontend engineer",
+            company="ACME GmbH",
+            location="Berlin",
+            url=canonical_url,
+            canonical_url=canonical_url,
+        ),
+        Job(
+            source="ats-application",
+            source_job_id="ats-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="London",
+            url="https://aggregator.test/jobs/ats-1",
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        ),
+        Job(
+            source="ats-delivery",
+            source_job_id="ats-2",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://aggregator.test/jobs/ats-2",
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        ),
+    ]
+    job_ids = []
+    for job in rows:
+        job_id, _, _ = store.upsert_job(job)
+        job_ids.append(job_id)
+        store.record_job_source(
+            job_id,
+            source=job.source,
+            source_job_id=job.source_job_id,
+            source_url=job.url,
+        )
+
+    assert store.find_job_by_canonical_url(canonical_url) is None
+    assert store.find_job_by_ats("lever", "acme", "abc") is None
+    assert store.find_job_by_identity(
+        "Acme", "Senior Frontend Engineer", "Berlin"
+    ) is None
+
+    evaluation_id, material_id, application_id, delivery_id = job_ids
+    store.save_evaluation(evaluation_id, _evaluation(evaluation_id))
+    store.save_material(
+        material_id,
+        Material(job_id=material_id, cover_letter_text="Existing material"),
+    )
+    store.save_application_event(
+        job_id=application_id,
+        event_type="INTERVIEW",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="all-match-application",
+        source_thread_id=None,
+        confidence=1.0,
+        company="Acme",
+        role_title="Senior Frontend Engineer",
+        rationale="interview invitation",
+    )
+    store.mark_delivered(delivery_id, "telegram_message", "delivery-1")
+
+    survivor_id, is_new, _description_changed = store.upsert_logical_job(
+        Job(
+            source="ats-delivery",
+            source_job_id="ats-2",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url=canonical_url,
+            original_url="https://aggregator.test/jobs/ats-2",
+            canonical_url=canonical_url,
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        )
+    )
+
+    assert survivor_id == application_id
+    assert is_new is False
+    assert store.count_jobs() == 1
+    assert store.get_job(survivor_id).url == canonical_url
+    assert store.get_evaluation(survivor_id) is not None
+    assert store.get_material(survivor_id) is not None
+    assert store.has_delivery(survivor_id, "telegram_message")
+    assert store.current_application_state(survivor_id) == "INTERVIEW"
+    assert {row["source"] for row in store.list_job_sources(survivor_id)} == {
+        "canonical-evaluation",
+        "canonical-material",
+        "ats-application",
+        "ats-delivery",
+    }
+    for table in ("evaluations", "materials", "application_events", "deliveries"):
+        associated_ids = {
+            row["job_id"] for row in store._conn.execute(f"SELECT job_id FROM {table}")
+        }
+        assert associated_ids == {survivor_id}
+
+
+def test_missing_location_does_not_merge_incompatible_role_locations(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    berlin_id, _, _ = store.upsert_job(
+        Job(
+            source="aggregator",
+            source_job_id="berlin-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://aggregator.test/jobs/berlin-1",
+        )
+    )
+    berlin_duplicate_id, _, _ = store.upsert_job(
+        Job(
+            source="second",
+            source_job_id="berlin-2",
+            title="senior frontend engineer",
+            company="ACME GmbH",
+            location="Berlin, Germany",
+            url="https://second.test/jobs/berlin-2",
+        )
+    )
+    new_york_id, _, _ = store.upsert_job(
+        Job(
+            source="third",
+            source_job_id="new-york-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="New York",
+            url="https://third.test/jobs/new-york-1",
+        )
+    )
+
+    berlin_survivor, _, _ = store.upsert_logical_job(
+        Job(
+            source="aggregator",
+            source_job_id="berlin-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="Berlin",
+            url="https://aggregator.test/jobs/berlin-1",
+        )
+    )
+
+    assert berlin_survivor == berlin_id
+    assert store.count_jobs() == 2
+    assert store.get_job(berlin_duplicate_id) is None
+    assert store.get_job(new_york_id) is not None
+
+    missing_location_id, _, _ = store.upsert_logical_job(
+        Job(
+            source="aggregator",
+            source_job_id="berlin-1",
+            title="Senior Frontend Engineer",
+            company="Acme",
+            location="",
+            url="https://aggregator.test/jobs/berlin-1",
+        )
+    )
+
+    assert missing_location_id == berlin_id
+    assert store.count_jobs() == 2
+    assert store.get_job(new_york_id) is not None
+
+
 def test_merge_survivor_prefers_other_history_over_age_and_lower_id(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     older_id, _, _ = store.upsert_job(
