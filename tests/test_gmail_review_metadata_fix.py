@@ -14,7 +14,13 @@ class FakeGemini:
     def __init__(self, response: dict) -> None:
         self.response = response
 
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         return json.dumps(self.response)
 
 
