@@ -150,6 +150,26 @@ class DigestItem:
     decision: str
     url: str
     hard_blockers: list
+    location: str = ""
+
+
+@dataclass(slots=True, frozen=True)
+class NavigationCard:
+    job_id: int
+    title: str
+    company: str
+    location: str
+    score: int
+    url: str
+
+
+@dataclass(slots=True, frozen=True)
+class NavigationSession:
+    session_id: str
+    cards: list[NavigationCard]
+    telegram_message_id: str | None
+    created_at: str
+    expires_at: str
 
 
 @dataclass(slots=True)
