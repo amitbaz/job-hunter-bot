@@ -8,6 +8,7 @@ from job_hunter.gemini_usage import (
     GeminiBudgetExceeded,
     GeminiQuotaPaused,
     GeminiUsageTracker,
+    _pacific_day_bounds,
     estimate_input_tokens,
 )
 from job_hunter.models import GeminiQuotaSettings
@@ -94,18 +95,65 @@ def test_daily_rows_reset_on_pacific_midnight_not_utc_or_berlin(store, tracker):
     # by 07:00:01 UTC; only the Pacific boundary (07:00 UTC in PDT) explains this.
 
 
-def test_daily_window_correct_across_dst_transition(store, tracker):
-    # US DST ends 2026-11-01, so by Nov 2 Pacific is on standard time (PST, UTC-8),
-    # not the summer offset (PDT, UTC-7). Pacific midnight on 2026-11-02 is
-    # therefore 2026-11-02T08:00:00 UTC. A hardcoded -7 offset would misplace
-    # these timestamps by an hour and put both readings in the same bucket.
-    before_midnight = datetime(2026, 11, 2, 7, 30, 0, tzinfo=timezone.utc)
-    after_midnight = datetime(2026, 11, 2, 8, 30, 0, tzinfo=timezone.utc)
+def test_pacific_day_spans_23_hours_on_spring_forward_and_rolls_over_correctly(
+    store, tracker
+):
+    # 2026-03-08 is the US spring-forward day: Pacific clocks jump from 02:00
+    # PST straight to 03:00 PDT, so the *local calendar day* is only 23 real
+    # hours long (07:00 UTC on Mar 8 to 07:00 UTC on Mar 9).
+    moment_in_day = datetime(2026, 3, 8, 12, 0, 0, tzinfo=timezone.utc)
+    start, end = _pacific_day_bounds(moment_in_day)
+    assert start == datetime(2026, 3, 8, 8, 0, 0, tzinfo=timezone.utc)
+    assert end == datetime(2026, 3, 9, 7, 0, 0, tzinfo=timezone.utc)
+    assert end - start == timedelta(hours=23)
 
-    _record_attempts(store, 1, purpose="job_evaluation", occurred_at=before_midnight)
+    _record_attempts(
+        store, 1, purpose="job_evaluation", occurred_at=moment_in_day, spacing_seconds=1
+    )
 
-    assert tracker.snapshot(before_midnight).requests_today == 1
-    assert tracker.snapshot(after_midnight).requests_today == 0
+    assert tracker.snapshot(moment_in_day).requests_today == 1
+
+    # A day naively assumed to be a fixed 24h would still call this "today";
+    # the true (23h) Pacific day has already rolled over by the real boundary.
+    just_after_true_midnight = end + timedelta(seconds=1)
+    assert tracker.snapshot(just_after_true_midnight).requests_today == 0
+
+
+def test_pacific_day_spans_25_hours_on_fall_back_with_repeated_local_hour(
+    store, tracker
+):
+    # 2026-11-01 is the US fall-back day: Pacific clocks repeat 01:00-02:00
+    # local (first as PDT, then as PST), so the local calendar day is 25 real
+    # hours long (07:00 UTC on Nov 1 to 08:00 UTC on Nov 2).
+    moment_in_day = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)
+    start, end = _pacific_day_bounds(moment_in_day)
+    assert start == datetime(2026, 11, 1, 7, 0, 0, tzinfo=timezone.utc)
+    assert end == datetime(2026, 11, 2, 8, 0, 0, tzinfo=timezone.utc)
+    assert end - start == timedelta(hours=25)
+
+    # 01:30 local occurs twice: first as PDT (UTC-7), then as PST (UTC-8).
+    first_pass_0130_pdt = datetime(2026, 11, 1, 8, 30, 0, tzinfo=timezone.utc)
+    second_pass_0130_pst = datetime(2026, 11, 1, 9, 30, 0, tzinfo=timezone.utc)
+    for occurred_at in (first_pass_0130_pdt, second_pass_0130_pst):
+        store.record_gemini_usage(
+            occurred_at=occurred_at.isoformat(),
+            run_id="run-1",
+            model=MODEL,
+            purpose="job_evaluation",
+            status="success",
+            estimated_input_tokens=10,
+        )
+
+    # Both passes through the repeated hour land in the same Pacific day.
+    assert tracker.snapshot(moment_in_day).requests_today == 2
+
+    # A day naively assumed to be a fixed 24h would already have rolled over
+    # by now; the true (25h) Pacific day has not.
+    still_same_day = start + timedelta(hours=24, minutes=30)
+    assert tracker.snapshot(still_same_day).requests_today == 2
+
+    just_after_true_midnight = end + timedelta(seconds=1)
+    assert tracker.snapshot(just_after_true_midnight).requests_today == 0
 
 
 # ---------------------------------------------------------------------------
