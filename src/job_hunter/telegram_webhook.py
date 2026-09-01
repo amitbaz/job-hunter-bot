@@ -8,8 +8,7 @@ from flask import Flask, jsonify, request
 from job_hunter.config import WebhookSettings, load_webhook_settings
 from job_hunter.github_state import GitHubArtifactStateLoader
 from job_hunter.http import HttpClient
-from job_hunter.navigation_store import get_navigation_session
-from job_hunter.store import JobStore
+from job_hunter.navigation_repository import GitHubArtifactNavigationRepository
 from job_hunter.telegram import TelegramClient
 from job_hunter.telegram_navigation import handle_callback_query, parse_callback
 
@@ -19,17 +18,19 @@ logger = logging.getLogger(__name__)
 def create_app(
     *,
     settings: WebhookSettings | None = None,
-    state_loader=None,
+    navigation_repository=None,
     telegram=None,
 ) -> Flask:
     settings = settings or load_webhook_settings()
     http = HttpClient()
-    state_loader = state_loader or GitHubArtifactStateLoader(
-        settings.github_repository,
-        settings.github_state_token,
-        settings.github_state_artifact_name,
-        settings.github_state_cache_dir,
-    )
+    if navigation_repository is None:
+        state_loader = GitHubArtifactStateLoader(
+            settings.github_repository,
+            settings.github_state_token,
+            settings.github_state_artifact_name,
+            settings.github_state_cache_dir,
+        )
+        navigation_repository = GitHubArtifactNavigationRepository(state_loader)
     telegram = telegram or TelegramClient(settings.telegram_bot_token, None, http)
 
     app = Flask(__name__)
@@ -64,29 +65,9 @@ def create_app(
         session_id = parsed[1]
         callback_id = str(callback_query.get("id") or "")
         try:
-            snapshot = state_loader.load_latest()
+            session = navigation_repository.get_session(session_id)
         except Exception:
-            logger.exception("failed to load GitHub state artifact for Telegram callback")
-            if callback_id:
-                telegram.answer_callback(
-                    callback_id,
-                    text="Could not load this job list right now.",
-                )
-            return jsonify(ok=True)
-
-        if snapshot is None:
-            if callback_id:
-                telegram.answer_callback(
-                    callback_id,
-                    text="Could not load this job list right now.",
-                )
-            return jsonify(ok=True)
-
-        try:
-            with JobStore(snapshot.path, read_only=True) as store:
-                session = get_navigation_session(store, session_id)
-        except Exception:
-            logger.exception("failed to read Telegram navigation session from SQLite snapshot")
+            logger.exception("failed to load Telegram navigation session")
             if callback_id:
                 telegram.answer_callback(
                     callback_id,
