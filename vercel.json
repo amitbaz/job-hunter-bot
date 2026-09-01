@@ -1,5 +1,6 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "pip install -e '.[webhook]'",
   "functions": {
     "main.py": {
       "maxDuration": 30,
