@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -112,6 +112,48 @@ def _format_source_counts(counts: dict[str, int]) -> str:
     return " ".join(f"{source}={count}" for source, count in counts.items())
 
 
+def _due_watch_state(
+    store: JobStore,
+) -> dict[int, tuple[str, str | None, int, str | None]]:
+    """Snapshot due watch health so logs count persisted check outcomes only."""
+    return {
+        watch["id"]: (
+            watch["company_name"],
+            watch["last_verified_at"],
+            watch["consecutive_failures"],
+            watch["paused_until"],
+        )
+        for watch in store.list_due_company_watches(datetime.now(timezone.utc))
+    }
+
+
+def _watch_check_outcomes(
+    store: JobStore,
+    before: dict[int, tuple[str, str | None, int, str | None]],
+) -> tuple[int, int]:
+    """Return persisted successful/failed checks and newly applied pauses."""
+    checks = 0
+    paused = 0
+    for _watch_id, (
+        company_name,
+        verified_at,
+        failures,
+        paused_until,
+    ) in before.items():
+        watch = store.get_company_watch(company_name)
+        if watch is None:
+            continue
+        check_recorded = (
+            watch["last_verified_at"] != verified_at
+            or watch["consecutive_failures"] != failures
+        )
+        if check_recorded:
+            checks += 1
+        if paused_until is None and watch["paused_until"] is not None:
+            paused += 1
+    return checks, paused
+
+
 def cover_letter_output_dir(settings: Settings) -> Path:
     return Path(settings.db_path).parent / "cover_letters"
 
@@ -189,6 +231,7 @@ def run_pipeline(
         GmailStagedSource(store),
         CompanyWatchSource(store, http),
     ]
+    due_watches = _due_watch_state(store)
     resolver = CanonicalResolver(
         http,
         search_candidates=lambda job: _targeted_canonical_candidates(http, job),
@@ -209,6 +252,7 @@ def run_pipeline(
         settings.policy,
         resolver=resolver,
     )
+    watch_checks, watch_paused = _watch_check_outcomes(store, due_watches)
     preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy)
     profile_mode = preferences_source(preferences)
     logger.info("profile extraction: source=%s", profile_mode)
@@ -232,6 +276,7 @@ def run_pipeline(
     logger.info("eligible sources: %s", _format_source_counts(eligible_source_counts))
     logger.info("selected sources: %s", _format_source_counts(selected_source_counts))
     queued_job_ids = {job_id for job_id, _job, _score in selected}
+    companies_promoted = 0
     for job_id in discovery.rediscovered_job_ids:
         _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
 
@@ -245,13 +290,15 @@ def run_pipeline(
 
         store.save_evaluation(job_id, evaluation)
         try:
-            promote_company(
+            promoted_watch_id = promote_company(
                 store,
                 job_id=job_id,
                 job=job,
                 evaluation=evaluation,
                 package_threshold=settings.policy.thresholds["package"],
             )
+            if promoted_watch_id is not None:
+                companies_promoted += 1
         except Exception:
             logger.exception("company watch promotion failed for job_id=%s", job_id)
             summary.errors += 1
@@ -328,5 +375,12 @@ def run_pipeline(
                 if review_message_id is None:
                     break
                 store.mark_review_delivered(event_ids, review_message_id)
+
+    logger.info(
+        "company watch outcomes: companies_promoted=%s watch_checks=%s watch_paused=%s",
+        companies_promoted,
+        watch_checks,
+        watch_paused,
+    )
 
     return summary

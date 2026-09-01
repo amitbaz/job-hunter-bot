@@ -266,7 +266,7 @@ def test_pipeline_delivers_strong_match_and_dedupes_within_run(settings):
 
 
 def test_pipeline_promotes_package_match_only_after_evaluation_is_persisted(
-    settings, monkeypatch
+    settings, monkeypatch, caplog
 ):
     store = JobStore(settings.db_path)
     gemini = FakeGemini(
@@ -303,19 +303,68 @@ def test_pipeline_promotes_package_match_only_after_evaluation_is_persisted(
         raising=False,
     )
 
-    summary = run_pipeline(
-        settings,
-        sources=[FakeSource([_job()])],
-        store=store,
-        gemini=gemini,
-        telegram=FakeTelegram(),
+    settings.candidate_profile = "PRIVATE_CV_TEXT"
+    job = _job(description="PRIVATE_GMAIL_BODY React TypeScript")
+    store.upsert_company_watch(
+        company_name="Healthy Watch",
+        careers_url="https://healthy.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
     )
+    failing_watch_id = store.upsert_company_watch(
+        company_name="Failing Watch",
+        careers_url="https://failing.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    now = datetime.now(timezone.utc)
+    store.record_watch_failure(failing_watch_id, now)
+    store.record_watch_failure(failing_watch_id, now)
+
+    class WatchResponse:
+        text = "<html></html>"
+
+        def raise_for_status(self):
+            return None
+
+    class WatchHttp:
+        def get(self, url, **kwargs):
+            if url == "https://healthy.test/careers":
+                return WatchResponse()
+            if url == "https://failing.test/careers":
+                raise RuntimeError("watch unavailable")
+            raise AssertionError(f"unexpected request for {url}")
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[FakeSource([job])],
+            store=store,
+            gemini=gemini,
+            telegram=FakeTelegram(),
+            http=WatchHttp(),
+        )
 
     row = store.get_company_watch("Acme")
     assert row is not None
     assert row["promotion_source"] == "automatic"
     assert promotion_calls == [(1, 75)]
     assert summary.ready_to_apply == 1
+    assert store.get_company_watch("Healthy Watch")["consecutive_failures"] == 0
+    failing_watch = store.get_company_watch("Failing Watch")
+    assert failing_watch["consecutive_failures"] == 3
+    assert failing_watch["paused_until"] is not None
+    assert "companies_promoted=1" in caplog.text
+    assert "watch_checks=2" in caplog.text
+    assert "watch_paused=1" in caplog.text
+    assert "PRIVATE_CV_TEXT" not in caplog.text
+    assert "PRIVATE_GMAIL_BODY" not in caplog.text
 
 
 def test_pipeline_does_not_promote_possible_match(settings, monkeypatch):

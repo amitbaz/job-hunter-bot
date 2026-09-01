@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 
 from job_hunter.discovery import collect_candidates
@@ -219,7 +221,9 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
     assert result.rediscovered_job_ids == [job_id]
 
 
-def test_collect_candidates_collapses_three_sources_to_one_logical_job(store, policy):
+def test_collect_candidates_logs_canonical_dedupe_metrics_without_job_content(
+    store, policy, caplog
+):
     sources = [
         FakeSource(
             [
@@ -229,7 +233,7 @@ def test_collect_candidates_collapses_three_sources_to_one_logical_job(store, po
                     company="Acme",
                     location="Berlin",
                     url=url,
-                    description="React TypeScript",
+                    description="PRIVATE_GMAIL_BODY React TypeScript",
                     remote=True,
                 )
             ]
@@ -249,13 +253,14 @@ def test_collect_candidates_collapses_three_sources_to_one_logical_job(store, po
         )
     )
 
-    result = collect_candidates(
-        sources,
-        store,
-        NoOpHttp(),
-        policy,
-        resolver=resolver,
-    )
+    with caplog.at_level(logging.INFO):
+        result = collect_candidates(
+            sources,
+            store,
+            NoOpHttp(),
+            policy,
+            resolver=resolver,
+        )
 
     assert result.stats.raw == 3
     assert result.stats.unique == 1
@@ -275,6 +280,11 @@ def test_collect_candidates_collapses_three_sources_to_one_logical_job(store, po
         "https://yc.test/2",
         "https://specialist.test/3",
     }
+    assert "gmail:linkedin=1 specialist=1 yc=1" in caplog.text
+    assert "canonical_resolved=3" in caplog.text
+    assert "canonical_unresolved=0" in caplog.text
+    assert "cross_source_duplicates=2" in caplog.text
+    assert "PRIVATE_GMAIL_BODY" not in caplog.text
 
 
 def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, policy):

@@ -162,6 +162,15 @@ def _dedupe(jobs: list[Job]) -> list[Job]:
     return merged
 
 
+def _format_source_contribution(per_source: dict[str, int]) -> str:
+    """Render compact source totals without including any job content."""
+    if not per_source:
+        return "none"
+    return " ".join(
+        f"{source}={count}" for source, count in sorted(per_source.items())
+    )
+
+
 def collect_candidates(
     sources: list,
     store: JobStore,
@@ -245,6 +254,14 @@ def collect_candidates(
         eligible.append((job_id, job))
 
     stats.eligible = len(eligible)
+    logger.info(
+        "discovery source contribution: %s canonical_resolved=%s "
+        "canonical_unresolved=%s cross_source_duplicates=%s",
+        _format_source_contribution(stats.per_source),
+        stats.canonical_resolved,
+        stats.canonical_unresolved,
+        stats.cross_source_duplicates,
+    )
 
     return DiscoveryResult(
         eligible=eligible,

@@ -58,6 +58,38 @@ all public sources (Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work R
 
 SQLite state does not persist on the runner between workflow runs, so the daily workflow restores the previous run's database from an uploaded artifact at the start of each run and re-uploads it at the end (see [Schedule and state persistence](#schedule-and-state-persistence)).
 
+### R2 automated discovery and company watch
+
+R2 adds source-independent job identity, public canonical resolution, provenance, and a lightweight company-watch loop while keeping the existing filter, rank, evaluation, and delivery boundaries intact:
+
+```text
+Gmail + existing sources + YC + specialist-domain search + company watch
+  -> canonical resolution + provenance/dedupe
+  -> existing filter/rank/evaluate/deliver
+  -> high_priority/package_match may promote company
+```
+
+Every discovered source copy is retained as provenance in SQLite before one logical job proceeds through deduplication. Canonical resolution uses public URLs and may recognize direct ATS listings, public redirects or embedded links, a known watch ATS target, or one targeted public search result. An unresolved lookup keeps the original candidate rather than blocking the run.
+
+Gmail contributes only staged job signals from the read-only intake; its message bodies are not logged by the R2 discovery flow. YC uses public job pages. Wellfound, Welcome to the Jungle, and configured portfolio domains are reached through public targeted search queries. R2 does not perform authenticated scraping, sign into job platforms, or bypass access controls.
+
+An evaluated job can promote its company to a watch only when its final decision is `high_priority` or `package_match`, it has no hard blockers, and it satisfies the configured package threshold. Promotion helps find future public postings; it never submits an application.
+
+#### Manual company watch configuration
+
+Add manual watch entries to `config/search.yml` when you know an employer's public ATS board or careers page:
+
+```yaml
+manual_company_watch:
+  - company_name: Example GmbH
+    ats_provider: greenhouse
+    ats_identifier: example
+  - company_name: Another Company
+    careers_url: https://example.com/careers
+```
+
+Manual entries are synchronized idempotently and preserved: automatic promotion cannot replace a manual ownership marker or downgrade its stronger ATS endpoint. Company-watch checks use only the configured public ATS endpoint or public careers URL. Each check records either a success or a failure. After exactly three consecutive failures, the watch pauses for 24 hours; it is retried when that pause expires. A successful retry clears the failure count and removes the pause. A failure for one watch does not stop the remaining discovery sources.
+
 ## Required GitHub secrets
 
 Set these under **Settings -> Secrets and variables -> Actions** on your fork/repo:
