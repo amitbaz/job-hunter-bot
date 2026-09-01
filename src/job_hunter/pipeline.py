@@ -6,12 +6,13 @@ from datetime import date, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from job_hunter.canonical import CanonicalResolver
+from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
 from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.discovery import collect_candidates
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
+from job_hunter.job_identity import normalize_company_name
 from job_hunter.models import (
     AtsReference,
     DigestItem,
@@ -60,7 +61,11 @@ def _targeted_canonical_candidates(http: HttpClient, job: Job) -> list[Job]:
     query = f'"{company}" "{title}" ({_CANONICAL_SEARCH_SITES})'
     candidates = DuckDuckGoSource(http, [query]).discover()
     for candidate in candidates:
-        candidate.company = job.company
+        ats = parse_supported_ats_url(candidate.url)
+        if ats is not None and (
+            normalize_company_name(ats.board) == normalize_company_name(job.company)
+        ):
+            candidate.company = ats.board
     return candidates
 
 

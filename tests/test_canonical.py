@@ -286,6 +286,39 @@ def test_extraction_failure_does_not_block_targeted_search(monkeypatch):
     assert result.method == "targeted_search"
 
 
+def test_source_fetch_failure_does_not_block_targeted_search():
+    class _FailingHttp:
+        def get(self, url, **kwargs):
+            raise RuntimeError("aggregator unavailable")
+
+    resolver = CanonicalResolver(
+        _FailingHttp(),
+        search_candidates=lambda job: [
+            Job(
+                source="duckduckgo",
+                title="Frontend Engineer",
+                company="Acme",
+                url="https://jobs.ashbyhq.com/acme/abc",
+            )
+        ],
+        watch_target=lambda company: None,
+    )
+
+    result = resolver.resolve(
+        Job(
+            source="board",
+            title="Frontend Engineer",
+            company="Acme",
+            url="https://unavailable.test/job",
+        )
+    )
+
+    assert result is not None
+    assert result.url == "https://jobs.ashbyhq.com/acme/abc"
+    assert result.confidence == 0.90
+    assert result.method == "targeted_search"
+
+
 def test_resolution_failure_is_non_blocking():
     class _FailingHttp:
         def get(self, url, **kwargs):

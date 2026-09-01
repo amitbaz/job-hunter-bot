@@ -544,6 +544,62 @@ def test_pipeline_uses_one_targeted_duckduckgo_query_for_canonical_resolution(
     assert "site:jobs.ashbyhq.com" in search_calls[0]
 
 
+def test_pipeline_rejects_targeted_ats_result_for_wrong_company(settings):
+    class Response:
+        def __init__(self, *, url, text):
+            self.url = url
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    class WrongCompanySearchHttp:
+        def get(self, url, **kwargs):
+            if url == "https://aggregator.test/jobs/1":
+                return Response(url=url, text="<html></html>")
+            if url == "https://duckduckgo.com/html/":
+                return Response(
+                    url=url,
+                    text=(
+                        '<a class="result__a" '
+                        'href="https://jobs.ashbyhq.com/wrong-company/123">'
+                        "Senior Product Engineer</a>"
+                    ),
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[
+            FakeSource(
+                [
+                    _job(
+                        source="aggregator",
+                        url="https://aggregator.test/jobs/1",
+                    )
+                ]
+            )
+        ],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+        http=WrongCompanySearchHttp(),
+    )
+
+    persisted = store._conn.execute(
+        "SELECT url, canonical_url, ats_provider, ats_board, ats_job_id "
+        "FROM jobs WHERE id = 1"
+    ).fetchone()
+    assert persisted is not None
+    assert persisted["url"] == "https://aggregator.test/jobs/1"
+    assert persisted["canonical_url"] == "https://aggregator.test/jobs/1"
+    assert persisted["ats_provider"] is None
+    assert persisted["ats_board"] is None
+    assert persisted["ats_job_id"] is None
+
+
 def test_pipeline_counts_promotion_failure_but_continues_delivery(
     settings, monkeypatch
 ):

@@ -60,23 +60,27 @@ class CanonicalResolver:
         if not job.url:
             return None
 
+        response_url = ""
+        response_text = ""
         try:
             response = self._http.get(job.url)
             response.raise_for_status()
+            response_url = response.url
+            response_text = response.text
         except Exception:
-            return None
+            pass
 
-        redirected_ats = parse_supported_ats_url(response.url)
+        redirected_ats = parse_supported_ats_url(response_url)
         if redirected_ats is not None:
             return CanonicalResolution(
-                url=response.url,
+                url=response_url,
                 ats=redirected_ats,
                 confidence=0.98,
                 method="redirect",
             )
 
         try:
-            links = extract_job_page_links(response.text, response.url)
+            links = extract_job_page_links(response_text, response_url or job.url)
         except Exception:
             links = []
         for url in links:
