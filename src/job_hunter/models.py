@@ -136,6 +136,7 @@ class SearchPolicy:
     yc_job_pages: list[str] = field(default_factory=list)
     manual_company_watch: list[CompanyWatchSeed] = field(default_factory=list)
     max_search_queries_per_run: int = 30
+    max_canonical_resolutions_per_run: int = 80
     engineering_title_keywords: list[str] = field(
         default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_KEYWORDS)
     )

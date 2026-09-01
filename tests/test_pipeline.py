@@ -1256,3 +1256,29 @@ def test_should_run_scheduled_matches_local_hour():
 def test_should_run_scheduled_rejects_other_hours():
     now = datetime(2026, 8, 30, 6, 0, tzinfo=timezone.utc)  # 08:00 in Europe/Berlin
     assert should_run_scheduled(now, "Europe/Berlin", 9) is False
+
+
+def test_targeted_canonical_search_stops_after_shared_breaker_opens():
+    """One breaker spans every per-job search, so a dead host is called once."""
+    from job_hunter.circuit_breaker import CircuitBreaker
+    from job_hunter.pipeline import _targeted_canonical_candidates
+
+    class FailingHttp:
+        def __init__(self):
+            self.calls = 0
+
+        def get(self, url, **kwargs):
+            self.calls += 1
+            raise RuntimeError("network down")
+
+    http = FailingHttp()
+    breaker = CircuitBreaker(failure_threshold=1)
+    jobs = [
+        Job(source="aggregator", title=f"Senior Product Engineer {i}", company="Acme")
+        for i in range(4)
+    ]
+
+    for job in jobs:
+        assert _targeted_canonical_candidates(http, job, breaker) == []
+
+    assert http.calls == 1

@@ -24,6 +24,7 @@ class DiscoveryStats:
     canonical_resolved: int = 0
     canonical_unresolved: int = 0
     cross_source_duplicates: int = 0
+    canonical_budget_exhausted: int = 0
     prefilter_rejected: int = 0
     profession_rejected: int = 0
     eligible: int = 0
@@ -214,25 +215,6 @@ def collect_candidates(
             stats.per_source[job.source] = stats.per_source.get(job.source, 0) + 1
             if job.url:
                 job.original_url = job.original_url or job.url
-                if resolver is not None:
-                    try:
-                        resolution = resolver.resolve(job)
-                    except Exception:
-                        logger.exception(
-                            "canonical resolution failed: source=%s",
-                            metric_source_label(job.source),
-                        )
-                        resolution = None
-                    if resolution is None:
-                        stats.canonical_unresolved += 1
-                    else:
-                        stats.canonical_resolved += 1
-                        job.canonical_url = resolution.url
-                        job.url = resolution.url
-                        if resolution.ats is not None:
-                            job.ats_provider = resolution.ats.provider
-                            job.ats_board = resolution.ats.board
-                            job.ats_job_id = resolution.ats.job_id
             raw_jobs.append(job)
 
     # Persist every source copy before collapsing the run so provenance is
@@ -244,14 +226,14 @@ def collect_candidates(
     stats.unique = len(unique_jobs)
 
     eligible: list[tuple[int, Job]] = []
+    eligible_job_ids: set[int] = set()
     rediscovered_job_ids: list[int] = []
+    resolutions_used = 0
 
     for job in unique_jobs:
         if job.url and not job.description:
             enrich_job(job, http)
 
-        # Late canonicalization may consolidate stored rows; use the store's
-        # history-preserving survivor ID for all downstream decisions.
         job_id, _is_new, _description_changed = store.upsert_logical_job(job)
 
         if not store.needs_evaluation(job_id):
@@ -266,15 +248,53 @@ def collect_candidates(
                 stats.prefilter_rejected += 1
             continue
 
+        # Canonical resolution costs a page fetch plus a public search, so it
+        # runs only for jobs that survived prefiltering, and only while the
+        # per-run budget lasts.
+        if resolver is not None and job.url:
+            if resolutions_used >= policy.max_canonical_resolutions_per_run:
+                stats.canonical_budget_exhausted += 1
+            else:
+                resolutions_used += 1
+                try:
+                    resolution = resolver.resolve(job)
+                except Exception:
+                    logger.exception(
+                        "canonical resolution failed: source=%s",
+                        metric_source_label(job.source),
+                    )
+                    resolution = None
+                if resolution is None:
+                    stats.canonical_unresolved += 1
+                else:
+                    stats.canonical_resolved += 1
+                    job.canonical_url = resolution.url
+                    job.url = resolution.url
+                    if resolution.ats is not None:
+                        job.ats_provider = resolution.ats.provider
+                        job.ats_board = resolution.ats.board
+                        job.ats_job_id = resolution.ats.job_id
+                    # Late canonicalization may consolidate stored rows; use
+                    # the store's history-preserving survivor ID downstream.
+                    job_id, _is_new, _description_changed = store.upsert_logical_job(job)
+                    if not store.needs_evaluation(job_id):
+                        rediscovered_job_ids.append(job_id)
+                        continue
+
+        if job_id in eligible_job_ids:
+            continue
+        eligible_job_ids.add(job_id)
         eligible.append((job_id, job))
 
     stats.eligible = len(eligible)
     logger.info(
         "discovery source contribution: %s canonical_resolved=%s "
-        "canonical_unresolved=%s cross_source_duplicates=%s",
+        "canonical_unresolved=%s canonical_budget_exhausted=%s "
+        "cross_source_duplicates=%s",
         _format_source_contribution(stats.per_source),
         stats.canonical_resolved,
         stats.canonical_unresolved,
+        stats.canonical_budget_exhausted,
         stats.cross_source_duplicates,
     )
 

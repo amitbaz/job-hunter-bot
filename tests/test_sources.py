@@ -1,5 +1,6 @@
 import pytest
 
+from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.models import SearchPolicy, Settings
 from job_hunter.sources import (
     ArbeitnowSource,
@@ -12,6 +13,13 @@ from job_hunter.sources import (
     RemotiveSource,
     build_sources,
 )
+
+
+_DUCKDUCKGO_HTML = """
+<html><body>
+    <a class="result__a" href="https://jobs.ashbyhq.com/acme/a1">Senior Product Engineer - Acme</a>
+</body></html>
+"""
 
 
 class FakeResponse:
@@ -378,3 +386,44 @@ def test_build_sources_includes_always_on_and_configured_ats(fake_http, policy):
     assert "AshbySource" in kinds
     assert "LeverSource" in kinds
     assert "GreenhouseSource" in kinds
+
+
+def test_duckduckgo_opens_circuit_after_consecutive_failures():
+    class FailingHttp(FakeHttp):
+        def get(self, url, **kwargs):
+            self.calls.append(("get", url, kwargs))
+            raise RuntimeError("network down")
+
+    http = FailingHttp()
+    breaker = CircuitBreaker(failure_threshold=2)
+
+    jobs = DuckDuckGoSource(http, ["q1", "q2", "q3", "q4"], breaker=breaker).discover()
+
+    assert jobs == []
+    assert len(http.calls) == 2
+    assert breaker.is_open
+
+
+def test_duckduckgo_circuit_stays_closed_when_a_query_succeeds(fake_http):
+    fake_http.text = _DUCKDUCKGO_HTML
+    breaker = CircuitBreaker(failure_threshold=2)
+
+    jobs = DuckDuckGoSource(fake_http, ["q1", "q2", "q3"], breaker=breaker).discover()
+
+    assert len(jobs) == 3
+    assert not breaker.is_open
+
+
+def test_duckduckgo_shared_breaker_blocks_a_later_source_instance():
+    class FailingHttp(FakeHttp):
+        def get(self, url, **kwargs):
+            self.calls.append(("get", url, kwargs))
+            raise RuntimeError("network down")
+
+    http = FailingHttp()
+    breaker = CircuitBreaker(failure_threshold=1)
+
+    DuckDuckGoSource(http, ["q1"], breaker=breaker).discover()
+    DuckDuckGoSource(http, ["q2"], breaker=breaker).discover()
+
+    assert len(http.calls) == 1

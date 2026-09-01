@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
+from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.discovery import collect_candidates, metric_source_label
 from job_hunter.evaluation import evaluate_job
@@ -55,13 +56,16 @@ _READY_DECISIONS = {"high_priority", "package_match"}
 _MIN_DELIVERABLE_SCORE = 61
 _NAVIGATION_SESSION_TTL = timedelta(days=30)
 _SUPPORTED_WATCH_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
+_SEARCH_FAILURE_THRESHOLD = 5
 _CANONICAL_SEARCH_SITES = (
     "site:jobs.ashbyhq.com OR site:jobs.lever.co OR "
     "site:boards.greenhouse.io OR careers"
 )
 
 
-def _targeted_canonical_candidates(http: HttpClient, job: Job) -> list[Job]:
+def _targeted_canonical_candidates(
+    http: HttpClient, job: Job, breaker: CircuitBreaker
+) -> list[Job]:
     """Run one bounded public search for the employer's original posting."""
     company = " ".join(job.company.replace('"', " ").split())
     title = " ".join(job.title.replace('"', " ").split())
@@ -69,7 +73,7 @@ def _targeted_canonical_candidates(http: HttpClient, job: Job) -> list[Job]:
         return []
 
     query = f'"{company}" "{title}" ({_CANONICAL_SEARCH_SITES})'
-    candidates = DuckDuckGoSource(http, [query]).discover()
+    candidates = DuckDuckGoSource(http, [query], breaker=breaker).discover()
     for candidate in candidates:
         ats = parse_supported_ats_url(candidate.url)
         if ats is not None and (
@@ -274,7 +278,12 @@ def run_pipeline(
     except Exception:
         logger.exception("manual company watch sync failed")
 
-    base_sources = sources if sources is not None else build_sources(settings, http)
+    search_breaker = CircuitBreaker(_SEARCH_FAILURE_THRESHOLD)
+    base_sources = (
+        sources
+        if sources is not None
+        else build_sources(settings, http, search_breaker=search_breaker)
+    )
     sources = [
         *base_sources,
         GmailStagedSource(store),
@@ -283,7 +292,9 @@ def run_pipeline(
     due_watches = _due_watch_state(store)
     resolver = CanonicalResolver(
         http,
-        search_candidates=lambda job: _targeted_canonical_candidates(http, job),
+        search_candidates=lambda job: _targeted_canonical_candidates(
+            http, job, search_breaker
+        ),
         watch_target=lambda company: _persisted_watch_target(store, company),
     )
     gemini = gemini or GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
