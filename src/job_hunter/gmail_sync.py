@@ -337,9 +337,10 @@ class GmailSyncService:
                 )
             except SemanticClassificationError as exc:
                 _LOGGER.warning(
-                    "gmail_semantic_classification_failed message_id=%s reason=%s",
+                    "gmail_semantic_classification_failed message_id=%s reason=%s detail=%s",
                     message_id,
                     exc.reason,
+                    exc.detail or "unknown",
                 )
                 summary.errors += 1
                 had_hard_errors = True
