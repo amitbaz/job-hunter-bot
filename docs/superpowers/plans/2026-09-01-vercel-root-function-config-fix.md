@@ -1,10 +1,10 @@
-# Vercel Root Function Config Fix Implementation Plan
+# Vercel Flask Deployment Config Fix Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove the invalid Vercel root `main.py` function mapping while preserving the existing root-level Flask entrypoint and webhook install command.
+**Goal:** Make the root-level Flask webhook deploy as a real Vercel Python Function by explicitly selecting the Flask framework in repository configuration.
 
-**Architecture:** Keep `main.py` as the Vercel Flask entrypoint and rely on Vercel's Python app detection/entrypoint configuration. Remove only the conflicting `functions.main.py` declaration from `vercel.json`; runtime webhook logic remains unchanged.
+**Architecture:** Keep `main.py` as the Flask entrypoint and preserve its function settings. Add `framework: "flask"` to `vercel.json` so Vercel uses the Flask backend pipeline even though the project was initially imported with the dashboard preset **Other**.
 
 **Tech Stack:** Python 3.12, Flask 3.1, pytest, Vercel Python Functions
 
@@ -15,37 +15,36 @@
 - Do not change Telegram callback behavior.
 - Do not change SQLite/GitHub artifact persistence.
 - Do not add Supabase runtime dependencies.
-- Keep `main.py` as the root Flask entrypoint.
+- Keep root `main.py` as the Flask entrypoint.
 - Keep `pip install -e '.[webhook]'` as the Vercel install command.
+- Keep the existing `main.py` function duration at 30 seconds.
 
 ---
 
-### Task 1: Lock the deployment configuration regression
+### Task 1: Lock the corrected Flask deployment shape
 
 **Files:**
-- Create: `tests/test_vercel_config.py`
+- Modify: `tests/test_vercel_config.py`
 
 **Interfaces:**
 - Consumes: repository-root `vercel.json`
-- Produces: regression coverage for Vercel function-pattern compatibility
+- Produces: regression coverage for framework detection and root Flask function configuration
 
-- [ ] **Step 1: Write the failing config regression test**
+- [ ] **Step 1: Replace the earlier regression with the desired Flask config assertions**
 
-Create:
+Use:
 
 ```python
 import json
 from pathlib import Path
 
 
-def test_vercel_config_does_not_map_root_main_as_legacy_function():
+def test_vercel_config_declares_flask_root_entrypoint():
     config = json.loads(Path("vercel.json").read_text())
 
+    assert config["framework"] == "flask"
     assert config["installCommand"] == "pip install -e '.[webhook]'"
-
-    functions = config.get("functions", {})
-    assert "main.py" not in functions
-    assert all(pattern.startswith("api/") for pattern in functions)
+    assert config["functions"]["main.py"]["maxDuration"] == 30
 ```
 
 - [ ] **Step 2: Run the focused test and confirm RED**
@@ -56,39 +55,47 @@ Run:
 pytest -q tests/test_vercel_config.py
 ```
 
-Expected: FAIL because current `vercel.json` contains `functions["main.py"]`.
+Expected: FAIL because the current intermediate config has neither `framework: "flask"` nor `functions.main.py`.
 
-- [ ] **Step 3: Commit the regression test**
+- [ ] **Step 3: Commit the corrected regression test**
 
 ```bash
 git add tests/test_vercel_config.py
-git commit -m "test: guard Vercel root function config"
+git commit -m "test: require Vercel Flask framework config"
 ```
 
 ---
 
-### Task 2: Remove the invalid Vercel function pattern
+### Task 2: Declare Flask explicitly and restore root function settings
 
 **Files:**
 - Modify: `vercel.json`
 - Test: `tests/test_vercel_config.py`
+- Test: `tests/test_vercel_entrypoint.py`
 
 **Interfaces:**
-- Preserves: `installCommand = "pip install -e '.[webhook]'"`
-- Removes: `functions.main.py`
+- Preserves: `main.py` Flask app and webhook install command
+- Produces: repository-controlled Flask framework detection
 
-- [ ] **Step 1: Replace `vercel.json` with the minimal supported config**
+- [ ] **Step 1: Replace `vercel.json` with the supported Flask configuration**
 
 Use exactly:
 
 ```json
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "installCommand": "pip install -e '.[webhook]'"
+  "framework": "flask",
+  "installCommand": "pip install -e '.[webhook]'",
+  "functions": {
+    "main.py": {
+      "maxDuration": 30,
+      "excludeFiles": "{tests/**,.superpowers/**,docs/**,var/**}"
+    }
+  }
 }
 ```
 
-- [ ] **Step 2: Run the focused test and confirm GREEN**
+- [ ] **Step 2: Run focused tests and confirm GREEN**
 
 Run:
 
@@ -108,38 +115,47 @@ pytest -q
 
 Expected: all tests pass with zero failures.
 
-- [ ] **Step 4: Commit the config fix**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add vercel.json
-git commit -m "fix: remove invalid Vercel function pattern"
+git commit -m "fix: declare Vercel Flask framework"
 ```
 
 ---
 
-### Task 3: Document the deployment rule and verify Vercel
+### Task 3: Verify the real Vercel preview and document the lesson
 
 **Files:**
 - Modify: `docs/telegram-job-navigator.md`
 
 **Interfaces:**
-- Documents: root-level `main.py` deployment and `functions` restriction
+- Documents: Vercel project preset, repository override, and observed deployment failure modes
 
-- [ ] **Step 1: Add a troubleshooting note**
+- [ ] **Step 1: Update deployment troubleshooting documentation**
 
-Document that the webhook uses root `main.py` as the Flask entrypoint and that `vercel.json` must not declare `functions.main.py`; Vercel's `functions` patterns are reserved for `/api` functions and trigger `unmatched-function-pattern` when pointed at root `main.py`.
+Record:
+
+- the Vercel project may be imported with **Other**, but `vercel.json` must explicitly declare `"framework": "flask"`;
+- root `main.py` is the supported Flask entrypoint;
+- removing the `functions.main.py` mapping without enabling Flask can yield an empty READY deployment where `/health` returns 404;
+- the successful verification criterion is a Vercel preview where `/health` returns `{"ok": true}`.
 
 - [ ] **Step 2: Commit documentation**
 
 ```bash
 git add docs/telegram-job-navigator.md
-git commit -m "docs: clarify Vercel Flask entrypoint config"
+git commit -m "docs: clarify Vercel Flask deployment detection"
 ```
 
 - [ ] **Step 3: Verify branch CI**
 
 Confirm GitHub Actions installs `.[test,webhook]` and `pytest -q` passes on the final branch head.
 
-- [ ] **Step 4: Verify deployment behavior**
+- [ ] **Step 4: Verify Vercel preview**
 
-After the branch/PR is deployed by Vercel, confirm the build proceeds past the previous `unmatched-function-pattern` error. After merge to production, confirm `GET /health` returns HTTP 200 with `{"ok": true}`.
+Confirm the branch preview reaches READY, its build logs show the Flask/Python build path rather than an empty ~175 ms output, and `GET /health` returns HTTP 200 with `{"ok": true}`.
+
+- [ ] **Step 5: Open PR**
+
+Open the fix branch against `main` with the two observed failure modes and successful preview verification in the PR body.
