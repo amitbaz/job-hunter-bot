@@ -1,29 +1,38 @@
 from __future__ import annotations
 
 import logging
+import secrets
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from job_hunter.cover_letter import generate_cover_letter
+from job_hunter.discovery import collect_candidates
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
 from job_hunter.http import HttpClient
-from job_hunter.models import DigestItem, Material, RunSummary, Settings
-from job_hunter.preferences import extract_candidate_preferences, preferences_source
+from job_hunter.models import (
+    DigestItem,
+    Material,
+    NavigationCard,
+    NavigationSession,
+    RunSummary,
+    Settings,
+)
 from job_hunter.pdf import render_cover_letter_pdf
-from job_hunter.discovery import collect_candidates
+from job_hunter.preferences import extract_candidate_preferences, preferences_source
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.sources import build_sources
 from job_hunter.store import JobStore
-from job_hunter.telegram import TelegramClient, build_digest
-from job_hunter.telegram import select_deliverable_items
+from job_hunter.telegram import TelegramClient, select_deliverable_items
+from job_hunter.telegram_navigation import build_navigation_card, navigation_sort_key
 
 logger = logging.getLogger(__name__)
 
 _READY_DECISIONS = {"high_priority", "package_match"}
 _MIN_DELIVERABLE_SCORE = 61
+_NAVIGATION_SESSION_TTL = timedelta(days=30)
 
 
 def _select_candidates(ranked, policy, preferences):
@@ -71,15 +80,9 @@ def _requeue_pending_delivery(
     pdf_deliveries: list[tuple[int, Path, DigestItem]],
     summary: RunSummary,
 ) -> None:
-    """
-    Re-queue an already-evaluated job for delivery if a prior Telegram send
-    failed. Never calls Gemini; reuses the persisted evaluation/cover letter.
-    """
+    """Re-queue persisted delivery work without calling Gemini again."""
     evaluation = store.get_evaluation(job_id)
-    if evaluation is None:
-        return
-
-    if evaluation.total_score < _MIN_DELIVERABLE_SCORE:
+    if evaluation is None or evaluation.total_score < _MIN_DELIVERABLE_SCORE:
         return
 
     job = store.get_job(job_id)
@@ -94,6 +97,7 @@ def _requeue_pending_delivery(
         decision=evaluation.decision,
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
+        location=job.location,
     )
 
     if not store.has_delivery(job_id, "telegram_message"):
@@ -108,6 +112,35 @@ def _requeue_pending_delivery(
             except Exception:
                 logger.exception("cover letter PDF re-render failed for job_id=%s", job_id)
                 summary.errors += 1
+
+
+def _build_navigation_session(items: list[DigestItem], now: datetime) -> NavigationSession:
+    ordered = sorted(items, key=navigation_sort_key)
+    return NavigationSession(
+        session_id=secrets.token_urlsafe(12),
+        cards=[
+            NavigationCard(
+                job_id=item.job_id,
+                title=item.title,
+                company=item.company,
+                location=item.location,
+                score=item.score,
+                url=item.url,
+            )
+            for item in ordered
+        ],
+        telegram_message_id=None,
+        created_at=now.isoformat(),
+        expires_at=(now + _NAVIGATION_SESSION_TTL).isoformat(),
+    )
+
+
+def _send_navigation_card(telegram, text: str, keyboard: list[list[dict[str, str]]]) -> str | None:
+    """Use the navigator API, with a legacy fallback for injected test clients."""
+    send_job_card = getattr(telegram, "send_job_card", None)
+    if callable(send_job_card):
+        return send_job_card(text, keyboard)
+    return telegram.send_message(text)
 
 
 def run_pipeline(
@@ -174,6 +207,7 @@ def run_pipeline(
             decision=evaluation.decision,
             url=job.url,
             hard_blockers=evaluation.hard_blockers,
+            location=job.location,
         )
         digest_items.append(item)
 
@@ -206,18 +240,38 @@ def run_pipeline(
 
     if not settings.dry_run:
         deliverable_items = select_deliverable_items(digest_items)
-        if deliverable_items:
-            digest_text = build_digest(deliverable_items)
-            message_id = telegram.send_message(digest_text)
-            if message_id is not None:
-                for item in deliverable_items:
-                    store.mark_delivered(item.job_id, "telegram_message", message_id)
 
-        pdf_deliveries.sort(key=lambda entry: (-entry[2].score, (entry[2].company or "").lower(), (entry[2].title or "").lower(), entry[0]))
+        # Preserve the existing PDF behavior and send documents before the navigator
+        # so the job card remains the most recent Telegram message.
+        pdf_deliveries.sort(
+            key=lambda entry: (
+                -entry[2].score,
+                (entry[2].company or "").lower(),
+                (entry[2].title or "").lower(),
+                entry[0],
+            )
+        )
         for job_id, pdf_path, item in pdf_deliveries:
             caption = f"{item.company} - {item.title} - {item.score} - {item.url}"
             document_id = telegram.send_document(pdf_path, caption)
             if document_id is not None:
                 store.mark_delivered(job_id, "telegram_document", document_id)
+
+        if deliverable_items:
+            now = datetime.now(timezone.utc)
+            store.prune_navigation_sessions(now.isoformat())
+            session = _build_navigation_session(deliverable_items, now)
+            store.create_navigation_session(session)
+            text, keyboard = build_navigation_card(
+                session.cards[0],
+                session.session_id,
+                0,
+                len(session.cards),
+            )
+            message_id = _send_navigation_card(telegram, text, keyboard)
+            if message_id is not None:
+                store.attach_navigation_message_id(session.session_id, str(message_id))
+                for card in session.cards:
+                    store.mark_delivered(card.job_id, "telegram_message", str(message_id))
 
     return summary
