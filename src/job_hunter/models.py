@@ -207,7 +207,7 @@ class NavigationSession:
 
 @dataclass(slots=True)
 class ReviewItem:
-    """Compact, privacy-minimized representation of an ambiguous Gmail event."""
+    """Compact, privacy-minimized representation of unresolved Gmail activity."""
 
     event_id: int
     company: str
@@ -215,6 +215,8 @@ class ReviewItem:
     occurred_at: str
     subject: str
     rationale: str
+    event_type: str
+    source_message_id: str
 
 
 @dataclass(slots=True)
