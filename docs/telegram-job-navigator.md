@@ -55,26 +55,34 @@ This boundary is intentional: when the bot moves navigation state to Supabase, t
 
 ## Vercel deployment
 
-Vercel's Python runtime discovers the Flask application through the root `main.py` entrypoint. `pyproject.toml` declares:
+The webhook is deployed as a Vercel Flask/Python Function from the repository root. The Flask application remains in `main.py`, and `pyproject.toml` declares:
 
 ```toml
 [tool.vercel]
 entrypoint = "main:app"
 ```
 
-`vercel.json` explicitly installs the webhook extra:
+The repository must also explicitly tell Vercel to use its Flask backend pipeline. This is important because the project was initially imported with the dashboard framework preset **Other**. The repository config is the durable source of truth:
 
 ```json
 {
-  "installCommand": "pip install -e '.[webhook]'"
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "flask",
+  "installCommand": "pip install -e '.[webhook]'",
+  "functions": {
+    "main.py": {
+      "maxDuration": 30,
+      "excludeFiles": "{tests/**,.superpowers/**,docs/**,var/**}"
+    }
+  }
 }
 ```
 
-This keeps Flask out of the normal scheduled bot dependencies while guaranteeing it is installed for the Vercel deployment.
+`framework: "flask"` is not cosmetic. Without Flask framework detection, Vercel can create a deployment that reports READY but contains no Python Lambda. `pip install -e '.[webhook]'` keeps Flask out of the normal scheduled-bot dependency set while guaranteeing that Flask and the webhook package are installed during the Vercel build.
 
 ### 1. Create the Vercel project
 
-Create a new Vercel project connected to:
+Create a separate Vercel project connected to:
 
 ```text
 amitbaz/job-hunter-bot
@@ -83,10 +91,10 @@ amitbaz/job-hunter-bot
 Recommended project name:
 
 ```text
-job-hunter-telegram-webhook
+job-hunter-bot
 ```
 
-Use the repository root as the project root. Do not point this deployment at the Interviewer App.
+Use the repository root as the project root. It is fine if the initial dashboard framework preset is **Other**, because `vercel.json` explicitly overrides the deployment framework to Flask. Do not point this deployment at the Interviewer App.
 
 ### 2. Configure production environment variables
 
@@ -100,6 +108,8 @@ GITHUB_STATE_TOKEN=<repository-scoped token with Actions read access>
 GITHUB_STATE_ARTIFACT_NAME=job-hunter-state
 GITHUB_STATE_CACHE_DIR=/tmp/job-hunter-state
 ```
+
+The last two have defaults in code and may be omitted unless the artifact name/cache path is customized.
 
 The webhook does **not** need:
 
@@ -125,7 +135,7 @@ Use the same value for the Vercel `TELEGRAM_WEBHOOK_SECRET` variable and webhook
 
 ### 3. Deploy
 
-Deploy the Vercel project from `main` after the relevant PRs are merged. Preview deployments are useful for verifying build/runtime behavior, but Telegram should ultimately be registered against the stable production domain.
+Vercel's Git integration creates preview deployments for branch pushes and a production deployment from `main`. Preview deployments should be used to verify build/runtime behavior before merging deployment changes. Telegram should ultimately be registered against the stable production domain.
 
 ### 4. Verify health
 
@@ -138,6 +148,8 @@ Expected:
 ```json
 {"ok":true}
 ```
+
+A deployment is not considered healthy merely because Vercel reports READY. `/health` must return HTTP 200 from the Flask application.
 
 ### 5. Register Telegram
 
@@ -314,6 +326,28 @@ Before switching the webhook to Supabase:
 The Interviewer App can share the same Supabase ecosystem without sharing deployment/runtime code with the Telegram webhook.
 
 ## Troubleshooting
+
+### Vercel reports `unmatched-function-pattern`
+
+If the build says that `main.py` does not match a Serverless Function under `/api`, confirm the repository contains:
+
+```json
+"framework": "flask"
+```
+
+The project was initially imported with the **Other** preset. Root `main.py` function configuration is valid when Vercel is actually using its Flask backend pipeline.
+
+### Vercel says READY but `/health` returns platform 404
+
+Check the build logs. If the build completes almost instantly and never installs Python/Flask dependencies, Vercel produced an empty deployment rather than the webhook Lambda. Confirm `vercel.json` still declares `"framework": "flask"` and retains `functions.main.py`.
+
+The successful reference behavior is a build that installs `.[webhook]`, reports a Python Lambda, and serves:
+
+```json
+{"ok":true}
+```
+
+from `/health`.
 
 ### Vercel build cannot import Flask
 
