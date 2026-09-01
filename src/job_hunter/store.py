@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 _CREATE_MATERIALS = """
 CREATE TABLE IF NOT EXISTS materials (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id            INTEGER NOT NULL REFERENCES jobs(id),
+    job_id             INTEGER NOT NULL REFERENCES jobs(id),
     cover_letter_text TEXT    NOT NULL DEFAULT '',
     generated_at      TEXT    NOT NULL
 )
@@ -88,11 +88,16 @@ def _now_iso() -> str:
 class JobStore:
     """SQLite-backed persistence layer for the job hunter bot."""
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, read_only: bool = False) -> None:
         self._path = str(path)
-        self._conn = sqlite3.connect(self._path, check_same_thread=False)
+        if read_only:
+            uri = f"file:{Path(self._path).resolve()}?mode=ro"
+            self._conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        else:
+            self._conn = sqlite3.connect(self._path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._init_db()
+        if not read_only:
+            self._init_db()
 
     def _init_db(self) -> None:
         with self._conn:
