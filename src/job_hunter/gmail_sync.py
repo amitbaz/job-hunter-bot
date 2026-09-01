@@ -24,7 +24,8 @@ from job_hunter.gmail_models import (
 _LOGGER = logging.getLogger(__name__)
 _QUERY_TERMS = (
     '{application interview recruiter hiring "job alert" position '
-    '"technical assessment" "coding challenge" offer}'
+    '"technical assessment" "coding challenge" "job offer" '
+    '"offer letter" "offer of employment" "pleased to offer you"}'
 )
 _LIFECYCLE_KINDS = frozenset(
     {"RECRUITER_CONTACT", "APPLIED", "INTERVIEW", "TECHNICAL", "OFFER", "REJECTED"}
