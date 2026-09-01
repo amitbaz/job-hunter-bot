@@ -155,6 +155,153 @@ def test_first_sync_scans_12_months_and_marks_backfill_complete(tmp_path):
     assert summary.processed == 1
 
 
+def test_backfill_limits_unprocessed_messages_and_defers_remaining(tmp_path):
+    gmail = FakeGmail(
+        message_ids=["m1", "m2", "m3"],
+        messages={
+            "m1": _message("m1"),
+            "m2": _message("m2"),
+            "m3": _message("m3"),
+        },
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    service = GmailSyncService(
+        gmail=gmail,
+        gemini=FakeGemini(),
+        store=store,
+        backfill_batch_size=2,
+    )
+
+    summary = service.sync(NOW)
+
+    assert gmail.message_calls == ["m1", "m2"]
+    assert summary.fetched == 3
+    assert summary.processed == 2
+    assert store.has_processed_gmail_message("m1") is True
+    assert store.has_processed_gmail_message("m2") is True
+    assert store.has_processed_gmail_message("m3") is False
+    assert store.get_gmail_sync_state("candidate@example.com") is None
+
+
+def test_backfill_resumes_and_marks_complete_after_final_batch(tmp_path):
+    gmail = FakeGmail(
+        message_ids=["m1", "m2", "m3"],
+        messages={
+            "m1": _message("m1"),
+            "m2": _message("m2"),
+            "m3": _message("m3"),
+        },
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    service = GmailSyncService(
+        gmail=gmail,
+        gemini=FakeGemini(),
+        store=store,
+        backfill_batch_size=2,
+    )
+
+    first = service.sync(NOW)
+    second = service.sync(NOW + timedelta(minutes=1))
+
+    state = store.get_gmail_sync_state("candidate@example.com")
+    assert first.processed == 2
+    assert second.processed == 1
+    assert gmail.message_calls == ["m1", "m2", "m3"]
+    assert state is not None
+    assert state["history_id"] == "100"
+    assert state["backfill_completed_at"] == (
+        NOW + timedelta(minutes=1)
+    ).isoformat()
+
+
+def test_processed_ids_do_not_consume_backfill_batch_allowance(tmp_path):
+    gmail = FakeGmail(
+        message_ids=["old", "new-1", "new-2"],
+        messages={
+            "new-1": _message("new-1"),
+            "new-2": _message("new-2"),
+        },
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    store.record_gmail_message(
+        message_id="old",
+        thread_id="thread-old",
+        sender="newsletter@example.com",
+        subject="Old",
+        occurred_at=NOW.isoformat(),
+        classification="IRRELEVANT",
+        confidence=1.0,
+        rationale="already processed",
+    )
+    service = GmailSyncService(
+        gmail=gmail,
+        gemini=FakeGemini(),
+        store=store,
+        backfill_batch_size=2,
+    )
+
+    summary = service.sync(NOW)
+
+    assert gmail.message_calls == ["new-1", "new-2"]
+    assert summary.fetched == 3
+    assert summary.processed == 2
+    assert store.get_gmail_sync_state("candidate@example.com") is not None
+
+
+def test_incremental_sync_is_not_limited_by_backfill_batch_size(tmp_path):
+    gmail = FakeGmail(
+        messages={
+            "m1": _message("m1"),
+            "m2": _message("m2"),
+            "m3": _message("m3"),
+        }
+    )
+    gmail.history_pages = {
+        None: GmailHistoryPage(["m1", "m2", "m3"], "103", None)
+    }
+    store = JobStore(tmp_path / "state.sqlite3")
+    _save_completed_state(store, history_id="100")
+    service = GmailSyncService(
+        gmail=gmail,
+        gemini=FakeGemini(),
+        store=store,
+        backfill_batch_size=1,
+    )
+
+    summary = service.sync(NOW)
+
+    assert gmail.message_calls == ["m1", "m2", "m3"]
+    assert summary.processed == 3
+    assert store.get_gmail_sync_state("candidate@example.com")["history_id"] == "103"
+
+
+def test_forced_backfill_uses_same_batch_limit(tmp_path):
+    gmail = FakeGmail(
+        message_ids=["m1", "m2", "m3"],
+        messages={
+            "m1": _message("m1"),
+            "m2": _message("m2"),
+            "m3": _message("m3"),
+        },
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    _save_completed_state(store)
+    service = GmailSyncService(
+        gmail=gmail,
+        gemini=FakeGemini(),
+        store=store,
+        backfill_batch_size=2,
+    )
+
+    summary = service.sync(NOW, force_backfill=True)
+
+    state = store.get_gmail_sync_state("candidate@example.com")
+    assert summary.processed == 2
+    assert gmail.message_calls == ["m1", "m2"]
+    assert state is not None
+    assert state["backfill_completed_at"] is None
+
+
 def test_backfill_rerun_skips_processed_message_ids(tmp_path):
     gmail = FakeGmail(
         message_ids=["m1"],
