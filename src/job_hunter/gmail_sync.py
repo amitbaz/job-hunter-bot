@@ -212,7 +212,7 @@ class GmailSyncService:
 
         if classification.kind in _LIFECYCLE_KINDS:
             effective, job_id = self._match_classification(message, classification)
-            self._save_event(message, effective, job_id)
+            self._save_event(message, classification, job_id)
         elif classification.kind == "REVIEW_NEEDED":
             self._save_event(message, classification, None)
 
