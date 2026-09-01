@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -339,3 +340,85 @@ def test_success_clears_failures_and_pause_and_updates_health_timestamps(tmp_pat
     assert row["last_successful_check_at"] == "2026-09-01T13:30:00+00:00"
     assert row["last_verified_at"] == "2026-09-01T13:30:00+00:00"
     assert row["promotion_source"] == "manual"
+
+
+def test_success_timestamps_are_normalized_to_utc(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    now = datetime(
+        2026,
+        8,
+        31,
+        14,
+        0,
+        tzinfo=timezone(timedelta(hours=2)),
+    )
+
+    store.record_watch_success(watch_id, now)
+
+    row = store.get_company_watch("Acme")
+    assert row["last_successful_check_at"] == "2026-08-31T12:00:00+00:00"
+    assert row["last_verified_at"] == "2026-08-31T12:00:00+00:00"
+
+
+def test_due_watch_compares_equivalent_offset_instants(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    store._conn.execute(
+        "UPDATE company_watch SET paused_until = ? WHERE id = ?",
+        ("2026-08-31T14:00:00+02:00", watch_id),
+    )
+    same_instant = datetime(
+        2026,
+        8,
+        31,
+        8,
+        0,
+        tzinfo=timezone(timedelta(hours=-4)),
+    )
+
+    assert [row["id"] for row in store.list_due_company_watches(same_instant)] == [
+        watch_id
+    ]
+
+
+def test_failure_pause_is_24_elapsed_hours_across_dst(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    before_spring_forward = datetime(
+        2026,
+        3,
+        28,
+        12,
+        0,
+        tzinfo=ZoneInfo("Europe/Berlin"),
+    )
+
+    for _ in range(3):
+        store.record_watch_failure(watch_id, before_spring_forward)
+
+    row = store.get_company_watch("Acme")
+    assert row["paused_until"] == "2026-03-29T11:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    [
+        "list_due_company_watches",
+        "record_watch_success",
+        "record_watch_failure",
+    ],
+)
+def test_watch_time_methods_reject_naive_datetimes(tmp_path, method_name):
+    store = JobStore(tmp_path / "state.sqlite3")
+    watch_id = _manual_watch(store)
+    naive = datetime(2026, 8, 31, 12, 0)
+    method = getattr(store, method_name)
+    arguments = (
+        (naive,)
+        if method_name == "list_due_company_watches"
+        else (watch_id, naive)
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        method(*arguments)

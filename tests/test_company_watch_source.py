@@ -1,4 +1,7 @@
+import json
 from datetime import datetime, timezone
+
+import pytest
 
 from job_hunter.models import Job
 from job_hunter.sources.company_watch import CompanyWatchSource
@@ -147,6 +150,103 @@ def test_swallowed_ats_http_failure_updates_health_and_later_watch_runs(tmp_path
     assert healthy["last_successful_check_at"] == "2026-08-31T12:00:00+00:00"
 
 
+def test_failure_health_write_error_does_not_abort_later_watch(
+    tmp_path, monkeypatch
+):
+    import job_hunter.sources.company_watch as company_watch
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    failed_id = _watch(store, "Broken", "broken")
+    _watch(store, "Healthy", "healthy")
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    class ControlledGreenhouseSource:
+        def __init__(self, token, http):
+            self.token = token
+
+        def discover(self):
+            if self.token == "broken":
+                raise RuntimeError("board unavailable")
+            return [
+                Job(
+                    source="greenhouse",
+                    source_job_id="healthy-1",
+                    title="Frontend Engineer",
+                    company="healthy",
+                )
+            ]
+
+    monkeypatch.setitem(
+        company_watch._ATS_SOURCE_TYPES,
+        "greenhouse",
+        ControlledGreenhouseSource,
+    )
+    original_record_failure = store.record_watch_failure
+
+    def record_failure(watch_id, checked_at):
+        if watch_id == failed_id:
+            raise OSError("database locked")
+        original_record_failure(watch_id, checked_at)
+
+    monkeypatch.setattr(store, "record_watch_failure", record_failure)
+
+    jobs = CompanyWatchSource(store, FakeHttp({}), now=lambda: now).discover()
+
+    assert [job.source_job_id for job in jobs] == ["healthy-1"]
+    assert (
+        store.get_company_watch("Healthy")["last_successful_check_at"]
+        == "2026-08-31T12:00:00+00:00"
+    )
+
+
+def test_success_health_write_error_keeps_jobs_and_does_not_record_failure(
+    tmp_path, monkeypatch
+):
+    import job_hunter.sources.company_watch as company_watch
+
+    store = JobStore(tmp_path / "state.sqlite3")
+    first_id = _watch(store, "First", "first")
+    _watch(store, "Second", "second")
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    class SuccessfulGreenhouseSource:
+        def __init__(self, token, http):
+            self.token = token
+
+        def discover(self):
+            return [
+                Job(
+                    source="greenhouse",
+                    source_job_id=f"{self.token}-1",
+                    title="Frontend Engineer",
+                    company=self.token,
+                )
+            ]
+
+    monkeypatch.setitem(
+        company_watch._ATS_SOURCE_TYPES,
+        "greenhouse",
+        SuccessfulGreenhouseSource,
+    )
+    original_record_success = store.record_watch_success
+
+    def record_success(watch_id, checked_at):
+        if watch_id == first_id:
+            raise OSError("database locked")
+        original_record_success(watch_id, checked_at)
+
+    monkeypatch.setattr(store, "record_watch_success", record_success)
+
+    jobs = CompanyWatchSource(store, FakeHttp({}), now=lambda: now).discover()
+
+    assert [job.source_job_id for job in jobs] == ["first-1", "second-1"]
+    first = store.get_company_watch("First")
+    second = store.get_company_watch("Second")
+    assert first["consecutive_failures"] == 0
+    assert first["last_successful_check_at"] is None
+    assert second["last_successful_check_at"] == "2026-08-31T12:00:00+00:00"
+
+
 def test_generic_watch_parses_postings_and_links_from_one_page_only(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     careers_url = "https://acme.test/careers"
@@ -218,3 +318,61 @@ def test_generic_watch_parses_postings_and_links_from_one_page_only(tmp_path):
     assert jobs[0].description == "React and TypeScript"
     assert jobs[0].remote is True
     assert jobs[1].company == "Acme"
+
+
+@pytest.mark.parametrize(
+    "job_type",
+    [
+        ["Thing", "JobPosting"],
+        "https://schema.org/JobPosting",
+        "http://schema.org/JobPosting",
+        ["Thing", "https://schema.org/JobPosting"],
+    ],
+)
+def test_generic_watch_accepts_compatible_json_ld_job_types(tmp_path, job_type):
+    store = JobStore(tmp_path / "state.sqlite3")
+    careers_url = "https://acme.test/careers"
+    store.upsert_company_watch(
+        company_name="Acme",
+        careers_url=careers_url,
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    posting = {
+        "@type": job_type,
+        "title": "Frontend Engineer",
+        "url": "/jobs/frontend-engineer",
+    }
+    html = (
+        '<script type="application/ld+json">'
+        f"{json.dumps(posting)}"
+        "</script>"
+    )
+
+    class FakeResponse:
+        text = html
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    class OnePageHttp:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(url)
+            return FakeResponse()
+
+    http = OnePageHttp()
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+
+    jobs = CompanyWatchSource(store, http, now=lambda: now).discover()
+
+    assert http.calls == [careers_url]
+    assert [(job.title, job.url) for job in jobs] == [
+        ("Frontend Engineer", "https://acme.test/jobs/frontend-engineer")
+    ]

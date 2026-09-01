@@ -200,6 +200,13 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_utc(now: datetime) -> datetime:
+    """Return an aware datetime as UTC or reject an ambiguous naive input."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(timezone.utc)
+
+
 class JobStore:
     """SQLite-backed persistence layer for the job hunter bot."""
 
@@ -857,19 +864,23 @@ class JobStore:
 
     def list_due_company_watches(self, now: datetime) -> list[sqlite3.Row]:
         """Return active watch targets whose health pause has expired."""
+        timestamp = _normalize_utc(now).isoformat()
         return self._conn.execute(
             """
             SELECT * FROM company_watch
             WHERE active = 1
-              AND (paused_until IS NULL OR paused_until <= ?)
+              AND (
+                  paused_until IS NULL
+                  OR julianday(paused_until) <= julianday(?)
+              )
             ORDER BY id
             """,
-            (now.isoformat(),),
+            (timestamp,),
         ).fetchall()
 
     def record_watch_success(self, watch_id: int, now: datetime) -> None:
         """Record a verified endpoint check and clear its failure backoff."""
-        timestamp = now.isoformat()
+        timestamp = _normalize_utc(now).isoformat()
         with self._conn:
             self._conn.execute(
                 """
@@ -886,8 +897,9 @@ class JobStore:
 
     def record_watch_failure(self, watch_id: int, now: datetime) -> None:
         """Increment endpoint failures and apply the deterministic 24h pause."""
-        timestamp = now.isoformat()
-        paused_until = (now + timedelta(hours=24)).isoformat()
+        normalized_now = _normalize_utc(now)
+        timestamp = normalized_now.isoformat()
+        paused_until = (normalized_now + timedelta(hours=24)).isoformat()
         with self._conn:
             self._conn.execute(
                 """

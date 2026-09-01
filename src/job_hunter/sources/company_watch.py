@@ -30,6 +30,14 @@ _ATS_SOURCE_TYPES = {
     "lever": LeverSource,
 }
 
+_JOB_POSTING_TYPES = frozenset(
+    {
+        "JobPosting",
+        "https://schema.org/JobPosting",
+        "http://schema.org/JobPosting",
+    }
+)
+
 
 class _HealthTrackingHttp:
     """Expose an ATS request failure even when its adapter fails open."""
@@ -72,11 +80,25 @@ class CompanyWatchSource:
                     watch["company_name"],
                     exc_info=True,
                 )
-                self._store.record_watch_failure(watch["id"], checked_at)
+                try:
+                    self._store.record_watch_failure(watch["id"], checked_at)
+                except Exception:
+                    logger.warning(
+                        "company watch failure health write failed for %s",
+                        watch["company_name"],
+                        exc_info=True,
+                    )
                 continue
 
             discovered.extend(jobs)
-            self._store.record_watch_success(watch["id"], checked_at)
+            try:
+                self._store.record_watch_success(watch["id"], checked_at)
+            except Exception:
+                logger.warning(
+                    "company watch success health write failed for %s",
+                    watch["company_name"],
+                    exc_info=True,
+                )
         return discovered
 
     def _discover_watch(self, watch) -> list[Job]:
@@ -108,9 +130,10 @@ class CompanyWatchSource:
         seen_urls: set[str] = set()
 
         for posting in _iter_json_ld_job_postings(html):
+            parser_posting = {**posting, "@type": "JobPosting"}
             metadata = extract_job_from_html(
                 '<script type="application/ld+json">'
-                f"{json.dumps(posting)}"
+                f"{json.dumps(parser_posting)}"
                 "</script>"
             )
             raw_url = posting.get("url")
@@ -157,7 +180,14 @@ def _iter_json_ld_job_postings(html: str):
 
 def _iter_job_postings(data):
     if isinstance(data, dict):
-        if data.get("@type") == "JobPosting":
+        posting_types = data.get("@type")
+        if isinstance(posting_types, str):
+            posting_types = [posting_types]
+        if isinstance(posting_types, list) and any(
+            isinstance(posting_type, str)
+            and posting_type in _JOB_POSTING_TYPES
+            for posting_type in posting_types
+        ):
             yield data
         for value in data.values():
             yield from _iter_job_postings(value)
