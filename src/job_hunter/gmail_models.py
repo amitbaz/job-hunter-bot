@@ -19,6 +19,7 @@ SUPPORTED_KINDS = frozenset(
 AUTO_CONFIDENCE_THRESHOLD = 0.90
 MATCH_RECENCY_DAYS = 120
 DISCOVERY_FRESHNESS_DAYS = 14
+LEGACY_SEMANTIC_FAILURE_RATIONALE = "semantic classification unavailable or invalid"
 
 
 @dataclass(frozen=True, slots=True)

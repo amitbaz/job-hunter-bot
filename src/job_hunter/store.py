@@ -5,7 +5,10 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-from job_hunter.gmail_models import ExtractedJob
+from job_hunter.gmail_models import (
+    LEGACY_SEMANTIC_FAILURE_RATIONALE,
+    ExtractedJob,
+)
 from job_hunter.models import Evaluation, Job, Material
 from job_hunter.normalize import (
     canonicalize_url,
@@ -56,7 +59,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
 _CREATE_MATERIALS = """
 CREATE TABLE IF NOT EXISTS materials (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id            INTEGER NOT NULL REFERENCES jobs(id),
+    job_id             INTEGER NOT NULL REFERENCES jobs(id),
     cover_letter_text TEXT    NOT NULL DEFAULT '',
     generated_at      TEXT    NOT NULL
 )
@@ -206,10 +209,7 @@ class JobStore:
         remote_int: int | None = None if job.remote is None else int(job.remote)
 
         with self._conn:
-            # Enable FK each transaction (SQLite resets per-connection)
             self._conn.execute("PRAGMA foreign_keys = ON")
-
-            # Try to insert; ignore if fingerprint already exists
             self._conn.execute(
                 """
                 INSERT OR IGNORE INTO jobs
@@ -233,8 +233,6 @@ class JobStore:
                     now,
                 ),
             )
-
-            # Fetch current record (whether just inserted or pre-existing)
             row = self._conn.execute(
                 "SELECT id, description_hash, first_seen_at FROM jobs WHERE fingerprint = ?",
                 (fingerprint,),
@@ -247,7 +245,6 @@ class JobStore:
 
             if not is_new:
                 description_changed = old_hash != desc_hash
-                # Update mutable fields
                 self._conn.execute(
                     """
                     UPDATE jobs SET
@@ -548,6 +545,53 @@ class JobStore:
                 [(event_id, _now_iso(), telegram_message_id) for event_id in event_ids],
             )
 
+    def release_legacy_gmail_semantic_failures(self) -> int:
+        """Remove only legacy synthetic technical reviews so Gmail can retry them."""
+        rationale = LEGACY_SEMANTIC_FAILURE_RATIONALE
+        with self._conn:
+            rows = self._conn.execute(
+                """
+                SELECT message_id
+                FROM gmail_messages
+                WHERE classification = 'REVIEW_NEEDED'
+                  AND rationale = ?
+                """,
+                (rationale,),
+            ).fetchall()
+            message_ids = [row["message_id"] for row in rows]
+            if not message_ids:
+                return 0
+
+            placeholders = ",".join("?" for _ in message_ids)
+            event_rows = self._conn.execute(
+                f"""
+                SELECT id
+                FROM application_events
+                WHERE source = 'gmail'
+                  AND event_type = 'REVIEW_NEEDED'
+                  AND rationale = ?
+                  AND source_message_id IN ({placeholders})
+                """,
+                (rationale, *message_ids),
+            ).fetchall()
+            event_ids = [row["id"] for row in event_rows]
+            if event_ids:
+                event_placeholders = ",".join("?" for _ in event_ids)
+                self._conn.execute(
+                    f"DELETE FROM review_deliveries WHERE event_id IN ({event_placeholders})",
+                    event_ids,
+                )
+                self._conn.execute(
+                    f"DELETE FROM application_events WHERE id IN ({event_placeholders})",
+                    event_ids,
+                )
+
+            self._conn.execute(
+                f"DELETE FROM gmail_messages WHERE message_id IN ({placeholders})",
+                message_ids,
+            )
+        return len(message_ids)
+
     # ------------------------------------------------------------------
     # Evaluation operations
     # ------------------------------------------------------------------
@@ -574,12 +618,11 @@ class JobStore:
         ).fetchone()
 
         if row is None:
-            return True  # No evaluation yet
+            return True
 
         if row["status"] == "failed":
             return True
 
-        # Re-evaluate only if the content actually changed since the last evaluation.
         if row["description_hash_at_eval"] != row["description_hash"]:
             return True
 

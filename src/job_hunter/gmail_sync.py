@@ -4,7 +4,11 @@ import logging
 from dataclasses import replace
 from datetime import datetime, timedelta
 
-from job_hunter.gmail_classifier import classify_email, source_candidate_key
+from job_hunter.gmail_classifier import (
+    SemanticClassificationError,
+    classify_email,
+    source_candidate_key,
+)
 from job_hunter.gmail_client import GmailHistoryExpired
 from job_hunter.gmail_matching import match_job
 from job_hunter.gmail_models import (
@@ -63,6 +67,21 @@ class GmailSyncService:
         summary = GmailSyncSummary()
         account_id, checkpoint_history_id = self.gmail.get_profile()
         state = self.store.get_gmail_sync_state(account_id)
+
+        if not dry_run:
+            released_legacy = self.store.release_legacy_gmail_semantic_failures()
+            if released_legacy:
+                _LOGGER.info(
+                    "gmail_legacy_semantic_failures_released=%s", released_legacy
+                )
+                if state is not None and state["backfill_completed_at"] is not None:
+                    self.store.save_gmail_sync_state(
+                        account_id=account_id,
+                        history_id=state["history_id"],
+                        last_successful_sync_at=state["last_successful_sync_at"],
+                        backfill_completed_at=None,
+                    )
+                    state = self.store.get_gmail_sync_state(account_id)
 
         backfill_pending = state is None or state["backfill_completed_at"] is None
         if force_backfill and state is not None and not dry_run:
@@ -308,6 +327,15 @@ class GmailSyncService:
                     self.gmail.get_message(message_id),
                     dry_run=dry_run,
                 )
+            except SemanticClassificationError as exc:
+                _LOGGER.warning(
+                    "gmail_semantic_classification_failed message_id=%s reason=%s",
+                    message_id,
+                    exc.reason,
+                )
+                summary.errors += 1
+                had_hard_errors = True
+                continue
             except Exception:
                 _LOGGER.exception("gmail_message_processing_failed message_id=%s", message_id)
                 summary.errors += 1

@@ -119,6 +119,30 @@ def test_generic_job_alert_without_known_candidate_uses_semantic_extraction():
     assert len(gemini.calls) == 1
 
 
+def test_generic_job_alert_with_no_safe_candidate_remains_job_alert():
+    result = classify_email(
+        message(
+            "Job alert",
+            "A new role matches your saved search.",
+            sender="alerts@talentboard.example",
+        ),
+        FakeGemini(
+            semantic_response(
+                kind="JOB_ALERT",
+                company="",
+                role_title="",
+                source_job_id=None,
+                job_urls=[],
+                jobs=[],
+                rationale="Saved-search job alert.",
+            )
+        ),
+    )
+
+    assert result.kind == "JOB_ALERT"
+    assert result.jobs == []
+
+
 def test_linkedin_security_notification_uses_semantic_fallback_not_job_alert():
     gemini = FakeGemini(
         semantic_response(
@@ -162,6 +186,23 @@ def test_platform_sender_and_url_require_hostname_boundaries():
 
 
 @pytest.mark.parametrize(
+    ("subject", "body"),
+    [
+        ("Special offer", "Save 20% on your next purchase."),
+        ("Your position in the queue", "Your order is being processed."),
+    ],
+)
+def test_bare_marketing_offer_or_position_is_not_probably_job_related(subject, body):
+    assert is_probably_job_related(message(subject, body)) is False
+
+
+def test_job_offer_phrase_is_probably_job_related():
+    assert is_probably_job_related(
+        message("Job offer", "We would like to discuss your job offer.")
+    ) is True
+
+
+@pytest.mark.parametrize(
     ("job", "expected"),
     [
         (ExtractedJob(source_platform="LinkedIn", url="https://www.linkedin.com/jobs/view/42/?utm_source=email"), "url:https://www.linkedin.com/jobs/view/42/"),
@@ -181,6 +222,11 @@ class FakeGemini:
     def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
         self.calls.append((prompt, json_mode))
         return self.response
+
+
+class FailingGemini:
+    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+        raise RuntimeError("provider unavailable")
 
 
 def semantic_response(**overrides) -> str:
@@ -229,13 +275,15 @@ def test_confident_semantic_recruiter_outreach_accepts_gemini_identified_job_url
     assert [job.url for job in result.jobs] == ["https://jobs.acme.example/frontend"]
 
 
-def test_semantic_generic_urls_must_appear_in_the_email():
+def test_semantic_generic_urls_not_in_email_are_dropped():
     result = classify_email(
         message("Hiring conversation", "Can we discuss a role?"),
         FakeGemini(semantic_response()),
     )
 
-    assert result.kind == "REVIEW_NEEDED"
+    assert result.kind == "RECRUITER_CONTACT"
+    assert result.job_urls == []
+    assert result.jobs[0].url == ""
 
 
 def test_semantic_classification_retains_known_email_job_urls():
@@ -253,7 +301,7 @@ def test_semantic_classification_retains_known_email_job_urls():
     assert [job.url for job in result.jobs] == ["https://www.linkedin.com/jobs/view/1234567890/"]
 
 
-def test_conflicting_semantic_job_urls_and_jobs_becomes_review_needed():
+def test_conflicting_semantic_job_urls_and_jobs_do_not_force_review():
     result = classify_email(
         message(
             "Hiring conversation",
@@ -263,7 +311,58 @@ def test_conflicting_semantic_job_urls_and_jobs_becomes_review_needed():
         FakeGemini(semantic_response(jobs=[])),
     )
 
-    assert result.kind == "REVIEW_NEEDED"
+    assert result.kind == "RECRUITER_CONTACT"
+    assert result.job_urls == ["https://jobs.acme.example/frontend"]
+
+
+def test_semantic_irrelevant_discards_harmless_extracted_metadata():
+    result = classify_email(
+        message("Application special offer", "A consumer promotion unrelated to jobs."),
+        FakeGemini(
+            semantic_response(
+                kind="IRRELEVANT",
+                confidence=0.98,
+                company="Example Brand",
+                role_title="",
+                source_job_id=None,
+                job_urls=[],
+                jobs=[],
+                rationale="Consumer marketing email.",
+            )
+        ),
+    )
+
+    assert result.kind == "IRRELEVANT"
+    assert result.company == ""
+    assert result.role_title == ""
+    assert result.job_urls == []
+    assert result.jobs == []
+
+
+def test_semantic_optional_extraction_fields_may_be_null_or_missing():
+    import json
+
+    response = json.dumps(
+        {
+            "kind": "INTERVIEW",
+            "confidence": 0.96,
+            "company": None,
+            "role_title": None,
+            "rationale": "Scheduling an interview.",
+        }
+    )
+
+    result = classify_email(
+        message("Hiring process", "Can we find a time for an interview?"),
+        FakeGemini(response),
+    )
+
+    assert result.kind == "INTERVIEW"
+    assert result.company == ""
+    assert result.role_title == ""
+    assert result.source_job_id is None
+    assert result.job_urls == []
+    assert result.jobs == []
 
 
 def test_low_confidence_semantic_lifecycle_becomes_review_needed():
@@ -285,19 +384,28 @@ def test_low_confidence_semantic_lifecycle_becomes_review_needed():
     assert result.kind == "REVIEW_NEEDED"
 
 
-def test_malformed_semantic_json_becomes_review_needed():
-    result = classify_email(message("Hiring conversation", "Can we discuss this role?"), FakeGemini("not json"))
+def test_malformed_semantic_json_raises_technical_failure():
+    with pytest.raises(RuntimeError):
+        classify_email(
+            message("Hiring conversation", "Can we discuss this role?"),
+            FakeGemini("not json"),
+        )
 
-    assert result.kind == "REVIEW_NEEDED"
+
+def test_unsupported_semantic_kind_raises_technical_failure():
+    with pytest.raises(RuntimeError):
+        classify_email(
+            message("Hiring conversation", "Can we discuss this role?"),
+            FakeGemini(semantic_response(kind="FOLLOW_UP")),
+        )
 
 
-def test_unsupported_semantic_kind_becomes_review_needed():
-    result = classify_email(
-        message("Hiring conversation", "Can we discuss this role?"),
-        FakeGemini(semantic_response(kind="FOLLOW_UP")),
-    )
-
-    assert result.kind == "REVIEW_NEEDED"
+def test_gemini_failure_raises_technical_failure():
+    with pytest.raises(RuntimeError):
+        classify_email(
+            message("Hiring conversation", "Can we discuss this role?"),
+            FailingGemini(),
+        )
 
 
 def test_low_confidence_semantic_irrelevant_becomes_review_needed():

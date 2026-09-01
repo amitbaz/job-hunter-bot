@@ -27,18 +27,7 @@ _KNOWN_PLATFORM_SENDERS = (
     "ashbyhq.com",
     "workable.com",
 )
-_CLASSIFICATION_FIELDS = frozenset(
-    {
-        "kind",
-        "confidence",
-        "company",
-        "role_title",
-        "source_job_id",
-        "job_urls",
-        "jobs",
-        "rationale",
-    }
-)
+_REQUIRED_CLASSIFICATION_FIELDS = frozenset({"kind", "confidence", "rationale"})
 _JOB_FIELDS = frozenset(
     {
         "source_platform",
@@ -62,6 +51,14 @@ _JOB_ALERT_EXTRACTION_INSTRUCTION = """Deterministic rules identified this messa
 Keep kind as JOB_ALERT and extract only job candidates evidenced by the email.
 Use a URL only when it appears in the supplied email links or body.
 """
+
+
+class SemanticClassificationError(RuntimeError):
+    """Raised when Gmail semantic classification fails for technical reasons."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
 
 
 def _is_absolute_http_url(value: str) -> bool:
@@ -150,10 +147,12 @@ def is_probably_job_related(message: GmailMessage) -> bool:
         "recruiter",
         "hiring",
         "job alert",
-        "position",
+        "job offer",
+        "offer letter",
         "technical assessment",
         "coding challenge",
-        "offer",
+        "thanks for applying",
+        "received your application",
     )
     return any(term in text for term in strong_terms) or _is_known_platform_sender(message)
 
@@ -209,14 +208,27 @@ def _validate_string(data: dict, key: str) -> str:
     return value.strip()
 
 
-def _validate_optional_string(data: dict, key: str) -> str | None:
+def _optional_text(data: dict, key: str) -> str:
     value = data.get(key)
-    if value is not None and not isinstance(value, str):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
         raise ValueError(f"{key} must be a string or null")
-    return value.strip() if isinstance(value, str) else None
+    return value.strip()
+
+
+def _optional_nullable_text(data: dict, key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string or null")
+    return value.strip() or None
 
 
 def _parse_urls(values: object) -> list[str]:
+    if values is None:
+        return []
     if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
         raise ValueError("job_urls must be an array of strings")
 
@@ -231,6 +243,8 @@ def _parse_urls(values: object) -> list[str]:
 
 
 def _parse_jobs(values: object) -> list[ExtractedJob]:
+    if values is None:
+        return []
     if not isinstance(values, list):
         raise ValueError("jobs must be an array")
 
@@ -250,7 +264,7 @@ def _parse_jobs(values: object) -> list[ExtractedJob]:
         jobs.append(
             ExtractedJob(
                 source_platform=source_platform,
-                source_job_id=_validate_optional_string(value, "source_job_id"),
+                source_job_id=_optional_nullable_text(value, "source_job_id"),
                 url=canonicalize_url(url) if url else "",
                 company=_validate_string(value, "company"),
                 title=_validate_string(value, "title"),
@@ -268,8 +282,10 @@ def _parse_semantic_classification(raw: str) -> GmailClassification:
         data = json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError("invalid JSON") from exc
-    if not isinstance(data, dict) or set(data) != _CLASSIFICATION_FIELDS:
-        raise ValueError("response must contain exactly the supported fields")
+    if not isinstance(data, dict):
+        raise ValueError("response must be an object")
+    if not _REQUIRED_CLASSIFICATION_FIELDS.issubset(data):
+        raise ValueError("response missing required classification fields")
 
     kind = _validate_string(data, "kind")
     if kind not in SUPPORTED_KINDS:
@@ -281,45 +297,38 @@ def _parse_semantic_classification(raw: str) -> GmailClassification:
     if len(rationale) >= 160:
         raise ValueError("rationale must be under 160 characters")
 
-    classification = GmailClassification(
+    if kind == "IRRELEVANT":
+        return GmailClassification(
+            kind="IRRELEVANT",
+            confidence=float(confidence),
+            rationale=rationale,
+        )
+
+    return GmailClassification(
         kind=kind,
         confidence=float(confidence),
-        company=_validate_string(data, "company"),
-        role_title=_validate_string(data, "role_title"),
-        source_job_id=_validate_optional_string(data, "source_job_id"),
+        company=_optional_text(data, "company"),
+        role_title=_optional_text(data, "role_title"),
+        source_job_id=_optional_nullable_text(data, "source_job_id"),
         job_urls=_parse_urls(data.get("job_urls")),
         jobs=_parse_jobs(data.get("jobs")),
         rationale=rationale,
     )
-    if classification.kind == "IRRELEVANT" and (
-        classification.company
-        or classification.role_title
-        or classification.source_job_id
-        or classification.job_urls
-        or classification.jobs
-    ):
-        raise ValueError("irrelevant response conflicts with extracted job data")
-    return classification
 
 
 def _reconcile_semantic_urls(
     message: GmailMessage, classification: GmailClassification
 ) -> GmailClassification:
-    semantic_urls = set(classification.job_urls)
-    semantic_job_urls = {job.url for job in classification.jobs if job.url}
-    if semantic_urls != semantic_job_urls:
-        raise ValueError("job_urls and jobs URLs conflict")
-
     message_urls = set(_message_urls(message))
-    if not semantic_urls.issubset(message_urls):
-        raise ValueError("semantic job URL was not present in the email")
+    job_urls = [url for url in classification.job_urls if url in message_urls]
+    jobs = [
+        replace(job, url="")
+        if job.url and job.url not in message_urls
+        else job
+        for job in classification.jobs
+    ]
 
     known_jobs = _known_jobs(message)
-    if classification.kind == "IRRELEVANT" and known_jobs:
-        raise ValueError("irrelevant response conflicts with known job URLs")
-
-    job_urls = list(classification.job_urls)
-    jobs = list(classification.jobs)
     known_urls = {job.url for job in jobs if job.url}
     for job in known_jobs:
         if job.url not in known_urls:
@@ -362,22 +371,22 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
         return GmailClassification(kind="IRRELEVANT", confidence=1.0, rationale="no deterministic job signal")
 
     try:
-        classification = _parse_semantic_classification(
-            gemini.generate_text(
-                _build_semantic_prompt(
-                    message,
-                    extract_job_alert=extract_job_alert,
-                ),
-                json_mode=True,
-            )
+        raw = gemini.generate_text(
+            _build_semantic_prompt(
+                message,
+                extract_job_alert=extract_job_alert,
+            ),
+            json_mode=True,
         )
-        classification = _reconcile_semantic_urls(message, classification)
-        if extract_job_alert and (
-            classification.kind != "JOB_ALERT" or not classification.jobs
-        ):
-            raise ValueError("generic job alert extraction returned no usable jobs")
-    except Exception:
-        return _review_needed("semantic classification unavailable or invalid")
+    except Exception as exc:
+        raise SemanticClassificationError("gemini_error") from exc
+
+    try:
+        classification = _parse_semantic_classification(raw)
+        if classification.kind != "IRRELEVANT":
+            classification = _reconcile_semantic_urls(message, classification)
+    except ValueError as exc:
+        raise SemanticClassificationError("invalid_semantic_response") from exc
 
     if classification.kind == "REVIEW_NEEDED" or classification.confidence < AUTO_CONFIDENCE_THRESHOLD:
         return _review_needed("semantic classification requires review")
