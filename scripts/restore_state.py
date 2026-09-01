@@ -1,61 +1,36 @@
 from __future__ import annotations
 
 import argparse
-import io
 import logging
-import zipfile
 from pathlib import Path
 
 import requests
 
-logger = logging.getLogger(__name__)
+from job_hunter.github_state import load_latest_artifact_to_path
 
-_ARTIFACTS_URL_TEMPLATE = "https://api.github.com/repos/{repo}/actions/artifacts"
+logger = logging.getLogger(__name__)
 
 
 def restore_state(repo: str, token: str, name: str, dest: Path, http=None) -> bool:
     http = http or requests
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-    }
-
-    response = http.get(_ARTIFACTS_URL_TEMPLATE.format(repo=repo), headers=headers)
-    response.raise_for_status()
-    artifacts = response.json().get("artifacts", [])
-
-    candidates = [a for a in artifacts if a.get("name") == name and not a.get("expired")]
-    if not candidates:
+    artifact = load_latest_artifact_to_path(
+        repo,
+        token,
+        name,
+        Path(dest),
+        http=http,
+    )
+    if artifact is None:
         logger.info("No prior %r artifact found for %s; starting with fresh state.", name, repo)
         return False
 
-    newest = max(candidates, key=lambda a: a["created_at"])
-
-    download_response = http.get(newest["archive_download_url"], headers=headers)
-    download_response.raise_for_status()
-
-    dest = Path(dest)
-    with zipfile.ZipFile(io.BytesIO(download_response.content)) as zf:
-        member = _find_member(zf, dest.name)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        with zf.open(member) as src, open(dest, "wb") as out:
-            out.write(src.read())
-
-    logger.info("Restored %s from artifact %r (id=%s)", dest, name, newest["id"])
+    logger.info(
+        "Restored %s from artifact %r (id=%s)",
+        dest,
+        name,
+        artifact["id"],
+    )
     return True
-
-
-def _find_member(zf: zipfile.ZipFile, expected_name: str) -> str:
-    for info in zf.infolist():
-        if info.is_dir():
-            continue
-        if Path(info.filename).name != expected_name:
-            continue
-        member_path = Path(info.filename)
-        if member_path.is_absolute() or ".." in member_path.parts:
-            raise ValueError(f"Unsafe zip member path: {info.filename!r}")
-        return info.filename
-    raise ValueError(f"No member named {expected_name!r} found in artifact zip")
 
 
 def build_parser() -> argparse.ArgumentParser:

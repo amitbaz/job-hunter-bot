@@ -20,6 +20,12 @@ test = [
     "pytest>=8.0",
     "pytest-mock>=3.12",
 ]
+webhook = [
+    "Flask>=3.1,<4",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.vercel]
+entrypoint = "main:app"
