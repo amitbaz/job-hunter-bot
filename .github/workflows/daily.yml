@@ -23,7 +23,7 @@ jobs:
         run: python scripts/restore_state.py --repo "$GH_REPO" --token "$GH_TOKEN" --dest var/job_hunter.sqlite3
       - name: Sync Gmail intelligence
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 20
         env:
           GMAIL_CLIENT_ID: ${{ secrets.GMAIL_CLIENT_ID }}
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
