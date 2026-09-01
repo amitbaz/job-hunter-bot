@@ -20,6 +20,7 @@ if TYPE_CHECKING:
     from job_hunter.gemini import GeminiClient
 
 _VISIBLE_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
+_LINKEDIN_JOB_ID_PATTERN = re.compile(r"/(?:comm/)?jobs/view/(\d+)(?:/|$)", re.IGNORECASE)
 _KNOWN_PLATFORM_SENDERS = (
     "linkedin.com",
     "greenhouse.io",
@@ -71,6 +72,22 @@ def _host_matches_domain(host: str, domain: str) -> bool:
     return host == domain or host.endswith("." + domain)
 
 
+def _linkedin_job_id(url: str) -> str | None:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not _host_matches_domain(host, "linkedin.com"):
+        return None
+    match = _LINKEDIN_JOB_ID_PATTERN.search(parsed.path)
+    return match.group(1) if match else None
+
+
+def _normalize_url(url: str) -> str:
+    linkedin_job_id = _linkedin_job_id(url)
+    if linkedin_job_id:
+        return f"https://www.linkedin.com/jobs/view/{linkedin_job_id}/"
+    return canonicalize_url(url)
+
+
 def _is_known_platform_host(host: str) -> bool:
     return any(_host_matches_domain(host, domain) for domain in _KNOWN_PLATFORM_SENDERS)
 
@@ -96,7 +113,7 @@ def _message_urls(message: GmailMessage) -> list[str]:
         value = value.rstrip(".,;:!?)]}")
         if not _is_absolute_http_url(value):
             continue
-        url = canonicalize_url(value)
+        url = _normalize_url(value)
         if url not in urls:
             urls.append(url)
     return urls
@@ -124,7 +141,14 @@ def _known_jobs(message: GmailMessage) -> list[ExtractedJob]:
     for index, url in enumerate(_message_urls(message)):
         platform = _job_url_platform(url)
         if platform:
-            jobs.append(ExtractedJob(source_platform=platform, url=url, index=index))
+            jobs.append(
+                ExtractedJob(
+                    source_platform=platform,
+                    source_job_id=_linkedin_job_id(url) if platform == "linkedin" else None,
+                    url=url,
+                    index=index,
+                )
+            )
     return jobs
 
 
@@ -188,8 +212,16 @@ def classify_deterministically(message: GmailMessage) -> GmailClassification | N
 
 
 def source_candidate_key(job: ExtractedJob) -> str:
+    if job.source_platform.lower() == "linkedin":
+        if job.source_job_id:
+            return f"id:linkedin:{job.source_job_id}"
+        parsed = urlparse(job.url)
+        if "/comm/jobs/view/" in parsed.path.lower():
+            linkedin_job_id = _linkedin_job_id(job.url)
+            if linkedin_job_id:
+                return f"id:linkedin:{linkedin_job_id}"
     if job.url:
-        return "url:" + canonicalize_url(job.url)
+        return "url:" + _normalize_url(job.url)
     if job.source_job_id:
         return f"id:{job.source_platform.lower()}:{job.source_job_id}"
     return "fallback:" + "|".join(
@@ -236,7 +268,7 @@ def _parse_urls(values: object) -> list[str]:
     for value in values:
         if not _is_absolute_http_url(value):
             raise ValueError("job URLs must be absolute HTTP(S) URLs")
-        url = canonicalize_url(value)
+        url = _normalize_url(value)
         if url not in urls:
             urls.append(url)
     return urls
@@ -261,11 +293,15 @@ def _parse_jobs(values: object) -> list[ExtractedJob]:
         remote = value.get("remote")
         if remote is not None and not isinstance(remote, bool):
             raise ValueError("remote must be a boolean or null")
+        normalized_url = _normalize_url(url) if url else ""
+        source_job_id = _optional_nullable_text(value, "source_job_id")
+        if source_platform.lower() == "linkedin" and normalized_url:
+            source_job_id = source_job_id or _linkedin_job_id(normalized_url)
         jobs.append(
             ExtractedJob(
                 source_platform=source_platform,
-                source_job_id=_optional_nullable_text(value, "source_job_id"),
-                url=canonicalize_url(url) if url else "",
+                source_job_id=source_job_id,
+                url=normalized_url,
                 company=_validate_string(value, "company"),
                 title=_validate_string(value, "title"),
                 location=_validate_string(value, "location"),
@@ -363,7 +399,13 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
     extract_job_alert = bool(
         deterministic is not None
         and deterministic.kind == "JOB_ALERT"
-        and not deterministic.jobs
+        and (
+            not deterministic.jobs
+            or any(
+                job.source_platform.lower() == "linkedin" and job.source_job_id
+                for job in deterministic.jobs
+            )
+        )
     )
     if deterministic is not None and not extract_job_alert:
         return deterministic
