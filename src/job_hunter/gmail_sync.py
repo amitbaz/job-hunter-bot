@@ -10,6 +10,7 @@ from job_hunter.gmail_classifier import (
     source_candidate_key,
 )
 from job_hunter.gmail_client import GmailHistoryExpired
+from job_hunter.gmail_linkedin_cleanup import release_legacy_blank_linkedin_jobs
 from job_hunter.gmail_matching import match_job
 from job_hunter.gmail_models import (
     AUTO_CONFIDENCE_THRESHOLD,
@@ -70,18 +71,25 @@ class GmailSyncService:
 
         if not dry_run:
             released_legacy = self.store.release_legacy_gmail_semantic_failures()
+            released_linkedin = release_legacy_blank_linkedin_jobs(self.store)
             if released_legacy:
                 _LOGGER.info(
                     "gmail_legacy_semantic_failures_released=%s", released_legacy
                 )
-                if state is not None and state["backfill_completed_at"] is not None:
-                    self.store.save_gmail_sync_state(
-                        account_id=account_id,
-                        history_id=state["history_id"],
-                        last_successful_sync_at=state["last_successful_sync_at"],
-                        backfill_completed_at=None,
-                    )
-                    state = self.store.get_gmail_sync_state(account_id)
+            if released_linkedin:
+                _LOGGER.info(
+                    "gmail_legacy_blank_linkedin_jobs_released=%s", released_linkedin
+                )
+            if (
+                released_legacy or released_linkedin
+            ) and state is not None and state["backfill_completed_at"] is not None:
+                self.store.save_gmail_sync_state(
+                    account_id=account_id,
+                    history_id=state["history_id"],
+                    last_successful_sync_at=state["last_successful_sync_at"],
+                    backfill_completed_at=None,
+                )
+                state = self.store.get_gmail_sync_state(account_id)
 
         backfill_pending = state is None or state["backfill_completed_at"] is None
         if force_backfill and state is not None and not dry_run:
