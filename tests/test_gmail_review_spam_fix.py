@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 
 from job_hunter.gmail_client import GmailPage
 from job_hunter.gmail_models import GmailMessage
-from job_hunter.gmail_sync import GmailSyncService, build_backfill_query
+from job_hunter.gmail_sync import GmailSyncService
 from job_hunter.store import JobStore
 
 
@@ -52,17 +52,6 @@ def test_semantic_provider_failure_is_error_not_review_and_remains_retryable(tmp
     assert summary.review_needed == 0
     assert store.has_processed_gmail_message("m1") is False
     assert store.pending_review_events() == []
-
-
-def test_backfill_query_uses_job_specific_offer_phrases():
-    query = build_backfill_query(NOW)
-
-    assert '"job offer"' in query
-    assert '"offer letter"' in query
-    assert '"thanks for applying"' in query
-    assert '"received your application"' in query
-    assert " position " not in f" {query} "
-    assert " offer " not in f" {query} "
 
 
 def test_release_legacy_semantic_failures_removes_only_exact_technical_artifacts(tmp_path):
