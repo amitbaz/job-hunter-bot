@@ -56,6 +56,34 @@ class Job:
     description: str = ""
     source_job_id: str | None = None
     remote: bool | None = None
+    original_url: str = ""
+    canonical_url: str = ""
+    ats_provider: str | None = None
+    ats_board: str | None = None
+    ats_job_id: str | None = None
+
+
+@dataclass(slots=True)
+class AtsReference:
+    provider: str
+    board: str
+    job_id: str | None
+
+
+@dataclass(slots=True)
+class CanonicalResolution:
+    url: str
+    ats: AtsReference | None
+    confidence: float
+    method: str
+
+
+@dataclass(slots=True)
+class CompanyWatchSeed:
+    company_name: str
+    careers_url: str = ""
+    ats_provider: str | None = None
+    ats_identifier: str | None = None
 
 
 @dataclass(slots=True)
@@ -103,6 +131,10 @@ class SearchPolicy:
     role_families: list[str] = field(default_factory=list)
     search_query_templates: list[str] = field(default_factory=list)
     search_domains: list[str] = field(default_factory=list)
+    specialist_search_domains: list[str] = field(default_factory=list)
+    specialist_query_templates: list[str] = field(default_factory=list)
+    yc_job_pages: list[str] = field(default_factory=list)
+    manual_company_watch: list[CompanyWatchSeed] = field(default_factory=list)
     max_search_queries_per_run: int = 30
     engineering_title_keywords: list[str] = field(
         default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_KEYWORDS)

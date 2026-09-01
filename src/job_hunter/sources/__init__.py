@@ -5,6 +5,7 @@ from job_hunter.models import Settings
 from .arbeitnow import ArbeitnowSource
 from .ashby import AshbySource
 from .base import JobSource
+from .company_watch import CompanyWatchSource
 from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
 from .gmail_staged import GmailStagedSource
@@ -15,6 +16,7 @@ from .remotive import RemotiveSource
 from .remoteok import RemoteOKSource
 from .weworkremotely import WeWorkRemotelySource
 from .hackernews import HackerNewsHiringSource
+from .yc import YCSource
 from job_hunter.discovery_queries import generate_search_queries
 
 __all__ = [
@@ -24,11 +26,12 @@ __all__ = [
     "JobicySource",
     "HimalayasSource",
     "GmailStagedSource",
+    "CompanyWatchSource",
     "DuckDuckGoSource",
     "AshbySource",
     "LeverSource",
     "GreenhouseSource",
-    "RemoteOKSource", "WeWorkRemotelySource", "HackerNewsHiringSource",
+    "RemoteOKSource", "WeWorkRemotelySource", "HackerNewsHiringSource", "YCSource",
     "build_sources",
 ]
 
@@ -44,6 +47,8 @@ def build_sources(settings: Settings, http) -> list[JobSource]:
         HackerNewsHiringSource(http),
         DuckDuckGoSource(http, generate_search_queries(settings.policy)),
     ]
+    if settings.policy.yc_job_pages:
+        sources.append(YCSource(http, settings.policy.yc_job_pages))
 
     ats = settings.policy.ats or {}
     for board in ats.get("ashby", []) or []:

@@ -2,12 +2,17 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from job_hunter.gmail_models import (
     LEGACY_SEMANTIC_FAILURE_RATIONALE,
     ExtractedJob,
+)
+from job_hunter.job_identity import (
+    locations_compatible,
+    normalize_company_name,
+    normalize_job_title,
 )
 from job_hunter.models import Evaluation, Job, Material
 from job_hunter.normalize import (
@@ -33,6 +38,49 @@ CREATE TABLE IF NOT EXISTS jobs (
     first_seen_at    TEXT    NOT NULL,
     last_seen_at     TEXT    NOT NULL,
     status           TEXT    NOT NULL DEFAULT 'new'
+)
+"""
+
+_R2_JOB_COLUMNS = {
+    "canonical_url": "TEXT NOT NULL DEFAULT ''",
+    "ats_provider": "TEXT",
+    "ats_board": "TEXT",
+    "ats_job_id": "TEXT",
+}
+
+_CREATE_JOB_SOURCES = """
+CREATE TABLE IF NOT EXISTS job_sources (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    source TEXT NOT NULL,
+    source_job_id TEXT,
+    source_url TEXT NOT NULL DEFAULT '',
+    identity_key TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    UNIQUE(job_id, identity_key)
+)
+"""
+
+_CREATE_COMPANY_WATCH = """
+CREATE TABLE IF NOT EXISTS company_watch (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    company_name TEXT NOT NULL,
+    normalized_company_name TEXT NOT NULL UNIQUE,
+    careers_url TEXT NOT NULL DEFAULT '',
+    ats_provider TEXT,
+    ats_identifier TEXT,
+    discovered_from_job_id INTEGER REFERENCES jobs(id),
+    promotion_source TEXT NOT NULL,
+    confidence REAL NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    paused_until TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_verified_at TEXT,
+    last_successful_check_at TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
 )
 """
 
@@ -148,10 +196,18 @@ CREATE TABLE IF NOT EXISTS review_deliveries (
 """
 
 _DELIVERABLE_SCORE_FLOOR = 60
+_SUPPORTED_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _normalize_utc(now: datetime) -> datetime:
+    """Return an aware datetime as UTC or reject an ambiguous naive input."""
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("now must be timezone-aware")
+    return now.astimezone(timezone.utc)
 
 
 class JobStore:
@@ -182,6 +238,9 @@ class JobStore:
         with self._conn:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute(_CREATE_JOBS)
+            self._migrate_jobs_to_r2_schema()
+            self._conn.execute(_CREATE_JOB_SOURCES)
+            self._conn.execute(_CREATE_COMPANY_WATCH)
             self._conn.execute(_CREATE_EVALUATIONS)
             self._conn.execute(_CREATE_MATERIALS)
             self._conn.execute(_CREATE_DELIVERIES)
@@ -190,6 +249,14 @@ class JobStore:
             self._conn.execute(_CREATE_INBOUND_JOB_CANDIDATES)
             self._conn.execute(_CREATE_APPLICATION_EVENTS)
             self._conn.execute(_CREATE_REVIEW_DELIVERIES)
+
+    def _migrate_jobs_to_r2_schema(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")
+        }
+        for name, definition in _R2_JOB_COLUMNS.items():
+            if name not in columns:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
 
     # ------------------------------------------------------------------
     # Job operations
@@ -207,6 +274,7 @@ class JobStore:
         desc_hash = description_hash(job.description or "")
         now = _now_iso()
         remote_int: int | None = None if job.remote is None else int(job.remote)
+        canonical_url = job.canonical_url or canonicalize_url(job.url or "")
 
         with self._conn:
             self._conn.execute("PRAGMA foreign_keys = ON")
@@ -215,8 +283,9 @@ class JobStore:
                 INSERT OR IGNORE INTO jobs
                     (fingerprint, source, source_job_id, url, company, title,
                      location, remote, description, description_hash,
+                     canonical_url, ats_provider, ats_board, ats_job_id,
                      first_seen_at, last_seen_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
                 """,
                 (
                     fingerprint,
@@ -229,6 +298,10 @@ class JobStore:
                     remote_int,
                     job.description or "",
                     desc_hash,
+                    canonical_url,
+                    job.ats_provider,
+                    job.ats_board,
+                    job.ats_job_id,
                     now,
                     now,
                 ),
@@ -255,6 +328,10 @@ class JobStore:
                         remote           = ?,
                         description      = ?,
                         description_hash = ?,
+                        canonical_url    = COALESCE(NULLIF(?, ''), canonical_url),
+                        ats_provider     = COALESCE(?, ats_provider),
+                        ats_board        = COALESCE(?, ats_board),
+                        ats_job_id       = COALESCE(?, ats_job_id),
                         last_seen_at     = ?
                     WHERE id = ?
                     """,
@@ -266,12 +343,651 @@ class JobStore:
                         remote_int,
                         job.description or "",
                         desc_hash,
+                        canonical_url,
+                        job.ats_provider,
+                        job.ats_board,
+                        job.ats_job_id,
                         now,
                         job_id,
                     ),
                 )
 
         return job_id, is_new, description_changed
+
+    def upsert_logical_job(self, job: Job) -> tuple[int, bool, bool]:
+        """Persist a source-independent logical job and its discovery provenance.
+
+        Identity is resolved from strongest to weakest exact evidence. Existing
+        rows retain richer fields, while a resolved canonical URL becomes the
+        usable job URL. The return shape matches :meth:`upsert_job`.
+        """
+        canonical_url = canonicalize_url(job.canonical_url) if job.canonical_url else ""
+        ats_provider = (job.ats_provider or "").lower()
+        fingerprint = job_fingerprint(job)
+
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            candidate_ids: list[int] = []
+
+            if canonical_url:
+                for candidate_id in self._find_job_ids_by_canonical_url(
+                    canonical_url
+                ):
+                    self._append_unique_id(candidate_ids, candidate_id)
+            if (
+                ats_provider in _SUPPORTED_ATS_PROVIDERS
+                and job.ats_board
+                and job.ats_job_id
+            ):
+                for candidate_id in self._find_job_ids_by_ats(
+                    ats_provider, job.ats_board, job.ats_job_id
+                ):
+                    self._append_unique_id(candidate_ids, candidate_id)
+            for candidate_id in self._find_job_ids_by_identity(
+                job.company, job.title, job.location
+            ):
+                self._append_unique_id(candidate_ids, candidate_id)
+            self._append_unique_id(
+                candidate_ids,
+                self._find_single_job_id(
+                    "SELECT id FROM jobs WHERE fingerprint = ?", (fingerprint,)
+                ),
+            )
+
+            if candidate_ids:
+                job_id = min(candidate_ids, key=self._job_survivor_sort_key)
+                previous_hash = self._conn.execute(
+                    "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()["description_hash"]
+                for duplicate_id in candidate_ids:
+                    if duplicate_id != job_id:
+                        job_id = self._merge_jobs(job_id, duplicate_id)
+                self._update_logical_job(job_id, job)
+                current_hash = self._conn.execute(
+                    "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
+                ).fetchone()["description_hash"]
+                description_changed = previous_hash != current_hash
+                is_new = False
+            else:
+                job_id = self._insert_logical_job(job, fingerprint)
+                description_changed = False
+                is_new = True
+
+            self._record_job_source(
+                job_id,
+                source=job.source or "",
+                source_job_id=job.source_job_id,
+                source_url=job.original_url or job.url or "",
+            )
+
+        return job_id, is_new, description_changed
+
+    @staticmethod
+    def _append_unique_id(ids: list[int], job_id: int | None) -> None:
+        if job_id is not None and job_id not in ids:
+            ids.append(job_id)
+
+    def _insert_logical_job(self, job: Job, fingerprint: str) -> int:
+        now = _now_iso()
+        persisted_url = job.canonical_url or job.url or ""
+        canonical_url = canonicalize_url(job.canonical_url or job.url or "")
+        remote = None if job.remote is None else int(job.remote)
+        cursor = self._conn.execute(
+            """
+            INSERT INTO jobs
+                (fingerprint, source, source_job_id, url, company, title,
+                 location, remote, description, description_hash,
+                 canonical_url, ats_provider, ats_board, ats_job_id,
+                 first_seen_at, last_seen_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+            """,
+            (
+                fingerprint,
+                job.source or "",
+                job.source_job_id,
+                persisted_url,
+                job.company or "",
+                job.title or "",
+                job.location or "",
+                remote,
+                job.description or "",
+                description_hash(job.description or ""),
+                canonical_url,
+                job.ats_provider,
+                job.ats_board,
+                job.ats_job_id,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def _update_logical_job(self, job_id: int, job: Job) -> bool:
+        row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"job does not exist: {job_id}")
+
+        description = self._richer_text(row["description"], job.description)
+        description_changed = description_hash(description) != row["description_hash"]
+        canonical_url = canonicalize_url(job.canonical_url) if job.canonical_url else ""
+        persisted_url = job.canonical_url or row["url"] or job.url or ""
+
+        remote = row["remote"]
+        if remote is None and job.remote is not None:
+            remote = int(job.remote)
+
+        self._conn.execute(
+            """
+            UPDATE jobs SET
+                url = ?,
+                company = ?,
+                title = ?,
+                location = ?,
+                remote = ?,
+                description = ?,
+                description_hash = ?,
+                canonical_url = ?,
+                ats_provider = ?,
+                ats_board = ?,
+                ats_job_id = ?,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (
+                persisted_url,
+                row["company"] or job.company or "",
+                row["title"] or job.title or "",
+                row["location"] or job.location or "",
+                remote,
+                description,
+                description_hash(description),
+                canonical_url or row["canonical_url"],
+                job.ats_provider or row["ats_provider"],
+                job.ats_board or row["ats_board"],
+                job.ats_job_id or row["ats_job_id"],
+                _now_iso(),
+                job_id,
+            ),
+        )
+        return description_changed
+
+    def merge_jobs(self, survivor_id: int, duplicate_id: int) -> int:
+        """Transactionally merge a duplicate job and all attached records."""
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            return self._merge_jobs(survivor_id, duplicate_id)
+
+    def _merge_jobs(self, survivor_id: int, duplicate_id: int) -> int:
+        if survivor_id == duplicate_id:
+            return survivor_id
+
+        if self._job_survivor_sort_key(duplicate_id) < self._job_survivor_sort_key(
+            survivor_id
+        ):
+            survivor_id, duplicate_id = duplicate_id, survivor_id
+
+        survivor = self._conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (survivor_id,)
+        ).fetchone()
+        duplicate = self._conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (duplicate_id,)
+        ).fetchone()
+        if survivor is None or duplicate is None:
+            raise ValueError("survivor and duplicate jobs must both exist")
+
+        survivor_has_ats = self._has_complete_ats_identity(survivor)
+        duplicate_has_ats = self._has_complete_ats_identity(duplicate)
+        prefer_duplicate_identity = duplicate_has_ats and not survivor_has_ats
+        canonical_url = (
+            duplicate["canonical_url"]
+            if prefer_duplicate_identity
+            else survivor["canonical_url"] or duplicate["canonical_url"]
+        )
+        url = (
+            duplicate["url"]
+            if prefer_duplicate_identity
+            else survivor["url"] or duplicate["url"]
+        )
+        if canonical_url and (survivor_has_ats or duplicate_has_ats):
+            url = canonical_url
+        description = self._richer_text(
+            survivor["description"], duplicate["description"]
+        )
+
+        self._conn.execute(
+            """
+            UPDATE jobs SET
+                source = ?,
+                source_job_id = ?,
+                url = ?,
+                company = ?,
+                title = ?,
+                location = ?,
+                remote = ?,
+                description = ?,
+                description_hash = ?,
+                canonical_url = ?,
+                ats_provider = ?,
+                ats_board = ?,
+                ats_job_id = ?,
+                first_seen_at = ?,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (
+                survivor["source"] or duplicate["source"],
+                survivor["source_job_id"] or duplicate["source_job_id"],
+                url,
+                survivor["company"] or duplicate["company"],
+                survivor["title"] or duplicate["title"],
+                survivor["location"] or duplicate["location"],
+                survivor["remote"]
+                if survivor["remote"] is not None
+                else duplicate["remote"],
+                description,
+                description_hash(description),
+                canonical_url,
+                duplicate["ats_provider"]
+                if prefer_duplicate_identity
+                else survivor["ats_provider"] or duplicate["ats_provider"],
+                duplicate["ats_board"]
+                if prefer_duplicate_identity
+                else survivor["ats_board"] or duplicate["ats_board"],
+                duplicate["ats_job_id"]
+                if prefer_duplicate_identity
+                else survivor["ats_job_id"] or duplicate["ats_job_id"],
+                min(survivor["first_seen_at"], duplicate["first_seen_at"]),
+                max(survivor["last_seen_at"], duplicate["last_seen_at"]),
+                survivor_id,
+            ),
+        )
+
+        for source in self._conn.execute(
+            "SELECT * FROM job_sources WHERE job_id = ? ORDER BY id", (duplicate_id,)
+        ).fetchall():
+            self._conn.execute(
+                """
+                INSERT INTO job_sources
+                    (job_id, source, source_job_id, source_url, identity_key,
+                     first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, identity_key) DO UPDATE SET
+                    first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+                    last_seen_at = MAX(last_seen_at, excluded.last_seen_at)
+                """,
+                (
+                    survivor_id,
+                    source["source"],
+                    source["source_job_id"],
+                    source["source_url"],
+                    source["identity_key"],
+                    source["first_seen_at"],
+                    source["last_seen_at"],
+                ),
+            )
+        self._conn.execute("DELETE FROM job_sources WHERE job_id = ?", (duplicate_id,))
+
+        for table in ("application_events", "materials", "deliveries", "evaluations"):
+            self._conn.execute(
+                f"UPDATE {table} SET job_id = ? WHERE job_id = ?",
+                (survivor_id, duplicate_id),
+            )
+        self._conn.execute(
+            """
+            UPDATE company_watch SET discovered_from_job_id = ?
+            WHERE discovered_from_job_id = ?
+            """,
+            (survivor_id, duplicate_id),
+        )
+        self._conn.execute("DELETE FROM jobs WHERE id = ?", (duplicate_id,))
+        return survivor_id
+
+    def _job_survivor_sort_key(self, job_id: int) -> tuple[int, int, str, int]:
+        """Rank a stored job for deterministic, history-preserving merges."""
+        row = self._conn.execute(
+            """
+            SELECT
+                j.first_seen_at,
+                EXISTS(
+                    SELECT 1 FROM application_events a WHERE a.job_id = j.id
+                ) AS has_application_events,
+                (
+                    EXISTS(SELECT 1 FROM evaluations e WHERE e.job_id = j.id)
+                    OR EXISTS(SELECT 1 FROM materials m WHERE m.job_id = j.id)
+                    OR EXISTS(SELECT 1 FROM deliveries d WHERE d.job_id = j.id)
+                ) AS has_other_history
+            FROM jobs j
+            WHERE j.id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"job does not exist: {job_id}")
+        return (
+            -int(row["has_application_events"]),
+            -int(row["has_other_history"]),
+            row["first_seen_at"],
+            job_id,
+        )
+
+    @staticmethod
+    def _has_complete_ats_identity(row: sqlite3.Row) -> bool:
+        return bool(row["ats_provider"] and row["ats_board"] and row["ats_job_id"])
+
+    @staticmethod
+    def _richer_text(current: str, candidate: str) -> str:
+        if candidate and len(candidate.strip()) > len((current or "").strip()):
+            return candidate
+        return current or candidate or ""
+
+    def record_job_source(
+        self,
+        job_id: int,
+        *,
+        source: str,
+        source_job_id: str | None,
+        source_url: str,
+    ) -> None:
+        """Record a discovery source once while refreshing its last-seen time."""
+        with self._conn:
+            self._record_job_source(
+                job_id,
+                source=source,
+                source_job_id=source_job_id,
+                source_url=source_url,
+            )
+
+    def _record_job_source(
+        self,
+        job_id: int,
+        *,
+        source: str,
+        source_job_id: str | None,
+        source_url: str,
+    ) -> None:
+        canonical_source_url = canonicalize_url(source_url)
+        identity_key = (
+            f"id:{source}:{source_job_id}"
+            if source_job_id
+            else f"url:{canonical_source_url}"
+        )
+        now = _now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO job_sources
+                (job_id, source, source_job_id, source_url, identity_key,
+                 first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, identity_key) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                job_id,
+                source,
+                source_job_id,
+                source_url,
+                identity_key,
+                now,
+                now,
+            ),
+        )
+
+    def list_job_sources(self, job_id: int) -> list[sqlite3.Row]:
+        """Return source provenance for a job in insertion order."""
+        return self._conn.execute(
+            "SELECT * FROM job_sources WHERE job_id = ? ORDER BY id", (job_id,)
+        ).fetchall()
+
+    def find_job_by_canonical_url(self, url: str) -> int | None:
+        """Return a job ID only when a canonical URL identifies one job."""
+        matching_ids = self._find_job_ids_by_canonical_url(url)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    def _find_job_ids_by_canonical_url(self, url: str) -> list[int]:
+        return self._find_job_ids(
+            "SELECT id FROM jobs WHERE canonical_url = ? ORDER BY id",
+            (canonicalize_url(url),),
+        )
+
+    def find_job_by_ats(
+        self, provider: str, board: str, job_id: str | None
+    ) -> int | None:
+        """Return a job ID only when an ATS tuple identifies one job."""
+        if not job_id:
+            return None
+        matching_ids = self._find_job_ids_by_ats(provider, board, job_id)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    def _find_job_ids_by_ats(
+        self, provider: str, board: str, job_id: str
+    ) -> list[int]:
+        return self._find_job_ids(
+            """
+            SELECT id FROM jobs
+            WHERE ats_provider = ? AND ats_board = ? AND ats_job_id = ?
+            ORDER BY id
+            """,
+            (provider, board, job_id),
+        )
+
+    def find_job_by_identity(
+        self, company: str, title: str, location: str
+    ) -> int | None:
+        """Return a job ID only for one normalized company/title/location match."""
+        matching_ids = self._find_job_ids_by_identity(company, title, location)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    def _find_job_ids_by_identity(
+        self, company: str, title: str, location: str
+    ) -> list[int]:
+        """Return all normalized identity matches only when locations agree."""
+        company_key = normalize_company_name(company)
+        title_key = normalize_job_title(title)
+        if not company_key or not title_key:
+            return []
+        matching_rows = [
+            row
+            for row in self._conn.execute("SELECT id, company, title, location FROM jobs")
+            if normalize_company_name(row["company"]) == company_key
+            and normalize_job_title(row["title"]) == title_key
+            and locations_compatible(location, row["location"])
+        ]
+        if any(
+            not locations_compatible(left["location"], right["location"])
+            for index, left in enumerate(matching_rows)
+            for right in matching_rows[index + 1 :]
+        ):
+            return []
+        return [row["id"] for row in matching_rows]
+
+    def _find_job_ids(
+        self, query: str, parameters: tuple[str, ...]
+    ) -> list[int]:
+        return [
+            row["id"] for row in self._conn.execute(query, parameters).fetchall()
+        ]
+
+    def _find_single_job_id(
+        self, query: str, parameters: tuple[str, ...]
+    ) -> int | None:
+        matching_ids = self._find_job_ids(query, parameters)
+        return matching_ids[0] if len(matching_ids) == 1 else None
+
+    # ------------------------------------------------------------------
+    # Company watch operations
+    # ------------------------------------------------------------------
+
+    def upsert_company_watch(
+        self,
+        *,
+        company_name: str,
+        careers_url: str,
+        ats_provider: str | None,
+        ats_identifier: str | None,
+        discovered_from_job_id: int | None,
+        promotion_source: str,
+        confidence: float,
+    ) -> int:
+        """Insert or safely upgrade one normalized company watch target.
+
+        Supported ATS targets outrank generic URLs, which outrank company-only
+        entries. Equal-strength replacements require greater confidence, and a
+        manual promotion source is never downgraded to automatic.
+        """
+        normalized_name = normalize_company_name(company_name)
+        if not normalized_name:
+            raise ValueError("company_name must normalize to a non-empty value")
+
+        provider = (ats_provider or "").strip().lower() or None
+        identifier = (ats_identifier or "").strip() or None
+        careers_url = (careers_url or "").strip()
+        now = _now_iso()
+
+        with self._conn:
+            insert = self._conn.execute(
+                """
+                INSERT INTO company_watch
+                    (company_name, normalized_company_name, careers_url,
+                     ats_provider, ats_identifier, discovered_from_job_id,
+                     promotion_source, confidence, first_seen_at,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_company_name) DO NOTHING
+                """,
+                (
+                    company_name,
+                    normalized_name,
+                    careers_url,
+                    provider,
+                    identifier,
+                    discovered_from_job_id,
+                    promotion_source,
+                    confidence,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            if insert.rowcount == 1:
+                return int(insert.lastrowid)
+
+            row = self._conn.execute(
+                "SELECT * FROM company_watch WHERE normalized_company_name = ?",
+                (normalized_name,),
+            ).fetchone()
+
+            existing_strength = self._watch_endpoint_strength(
+                row["careers_url"], row["ats_provider"], row["ats_identifier"]
+            )
+            candidate_strength = self._watch_endpoint_strength(
+                careers_url, provider, identifier
+            )
+            replace_target = candidate_strength > existing_strength or (
+                candidate_strength == existing_strength
+                and confidence > row["confidence"]
+            )
+            retained_source = (
+                "manual"
+                if row["promotion_source"] == "manual" or promotion_source == "manual"
+                else "automatic"
+            )
+            self._conn.execute(
+                """
+                UPDATE company_watch SET
+                    careers_url = ?,
+                    ats_provider = ?,
+                    ats_identifier = ?,
+                    discovered_from_job_id = COALESCE(?, discovered_from_job_id),
+                    promotion_source = ?,
+                    confidence = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    careers_url if replace_target else row["careers_url"],
+                    provider if replace_target else row["ats_provider"],
+                    identifier if replace_target else row["ats_identifier"],
+                    discovered_from_job_id,
+                    retained_source,
+                    confidence if replace_target else row["confidence"],
+                    now,
+                    row["id"],
+                ),
+            )
+            return int(row["id"])
+
+    def get_company_watch(self, company_name: str) -> sqlite3.Row | None:
+        """Return the normalized company watch row, if one exists."""
+        normalized_name = normalize_company_name(company_name)
+        if not normalized_name:
+            return None
+        return self._conn.execute(
+            "SELECT * FROM company_watch WHERE normalized_company_name = ?",
+            (normalized_name,),
+        ).fetchone()
+
+    def list_due_company_watches(self, now: datetime) -> list[sqlite3.Row]:
+        """Return active watch targets whose health pause has expired."""
+        timestamp = _normalize_utc(now).isoformat()
+        return self._conn.execute(
+            """
+            SELECT * FROM company_watch
+            WHERE active = 1
+              AND (
+                  paused_until IS NULL
+                  OR julianday(paused_until) <= julianday(?)
+              )
+            ORDER BY id
+            """,
+            (timestamp,),
+        ).fetchall()
+
+    def record_watch_success(self, watch_id: int, now: datetime) -> None:
+        """Record a verified endpoint check and clear its failure backoff."""
+        timestamp = _normalize_utc(now).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE company_watch SET
+                    last_successful_check_at = ?,
+                    last_verified_at = ?,
+                    consecutive_failures = 0,
+                    paused_until = NULL,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, timestamp, timestamp, watch_id),
+            )
+
+    def record_watch_failure(self, watch_id: int, now: datetime) -> None:
+        """Increment endpoint failures and apply the deterministic 24h pause."""
+        normalized_now = _normalize_utc(now)
+        timestamp = normalized_now.isoformat()
+        paused_until = (normalized_now + timedelta(hours=24)).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE company_watch SET
+                    consecutive_failures = consecutive_failures + 1,
+                    paused_until = CASE
+                        WHEN consecutive_failures + 1 >= 3 THEN ?
+                        ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (paused_until, timestamp, watch_id),
+            )
+
+    @staticmethod
+    def _watch_endpoint_strength(
+        careers_url: str, ats_provider: str | None, ats_identifier: str | None
+    ) -> int:
+        if ats_provider in _SUPPORTED_ATS_PROVIDERS and ats_identifier:
+            return 3
+        if careers_url:
+            return 2
+        return 1
 
     def count_jobs(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()

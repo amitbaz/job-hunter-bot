@@ -1,4 +1,4 @@
-from job_hunter.fetching import extract_job_from_html
+from job_hunter.fetching import extract_job_from_html, extract_job_page_links
 
 
 def test_extracts_jobposting_json_ld():
@@ -20,3 +20,34 @@ def test_falls_back_to_page_title():
     html = '''<html><head><title>Senior Engineer at Acme</title></head><body><p>Some job description here with React</p></body></html>'''
     data = extract_job_from_html(html)
     assert data.get("title") or data.get("description")
+
+
+def test_extract_job_page_links_returns_canonical_json_ld_and_ats_anchors():
+    html = '''
+    <link rel="canonical" href="/jobs/frontend">
+    <script type="application/ld+json">
+      {"@type": "JobPosting", "url": "https://jobs.ashbyhq.com/acme/123"}
+    </script>
+    <a href="https://jobs.lever.co/acme/456">Apply</a>
+    <a href="https://example.test/careers">Careers</a>
+    '''
+
+    assert extract_job_page_links(html, "https://example.test/posting") == [
+        "https://example.test/jobs/frontend",
+        "https://jobs.ashbyhq.com/acme/123",
+        "https://jobs.lever.co/acme/456",
+    ]
+
+
+def test_extract_job_page_links_uses_nested_jobposting_url():
+    html = '''
+    <script type="application/ld+json">
+      {"@graph": [{"@type": "WebPage"}, {"@type": "JobPosting", "url": "/jobs/1"}]}
+    </script>
+    <a href="https://boards.greenhouse.io/acme/jobs/789">Apply</a>
+    '''
+
+    assert extract_job_page_links(html, "https://example.test/posting") == [
+        "https://example.test/jobs/1",
+        "https://boards.greenhouse.io/acme/jobs/789",
+    ]

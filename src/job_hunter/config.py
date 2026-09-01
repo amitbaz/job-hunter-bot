@@ -12,6 +12,7 @@ from .models import (
     DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES,
     DEFAULT_ENGINEERING_TITLE_KEYWORDS,
     DEFAULT_ENGINEERING_TITLE_PHRASES,
+    CompanyWatchSeed,
     SearchPolicy,
     Settings,
 )
@@ -68,6 +69,12 @@ def load_settings(config_path: Path) -> Settings:
         role_families=data.get("role_families", []),
         search_query_templates=data.get("search_query_templates", []),
         search_domains=data.get("search_domains", []),
+        specialist_search_domains=data.get("specialist_search_domains", []),
+        specialist_query_templates=data.get("specialist_query_templates", []),
+        yc_job_pages=data.get("yc_job_pages", []),
+        manual_company_watch=_parse_manual_company_watch(
+            data.get("manual_company_watch", [])
+        ),
         max_search_queries_per_run=data.get("max_search_queries_per_run", 30),
         engineering_title_keywords=list(
             data.get("engineering_title_keywords", DEFAULT_ENGINEERING_TITLE_KEYWORDS)
@@ -118,3 +125,58 @@ def _require_env(name: str) -> str:
     if not val:
         raise ValueError(f"Required environment variable {name!r} is not set")
     return val
+
+
+def _parse_manual_company_watch(entries: object) -> list[CompanyWatchSeed]:
+    if not isinstance(entries, list):
+        raise ValueError("manual_company_watch must be a list")
+
+    seeds: list[CompanyWatchSeed] = []
+    for index, entry in enumerate(entries):
+        if isinstance(entry, str):
+            company_name = entry.strip()
+            if not company_name:
+                raise ValueError(
+                    f"manual_company_watch[{index}].company_name "
+                    "must be a non-empty string"
+                )
+            seeds.append(CompanyWatchSeed(company_name=company_name))
+            continue
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"manual_company_watch[{index}] must be a non-empty string or mapping"
+            )
+
+        allowed_fields = {
+            "company_name",
+            "careers_url",
+            "ats_provider",
+            "ats_identifier",
+        }
+        unknown_fields = sorted(set(entry) - allowed_fields, key=str)
+        if unknown_fields:
+            raise ValueError(
+                f"manual_company_watch[{index}].{unknown_fields[0]} is not allowed"
+            )
+
+        company_name = entry.get("company_name")
+        if not isinstance(company_name, str) or not company_name.strip():
+            raise ValueError(
+                f"manual_company_watch[{index}].company_name "
+                "must be a non-empty string"
+            )
+        for field in ("careers_url", "ats_provider", "ats_identifier"):
+            value = entry.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"manual_company_watch[{index}].{field} must be a string or null"
+                )
+        seeds.append(
+            CompanyWatchSeed(
+                company_name=company_name.strip(),
+                careers_url=entry.get("careers_url", "") or "",
+                ats_provider=entry.get("ats_provider"),
+                ats_identifier=entry.get("ats_identifier"),
+            )
+        )
+    return seeds

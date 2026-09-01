@@ -1,24 +1,34 @@
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from job_hunter.gmail_models import ExtractedJob
-from job_hunter.models import CandidatePreferences, Job, RunSummary, SearchPolicy, Settings
+from job_hunter.models import (
+    CandidatePreferences,
+    CompanyWatchSeed,
+    Job,
+    RunSummary,
+    SearchPolicy,
+    Settings,
+)
 from job_hunter.pipeline import run_pipeline, should_run_scheduled
 from job_hunter.sources import GmailStagedSource
+from job_hunter.sources.company_watch import CompanyWatchSource
 from job_hunter.store import JobStore
+from job_hunter.watchlist import promote_company as persist_promoted_company
 
 
 class FakeGemini:
-    def __init__(self, *, preference_payload=None):
+    def __init__(self, *, preference_payload=None, evaluation_payload=None):
         self.model = "gemini-test"
         self.preference_calls = 0
         self.eval_calls = 0
         self.cover_letter_calls = 0
         self.preference_payload = preference_payload
+        self.evaluation_payload = evaluation_payload
 
     def generate_text(self, prompt, *, json_mode=False):
         if json_mode and "preferred_roles" in prompt:
@@ -35,7 +45,7 @@ class FakeGemini:
             return json.dumps(payload)
         if json_mode:
             self.eval_calls += 1
-            payload = {
+            payload = self.evaluation_payload or {
                 "scores": {
                     "role_seniority": 28,
                     "technical": 22,
@@ -153,6 +163,20 @@ def _job(**overrides):
     return Job(**defaults)
 
 
+def _evaluation_payload(scores, decision):
+    return {
+        "scores": scores,
+        "total_score": sum(scores.values()),
+        "hard_blockers": [],
+        "strengths": ["React expertise"],
+        "gaps": [],
+        "salary_note": "Not disclosed",
+        "location_note": "Remote EU friendly",
+        "decision": decision,
+        "rationale": "Strong fit",
+    }
+
+
 def _jobs_for_source(source: str, count: int, *, title="Senior Product Engineer", description="React TypeScript remote role"):
     return [
         _job(
@@ -239,6 +263,534 @@ def test_pipeline_delivers_strong_match_and_dedupes_within_run(settings):
     source2 = FakeSource([strong_job])
     run_pipeline(settings, sources=[source2], store=store, gemini=gemini, telegram=telegram)
     assert gemini.eval_calls == 1
+
+
+def test_pipeline_promotes_package_match_only_after_evaluation_is_persisted(
+    settings, monkeypatch, caplog
+):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini(
+        evaluation_payload=_evaluation_payload(
+            {
+                "role_seniority": 25,
+                "technical": 20,
+                "product_architecture": 15,
+                "career_direction": 7,
+                "location_language": 8,
+                "company_environment": 5,
+            },
+            "package_match",
+        )
+    )
+    promotion_calls = []
+
+    def assert_persisted_then_promote(
+        passed_store, *, job_id, job, evaluation, package_threshold
+    ):
+        assert passed_store.get_evaluation(job_id) is not None
+        promotion_calls.append((job_id, package_threshold))
+        return persist_promoted_company(
+            passed_store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=package_threshold,
+        )
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        assert_persisted_then_promote,
+        raising=False,
+    )
+
+    settings.candidate_profile = "PRIVATE_CV_TEXT"
+    job = _job(description="PRIVATE_GMAIL_BODY React TypeScript")
+    store.upsert_company_watch(
+        company_name="Healthy Watch",
+        careers_url="https://healthy.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    failing_watch_id = store.upsert_company_watch(
+        company_name="Failing Watch",
+        careers_url="https://failing.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    now = datetime.now(timezone.utc)
+    store.record_watch_failure(failing_watch_id, now)
+    store.record_watch_failure(failing_watch_id, now)
+
+    class WatchResponse:
+        text = "<html></html>"
+
+        def raise_for_status(self):
+            return None
+
+    class WatchHttp:
+        def get(self, url, **kwargs):
+            if url == "https://healthy.test/careers":
+                return WatchResponse()
+            if url == "https://failing.test/careers":
+                raise RuntimeError("watch unavailable")
+            raise AssertionError(f"unexpected request for {url}")
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[FakeSource([job])],
+            store=store,
+            gemini=gemini,
+            telegram=FakeTelegram(),
+            http=WatchHttp(),
+        )
+
+    row = store.get_company_watch("Acme")
+    assert row is not None
+    assert row["promotion_source"] == "automatic"
+    assert promotion_calls == [(1, 75)]
+    assert summary.ready_to_apply == 1
+    assert store.get_company_watch("Healthy Watch")["consecutive_failures"] == 0
+    failing_watch = store.get_company_watch("Failing Watch")
+    assert failing_watch["consecutive_failures"] == 3
+    assert failing_watch["paused_until"] is not None
+    assert "companies_promoted=1" in caplog.text
+    assert "watch_checks=2" in caplog.text
+    assert "watch_paused=1" in caplog.text
+    assert "PRIVATE_CV_TEXT" not in caplog.text
+    assert "PRIVATE_GMAIL_BODY" not in caplog.text
+
+
+def test_pipeline_aggregates_untrusted_gmail_source_labels_in_logs(settings, caplog):
+    settings.dry_run = True
+    store = JobStore(settings.db_path)
+    platform = "MODEL_PLATFORM\nPRIVATE_PLATFORM_SECRET"
+    store.stage_inbound_job(
+        "message-1",
+        "candidate-1",
+        ExtractedJob(
+            source_platform=platform,
+            company="Acme",
+            title="Senior Product Engineer",
+            location="Remote",
+            remote=True,
+            description="React TypeScript remote role",
+        ),
+    )
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[],
+            store=store,
+            gemini=FakeGemini(),
+            telegram=FakeTelegram(),
+        )
+
+    assert summary.ready_to_apply == 1
+    assert "gmail=1" in caplog.text
+    assert platform not in caplog.text
+    assert "PRIVATE_PLATFORM_SECRET" not in caplog.text
+
+
+def test_pipeline_counts_only_meaningful_company_watch_promotions(settings, caplog):
+    settings.dry_run = True
+    store = JobStore(settings.db_path)
+    watch_seeds = (
+        ("Repeat", "automatic"),
+        ("Manual", "manual"),
+        ("Upgrade", "automatic"),
+    )
+    for company_name, promotion_source in watch_seeds:
+        store.upsert_company_watch(
+            company_name=company_name,
+            careers_url="",
+            ats_provider=None,
+            ats_identifier=None,
+            discovered_from_job_id=None,
+            promotion_source=promotion_source,
+            confidence=1.0,
+        )
+    jobs = [
+        _job(company="Repeat", source_job_id="repeat"),
+        _job(company="Manual", source_job_id="manual"),
+        _job(company="New", source_job_id="new"),
+        _job(
+            company="Upgrade",
+            source_job_id="upgrade",
+            canonical_url="https://upgrade.test/careers",
+        ),
+    ]
+
+    with caplog.at_level(logging.INFO):
+        summary = run_pipeline(
+            settings,
+            sources=[FakeSource(jobs)],
+            store=store,
+            gemini=FakeGemini(),
+            telegram=FakeTelegram(),
+        )
+
+    assert summary.ready_to_apply == 4
+    assert store.get_company_watch("Repeat")["promotion_source"] == "automatic"
+    assert store.get_company_watch("Manual")["promotion_source"] == "manual"
+    assert store.get_company_watch("Upgrade")["careers_url"] == "https://upgrade.test/careers"
+    assert "companies_promoted=2" in caplog.text
+
+
+def test_pipeline_counts_a_failed_expired_watch_retry_as_a_new_pause(settings, caplog):
+    settings.dry_run = True
+    store = JobStore(settings.db_path)
+    watch_id = store.upsert_company_watch(
+        company_name="Retry Watch",
+        careers_url="https://retry.test/careers",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="manual",
+        confidence=1.0,
+    )
+    past = datetime.now(timezone.utc) - timedelta(days=2)
+    for _ in range(3):
+        store.record_watch_failure(watch_id, past)
+    previous_pause = store.get_company_watch("Retry Watch")["paused_until"]
+
+    class FailingWatchHttp:
+        def get(self, url, **kwargs):
+            raise RuntimeError("retry unavailable")
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(
+            settings,
+            sources=[],
+            store=store,
+            gemini=FakeGemini(),
+            telegram=FakeTelegram(),
+            http=FailingWatchHttp(),
+        )
+
+    watch = store.get_company_watch("Retry Watch")
+    assert watch["consecutive_failures"] == 4
+    assert watch["paused_until"] != previous_pause
+    assert "watch_checks=1" in caplog.text
+    assert "watch_paused=1" in caplog.text
+
+
+def test_pipeline_does_not_promote_possible_match(settings, monkeypatch):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini(
+        evaluation_payload=_evaluation_payload(
+            {
+                "role_seniority": 20,
+                "technical": 18,
+                "product_architecture": 14,
+                "career_direction": 6,
+                "location_language": 7,
+                "company_environment": 5,
+            },
+            "possible_match",
+        )
+    )
+    promotion_calls = []
+
+    def record_promotion_attempt(
+        passed_store, *, job_id, job, evaluation, package_threshold
+    ):
+        promotion_calls.append((job_id, package_threshold))
+        return persist_promoted_company(
+            passed_store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=package_threshold,
+        )
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        record_promotion_attempt,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=gemini,
+        telegram=FakeTelegram(),
+    )
+
+    assert store.get_company_watch("Acme") is None
+    assert promotion_calls == [(1, 75)]
+    assert summary.possible_matches == 1
+
+
+def test_pipeline_passes_configured_package_threshold_to_promotion(
+    settings, monkeypatch
+):
+    settings.policy.thresholds["package"] = 95
+    store = JobStore(settings.db_path)
+    promotion_calls = []
+
+    def record_threshold(
+        passed_store, *, job_id, job, evaluation, package_threshold
+    ):
+        promotion_calls.append(package_threshold)
+        return persist_promoted_company(
+            passed_store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=package_threshold,
+        )
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        record_threshold,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+    )
+
+    assert summary.ready_to_apply == 1
+    assert promotion_calls == [95]
+    assert store.get_company_watch("Acme") is None
+
+
+def test_pipeline_isolates_company_watch_source_failure(
+    settings, monkeypatch
+):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    attempts = []
+
+    def raise_watch_failure(self):
+        attempts.append(self)
+        raise RuntimeError("watch down")
+
+    monkeypatch.setattr(CompanyWatchSource, "discover", raise_watch_failure)
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=gemini,
+        telegram=FakeTelegram(),
+    )
+
+    assert gemini.eval_calls == 1
+    assert len(attempts) == 1
+    assert summary.ready_to_apply == 1
+    assert summary.errors == 0
+
+
+def test_pipeline_syncs_structured_manual_watch_seeds(settings):
+    settings.policy.manual_company_watch = [
+        CompanyWatchSeed(company_name="Manual Co")
+    ]
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+    )
+
+    row = store.get_company_watch("Manual Co")
+    assert row is not None
+    assert row["promotion_source"] == "manual"
+
+
+def test_pipeline_injects_resolver_for_direct_ats_canonical_metadata(settings):
+    job = _job(
+        source="remotive",
+        url="https://jobs.lever.co/acme/job-1",
+    )
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[FakeSource([job])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+        http=ExplodingHttp(),
+    )
+
+    persisted = store._conn.execute(
+        "SELECT canonical_url, ats_provider, ats_board, ats_job_id "
+        "FROM jobs WHERE id = 1"
+    ).fetchone()
+    assert persisted is not None
+    assert persisted["canonical_url"] == "https://jobs.lever.co/acme/job-1"
+    assert persisted["ats_provider"] == "lever"
+    assert persisted["ats_board"] == "acme"
+    assert persisted["ats_job_id"] == "job-1"
+
+
+def test_pipeline_uses_one_targeted_duckduckgo_query_for_canonical_resolution(
+    settings
+):
+    class Response:
+        def __init__(self, *, url, text):
+            self.url = url
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    class TargetedSearchHttp:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if url == "https://aggregator.test/jobs/1":
+                return Response(url=url, text="<html></html>")
+            if url == "https://duckduckgo.com/html/":
+                return Response(
+                    url=url,
+                    text=(
+                        '<a class="result__a" '
+                        'href="https://jobs.ashbyhq.com/acme/ats-1">'
+                        "Senior Product Engineer</a>"
+                    ),
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+    http = TargetedSearchHttp()
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[
+            FakeSource(
+                [
+                    _job(
+                        source="aggregator",
+                        url="https://aggregator.test/jobs/1",
+                    )
+                ]
+            )
+        ],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+        http=http,
+    )
+
+    persisted = store._conn.execute(
+        "SELECT canonical_url FROM jobs WHERE id = 1"
+    ).fetchone()
+    assert persisted is not None
+    assert persisted["canonical_url"] == "https://jobs.ashbyhq.com/acme/ats-1"
+    search_calls = [
+        kwargs["params"]["q"]
+        for url, kwargs in http.calls
+        if url == "https://duckduckgo.com/html/"
+    ]
+    assert len(search_calls) == 1
+    assert '"Acme"' in search_calls[0]
+    assert '"Senior Product Engineer"' in search_calls[0]
+    assert "site:jobs.ashbyhq.com" in search_calls[0]
+
+
+def test_pipeline_rejects_targeted_ats_result_for_wrong_company(settings):
+    class Response:
+        def __init__(self, *, url, text):
+            self.url = url
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+    class WrongCompanySearchHttp:
+        def get(self, url, **kwargs):
+            if url == "https://aggregator.test/jobs/1":
+                return Response(url=url, text="<html></html>")
+            if url == "https://duckduckgo.com/html/":
+                return Response(
+                    url=url,
+                    text=(
+                        '<a class="result__a" '
+                        'href="https://jobs.ashbyhq.com/wrong-company/123">'
+                        "Senior Product Engineer</a>"
+                    ),
+                )
+            raise AssertionError(f"unexpected GET {url}")
+
+    store = JobStore(settings.db_path)
+
+    run_pipeline(
+        settings,
+        sources=[
+            FakeSource(
+                [
+                    _job(
+                        source="aggregator",
+                        url="https://aggregator.test/jobs/1",
+                    )
+                ]
+            )
+        ],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=FakeTelegram(),
+        http=WrongCompanySearchHttp(),
+    )
+
+    persisted = store._conn.execute(
+        "SELECT url, canonical_url, ats_provider, ats_board, ats_job_id "
+        "FROM jobs WHERE id = 1"
+    ).fetchone()
+    assert persisted is not None
+    assert persisted["url"] == "https://aggregator.test/jobs/1"
+    assert persisted["canonical_url"] == "https://aggregator.test/jobs/1"
+    assert persisted["ats_provider"] is None
+    assert persisted["ats_board"] is None
+    assert persisted["ats_job_id"] is None
+
+
+def test_pipeline_counts_promotion_failure_but_continues_delivery(
+    settings, monkeypatch
+):
+    store = JobStore(settings.db_path)
+    telegram = FakeTelegram()
+
+    def raise_promotion_failure(*args, **kwargs):
+        raise RuntimeError("watch persistence down")
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.promote_company",
+        raise_promotion_failure,
+        raising=False,
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([_job()])],
+        store=store,
+        gemini=FakeGemini(),
+        telegram=telegram,
+    )
+
+    assert summary.errors == 1
+    assert summary.ready_to_apply == 1
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
 
 
 def test_pipeline_isolates_broken_source(settings):
