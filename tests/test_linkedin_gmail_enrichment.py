@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 
 from job_hunter.gmail_classifier import classify_email, source_candidate_key
 from job_hunter.gmail_client import GmailHistoryPage, GmailPage
+from job_hunter.gmail_linkedin_cleanup import release_legacy_blank_linkedin_jobs
 from job_hunter.gmail_models import ExtractedJob, GmailMessage
 from job_hunter.gmail_sync import GmailSyncService
 from job_hunter.models import Evaluation, Job
@@ -211,7 +212,7 @@ def test_legacy_blank_linkedin_cleanup_releases_only_safe_blank_artifacts(tmp_pa
         with_evaluation=True,
     )
 
-    released = store.release_legacy_blank_linkedin_jobs()
+    released = release_legacy_blank_linkedin_jobs(store)
 
     assert released == 1
     assert store.has_processed_gmail_message("4461012343") is False
