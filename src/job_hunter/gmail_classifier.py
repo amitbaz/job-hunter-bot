@@ -213,9 +213,13 @@ def classify_deterministically(message: GmailMessage) -> GmailClassification | N
 
 def source_candidate_key(job: ExtractedJob) -> str:
     if job.source_platform.lower() == "linkedin":
-        linkedin_job_id = job.source_job_id or _linkedin_job_id(job.url)
-        if linkedin_job_id:
-            return f"id:linkedin:{linkedin_job_id}"
+        if job.source_job_id:
+            return f"id:linkedin:{job.source_job_id}"
+        parsed = urlparse(job.url)
+        if "/comm/jobs/view/" in parsed.path.lower():
+            linkedin_job_id = _linkedin_job_id(job.url)
+            if linkedin_job_id:
+                return f"id:linkedin:{linkedin_job_id}"
     if job.url:
         return "url:" + _normalize_url(job.url)
     if job.source_job_id:
@@ -393,7 +397,15 @@ def _build_semantic_prompt(
 def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification:
     deterministic = classify_deterministically(message)
     extract_job_alert = bool(
-        deterministic is not None and deterministic.kind == "JOB_ALERT"
+        deterministic is not None
+        and deterministic.kind == "JOB_ALERT"
+        and (
+            not deterministic.jobs
+            or any(
+                job.source_platform.lower() == "linkedin" and job.source_job_id
+                for job in deterministic.jobs
+            )
+        )
     )
     if deterministic is not None and not extract_job_alert:
         return deterministic
