@@ -444,6 +444,8 @@ def run_pipeline(
                     occurred_at=row["occurred_at"],
                     subject=row["subject"],
                     rationale=row["rationale"],
+                    event_type=row["event_type"],
+                    source_message_id=row["source_message_id"],
                 )
                 for row in pending_reviews
             ]
