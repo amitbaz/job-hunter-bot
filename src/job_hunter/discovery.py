@@ -3,10 +3,12 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
+from job_hunter.canonical import CanonicalResolver
 from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
+from job_hunter.job_identity import job_fallback_identity
 from job_hunter.models import Job, SearchPolicy
-from job_hunter.normalize import canonicalize_url, normalize_text
+from job_hunter.normalize import canonicalize_url
 from job_hunter.prefilter import prefilter_job
 from job_hunter.store import JobStore
 
@@ -19,6 +21,9 @@ _ATS_HOSTS = ("jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io")
 class DiscoveryStats:
     raw: int = 0
     unique: int = 0
+    canonical_resolved: int = 0
+    canonical_unresolved: int = 0
+    cross_source_duplicates: int = 0
     prefilter_rejected: int = 0
     profession_rejected: int = 0
     eligible: int = 0
@@ -33,13 +38,20 @@ class DiscoveryResult:
 
 
 def candidate_url_key(job: Job) -> str | None:
-    if not job.url:
+    url = job.canonical_url or job.url
+    if not url:
         return None
-    return canonicalize_url(job.url)
+    return canonicalize_url(url)
 
 
 def candidate_identity_key(job: Job) -> str:
-    return "|".join(normalize_text(value) for value in (job.company, job.title, job.location))
+    return job_fallback_identity(job.company, job.title, job.location) or ""
+
+
+def candidate_ats_key(job: Job) -> tuple[str, str, str] | None:
+    if not job.ats_provider or not job.ats_board or not job.ats_job_id:
+        return None
+    return (job.ats_provider, job.ats_board, job.ats_job_id)
 
 
 def _is_ats_url(job: Job) -> bool:
@@ -72,16 +84,24 @@ def _merge_fields(richer: Job, weaker: Job) -> Job:
         richer.url = weaker.url
     if not richer.source_job_id and weaker.source_job_id:
         richer.source_job_id = weaker.source_job_id
+    if not richer.original_url and weaker.original_url:
+        richer.original_url = weaker.original_url
+    if not richer.canonical_url and weaker.canonical_url:
+        richer.canonical_url = weaker.canonical_url
+    if not richer.ats_provider and weaker.ats_provider:
+        richer.ats_provider = weaker.ats_provider
+    if not richer.ats_board and weaker.ats_board:
+        richer.ats_board = weaker.ats_board
+    if not richer.ats_job_id and weaker.ats_job_id:
+        richer.ats_job_id = weaker.ats_job_id
     return richer
 
 
 def _dedupe(jobs: list[Job]) -> list[Job]:
     """
     Collapse in-run duplicates. Two jobs are the same candidate when their
-    canonical URLs match, or (absent a matching URL) when their normalized
-    company/title/location triple matches exactly. Union-find lets a job
-    bridge both keys (e.g. an aggregator record with only a title/company
-    match to one record, and a shared canonical URL with another).
+    canonical URLs, ATS identities, or exact source-independent fallback
+    identities match. Union-find lets one record bridge multiple strong keys.
     """
     n = len(jobs)
     parent = list(range(n))
@@ -98,6 +118,7 @@ def _dedupe(jobs: list[Job]) -> list[Job]:
             parent[ra] = rb
 
     url_seen: dict[str, int] = {}
+    ats_seen: dict[tuple[str, str, str], int] = {}
     identity_seen: dict[str, int] = {}
 
     for i, job in enumerate(jobs):
@@ -108,8 +129,15 @@ def _dedupe(jobs: list[Job]) -> list[Job]:
             else:
                 url_seen[url_key] = i
 
+        ats_key = candidate_ats_key(job)
+        if ats_key:
+            if ats_key in ats_seen:
+                union(i, ats_seen[ats_key])
+            else:
+                ats_seen[ats_key] = i
+
         identity_key = candidate_identity_key(job)
-        if identity_key != "||":
+        if identity_key:
             if identity_key in identity_seen:
                 union(i, identity_seen[identity_key])
             else:
@@ -139,7 +167,14 @@ def collect_candidates(
     store: JobStore,
     http: HttpClient,
     policy: SearchPolicy,
+    resolver: CanonicalResolver | None = None,
 ) -> DiscoveryResult:
+    """Discover, canonicalize, deduplicate, persist, and prefilter jobs.
+
+    Source failures and unresolved canonical lookups remain non-fatal. When no
+    resolver is supplied, candidates retain their source URLs and canonical
+    counters stay at zero.
+    """
     stats = DiscoveryStats()
     raw_jobs: list[Job] = []
 
@@ -153,10 +188,30 @@ def collect_candidates(
         for job in jobs:
             stats.raw += 1
             stats.per_source[job.source] = stats.per_source.get(job.source, 0) + 1
+            if job.url:
+                job.original_url = job.original_url or job.url
+                if resolver is not None:
+                    resolution = resolver.resolve(job)
+                    if resolution is None:
+                        stats.canonical_unresolved += 1
+                    else:
+                        stats.canonical_resolved += 1
+                        job.canonical_url = resolution.url
+                        job.url = resolution.url
+                        if resolution.ats is not None:
+                            job.ats_provider = resolution.ats.provider
+                            job.ats_board = resolution.ats.board
+                            job.ats_job_id = resolution.ats.job_id
             raw_jobs.append(job)
+
+    # Persist every source copy before collapsing the run so provenance is
+    # retained even when only one representative continues to evaluation.
+    for job in raw_jobs:
+        store.upsert_logical_job(job)
 
     unique_jobs = _dedupe(raw_jobs)
     stats.unique = len(unique_jobs)
+    stats.cross_source_duplicates = stats.raw - stats.unique
 
     eligible: list[tuple[int, Job]] = []
     rediscovered_job_ids: list[int] = []
@@ -165,7 +220,7 @@ def collect_candidates(
         if job.url and not job.description:
             enrich_job(job, http)
 
-        job_id, _is_new, _description_changed = store.upsert_job(job)
+        job_id, _is_new, _description_changed = store.upsert_logical_job(job)
 
         if not store.needs_evaluation(job_id):
             rediscovered_job_ids.append(job_id)

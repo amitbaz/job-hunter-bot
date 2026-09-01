@@ -1,7 +1,13 @@
 import pytest
 
 from job_hunter.discovery import collect_candidates
-from job_hunter.models import Evaluation, Job, SearchPolicy
+from job_hunter.models import (
+    AtsReference,
+    CanonicalResolution,
+    Evaluation,
+    Job,
+    SearchPolicy,
+)
 from job_hunter.store import JobStore
 
 
@@ -11,6 +17,14 @@ class FakeSource:
 
     def discover(self):
         return self._jobs
+
+
+class FakeResolver:
+    def __init__(self, resolution):
+        self._resolution = resolution
+
+    def resolve(self, job):
+        return self._resolution
 
 
 class BrokenSource:
@@ -192,3 +206,84 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
 
     assert result.eligible == []
     assert result.rediscovered_job_ids == [job_id]
+
+
+def test_collect_candidates_collapses_three_sources_to_one_logical_job(store, policy):
+    sources = [
+        FakeSource(
+            [
+                Job(
+                    source=source,
+                    title="Senior Product Engineer",
+                    company="Acme",
+                    location="Berlin",
+                    url=url,
+                    description="React TypeScript",
+                    remote=True,
+                )
+            ]
+        )
+        for source, url in (
+            ("gmail:linkedin", "https://linkedin.test/1"),
+            ("yc", "https://yc.test/2"),
+            ("specialist", "https://specialist.test/3"),
+        )
+    ]
+    resolver = FakeResolver(
+        CanonicalResolution(
+            url="https://jobs.lever.co/acme/abc",
+            ats=AtsReference(provider="lever", board="acme", job_id="abc"),
+            confidence=1.0,
+            method="test",
+        )
+    )
+
+    result = collect_candidates(
+        sources,
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+    )
+
+    assert result.stats.raw == 3
+    assert result.stats.unique == 1
+    assert result.stats.canonical_resolved == 3
+    assert result.stats.canonical_unresolved == 0
+    assert result.stats.cross_source_duplicates == 2
+    assert store.count_jobs() == 1
+    job_id = result.eligible[0][0]
+    provenance = store.list_job_sources(job_id)
+    assert {row["source"] for row in provenance} == {
+        "gmail:linkedin",
+        "yc",
+        "specialist",
+    }
+    assert {row["source_url"] for row in provenance} == {
+        "https://linkedin.test/1",
+        "https://yc.test/2",
+        "https://specialist.test/3",
+    }
+
+
+def test_collect_candidates_counts_unresolved_canonical_urls(store, policy):
+    job = Job(
+        source="yc",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://yc.test/unresolved",
+        description="React TypeScript",
+        remote=True,
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(None),
+    )
+
+    assert result.stats.canonical_resolved == 0
+    assert result.stats.canonical_unresolved == 1
+    assert result.eligible[0][1].url == "https://yc.test/unresolved"

@@ -1,7 +1,7 @@
 import sqlite3
 
 from job_hunter.gmail_models import ExtractedJob
-from job_hunter.models import Evaluation, Job
+from job_hunter.models import Evaluation, Job, Material
 from job_hunter.store import JobStore
 
 
@@ -613,3 +613,138 @@ def test_candidate_emitted_when_no_existing_job_matches(tmp_path):
     assert [(row["id"], row["source_candidate_key"]) for row in rows] == [
         (candidate_id, "linkedin:1")
     ]
+
+
+def test_same_canonical_job_from_two_sources_uses_one_job_id(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    first = Job(
+        source="gmail:linkedin",
+        title="Senior Frontend Engineer",
+        company="Acme",
+        url="https://linkedin.test/1",
+        original_url="https://linkedin.test/1",
+        canonical_url="https://jobs.lever.co/acme/abc",
+        ats_provider="lever",
+        ats_board="acme",
+        ats_job_id="abc",
+    )
+    second = Job(
+        source="yc",
+        title="Senior Frontend Engineer",
+        company="Acme GmbH",
+        url="https://yc.test/2",
+        original_url="https://yc.test/2",
+        canonical_url="https://jobs.lever.co/acme/abc",
+        ats_provider="lever",
+        ats_board="acme",
+        ats_job_id="abc",
+    )
+
+    first_id, _, _ = store.upsert_logical_job(first)
+    second_id, _, _ = store.upsert_logical_job(second)
+
+    assert first_id == second_id
+    assert {row["source"] for row in store.list_job_sources(first_id)} == {
+        "gmail:linkedin",
+        "yc",
+    }
+
+
+def test_different_titles_at_same_company_do_not_merge(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    first_id, _, _ = store.upsert_logical_job(
+        Job(source="a", title="Senior Frontend Engineer", company="Acme", location="Berlin")
+    )
+    second_id, _, _ = store.upsert_logical_job(
+        Job(source="b", title="Staff Frontend Engineer", company="Acme", location="Berlin")
+    )
+    assert first_id != second_id
+
+
+def test_same_title_at_different_companies_does_not_merge(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    first_id, _, _ = store.upsert_logical_job(
+        Job(source="a", title="Senior Frontend Engineer", company="Acme", location="Berlin")
+    )
+    second_id, _, _ = store.upsert_logical_job(
+        Job(source="b", title="Senior Frontend Engineer", company="Beta", location="Berlin")
+    )
+    assert first_id != second_id
+
+
+def test_merge_jobs_preserves_associations_provenance_and_richer_fields(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    survivor_id, _, _ = store.upsert_job(
+        Job(source="gmail:linkedin", source_job_id="1", title="Frontend Engineer")
+    )
+    duplicate_id, _, _ = store.upsert_job(
+        Job(
+            source="yc",
+            source_job_id="2",
+            title="Frontend Engineer",
+            company="Acme",
+            description="A detailed React role description",
+            canonical_url="https://jobs.lever.co/acme/abc",
+            ats_provider="lever",
+            ats_board="acme",
+            ats_job_id="abc",
+        )
+    )
+    store.record_job_source(
+        survivor_id,
+        source="gmail:linkedin",
+        source_job_id="1",
+        source_url="https://linkedin.test/1",
+    )
+    store.record_job_source(
+        duplicate_id,
+        source="yc",
+        source_job_id="2",
+        source_url="https://yc.test/2",
+    )
+    store.save_application_event(
+        job_id=duplicate_id,
+        event_type="APPLIED",
+        occurred_at="2026-08-31T10:00:00+00:00",
+        source_message_id="merge-message",
+        source_thread_id=None,
+        confidence=1.0,
+        company="Acme",
+        role_title="Frontend Engineer",
+        rationale="application confirmation",
+    )
+    store.save_evaluation(duplicate_id, _evaluation(duplicate_id))
+    store.save_material(
+        duplicate_id,
+        Material(job_id=duplicate_id, cover_letter_text="Tailored letter"),
+    )
+    store.mark_delivered(duplicate_id, "telegram_message", "delivery-1")
+    now = "2026-08-31T10:00:00+00:00"
+    store._conn.execute(
+        """
+        INSERT INTO company_watch
+            (company_name, normalized_company_name, discovered_from_job_id,
+             promotion_source, confidence, first_seen_at, created_at, updated_at)
+        VALUES ('Acme', 'acme', ?, 'automatic', 1.0, ?, ?, ?)
+        """,
+        (duplicate_id, now, now, now),
+    )
+    store._conn.commit()
+
+    assert store.merge_jobs(survivor_id, duplicate_id) == survivor_id
+
+    merged = store._conn.execute("SELECT * FROM jobs WHERE id = ?", (survivor_id,)).fetchone()
+    assert merged["company"] == "Acme"
+    assert merged["description"] == "A detailed React role description"
+    assert merged["url"] == "https://jobs.lever.co/acme/abc"
+    assert merged["ats_provider"] == "lever"
+    assert store.count_jobs() == 1
+    assert {row["source"] for row in store.list_job_sources(survivor_id)} == {
+        "gmail:linkedin",
+        "yc",
+    }
+    for table in ("application_events", "evaluations", "materials", "deliveries"):
+        row = store._conn.execute(f"SELECT job_id FROM {table}").fetchone()
+        assert row["job_id"] == survivor_id
+    watch = store._conn.execute("SELECT discovered_from_job_id FROM company_watch").fetchone()
+    assert watch["discovered_from_job_id"] == survivor_id

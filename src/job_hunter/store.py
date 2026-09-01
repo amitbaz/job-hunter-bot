@@ -193,6 +193,7 @@ CREATE TABLE IF NOT EXISTS review_deliveries (
 """
 
 _DELIVERABLE_SCORE_FLOOR = 60
+_SUPPORTED_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
 
 
 def _now_iso() -> str:
@@ -349,6 +350,290 @@ class JobStore:
 
         return job_id, is_new, description_changed
 
+    def upsert_logical_job(self, job: Job) -> tuple[int, bool, bool]:
+        """Persist a source-independent logical job and its discovery provenance.
+
+        Identity is resolved from strongest to weakest exact evidence. Existing
+        rows retain richer fields, while a resolved canonical URL becomes the
+        usable job URL. The return shape matches :meth:`upsert_job`.
+        """
+        canonical_url = canonicalize_url(job.canonical_url) if job.canonical_url else ""
+        ats_provider = (job.ats_provider or "").lower()
+        fingerprint = job_fingerprint(job)
+
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            candidate_ids: list[int] = []
+
+            if canonical_url:
+                self._append_unique_id(
+                    candidate_ids, self.find_job_by_canonical_url(canonical_url)
+                )
+            if (
+                ats_provider in _SUPPORTED_ATS_PROVIDERS
+                and job.ats_board
+                and job.ats_job_id
+            ):
+                self._append_unique_id(
+                    candidate_ids,
+                    self.find_job_by_ats(ats_provider, job.ats_board, job.ats_job_id),
+                )
+            self._append_unique_id(
+                candidate_ids,
+                self.find_job_by_identity(job.company, job.title, job.location),
+            )
+            self._append_unique_id(
+                candidate_ids,
+                self._find_single_job_id(
+                    "SELECT id FROM jobs WHERE fingerprint = ?", (fingerprint,)
+                ),
+            )
+
+            if candidate_ids:
+                job_id = candidate_ids[0]
+                for duplicate_id in candidate_ids[1:]:
+                    self._merge_jobs(job_id, duplicate_id)
+                description_changed = self._update_logical_job(job_id, job)
+                is_new = False
+            else:
+                job_id = self._insert_logical_job(job, fingerprint)
+                description_changed = False
+                is_new = True
+
+            self._record_job_source(
+                job_id,
+                source=job.source or "",
+                source_job_id=job.source_job_id,
+                source_url=job.original_url or job.url or "",
+            )
+
+        return job_id, is_new, description_changed
+
+    @staticmethod
+    def _append_unique_id(ids: list[int], job_id: int | None) -> None:
+        if job_id is not None and job_id not in ids:
+            ids.append(job_id)
+
+    def _insert_logical_job(self, job: Job, fingerprint: str) -> int:
+        now = _now_iso()
+        persisted_url = job.canonical_url or job.url or ""
+        canonical_url = canonicalize_url(job.canonical_url or job.url or "")
+        remote = None if job.remote is None else int(job.remote)
+        cursor = self._conn.execute(
+            """
+            INSERT INTO jobs
+                (fingerprint, source, source_job_id, url, company, title,
+                 location, remote, description, description_hash,
+                 canonical_url, ats_provider, ats_board, ats_job_id,
+                 first_seen_at, last_seen_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+            """,
+            (
+                fingerprint,
+                job.source or "",
+                job.source_job_id,
+                persisted_url,
+                job.company or "",
+                job.title or "",
+                job.location or "",
+                remote,
+                job.description or "",
+                description_hash(job.description or ""),
+                canonical_url,
+                job.ats_provider,
+                job.ats_board,
+                job.ats_job_id,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    def _update_logical_job(self, job_id: int, job: Job) -> bool:
+        row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"job does not exist: {job_id}")
+
+        description = self._richer_text(row["description"], job.description)
+        description_changed = description_hash(description) != row["description_hash"]
+        canonical_url = canonicalize_url(job.canonical_url) if job.canonical_url else ""
+        persisted_url = job.canonical_url or row["url"] or job.url or ""
+
+        remote = row["remote"]
+        if remote is None and job.remote is not None:
+            remote = int(job.remote)
+
+        self._conn.execute(
+            """
+            UPDATE jobs SET
+                url = ?,
+                company = ?,
+                title = ?,
+                location = ?,
+                remote = ?,
+                description = ?,
+                description_hash = ?,
+                canonical_url = ?,
+                ats_provider = ?,
+                ats_board = ?,
+                ats_job_id = ?,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (
+                persisted_url,
+                row["company"] or job.company or "",
+                row["title"] or job.title or "",
+                row["location"] or job.location or "",
+                remote,
+                description,
+                description_hash(description),
+                canonical_url or row["canonical_url"],
+                job.ats_provider or row["ats_provider"],
+                job.ats_board or row["ats_board"],
+                job.ats_job_id or row["ats_job_id"],
+                _now_iso(),
+                job_id,
+            ),
+        )
+        return description_changed
+
+    def merge_jobs(self, survivor_id: int, duplicate_id: int) -> int:
+        """Transactionally merge a duplicate job and all attached records."""
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            return self._merge_jobs(survivor_id, duplicate_id)
+
+    def _merge_jobs(self, survivor_id: int, duplicate_id: int) -> int:
+        if survivor_id == duplicate_id:
+            return survivor_id
+
+        survivor = self._conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (survivor_id,)
+        ).fetchone()
+        duplicate = self._conn.execute(
+            "SELECT * FROM jobs WHERE id = ?", (duplicate_id,)
+        ).fetchone()
+        if survivor is None or duplicate is None:
+            raise ValueError("survivor and duplicate jobs must both exist")
+
+        survivor_has_ats = self._has_complete_ats_identity(survivor)
+        duplicate_has_ats = self._has_complete_ats_identity(duplicate)
+        prefer_duplicate_identity = duplicate_has_ats and not survivor_has_ats
+        canonical_url = (
+            duplicate["canonical_url"]
+            if prefer_duplicate_identity
+            else survivor["canonical_url"] or duplicate["canonical_url"]
+        )
+        url = (
+            duplicate["url"]
+            if prefer_duplicate_identity
+            else survivor["url"] or duplicate["url"]
+        )
+        if prefer_duplicate_identity and canonical_url:
+            url = canonical_url
+        description = self._richer_text(
+            survivor["description"], duplicate["description"]
+        )
+
+        self._conn.execute(
+            """
+            UPDATE jobs SET
+                source = ?,
+                source_job_id = ?,
+                url = ?,
+                company = ?,
+                title = ?,
+                location = ?,
+                remote = ?,
+                description = ?,
+                description_hash = ?,
+                canonical_url = ?,
+                ats_provider = ?,
+                ats_board = ?,
+                ats_job_id = ?,
+                first_seen_at = ?,
+                last_seen_at = ?
+            WHERE id = ?
+            """,
+            (
+                survivor["source"] or duplicate["source"],
+                survivor["source_job_id"] or duplicate["source_job_id"],
+                url,
+                survivor["company"] or duplicate["company"],
+                survivor["title"] or duplicate["title"],
+                survivor["location"] or duplicate["location"],
+                survivor["remote"]
+                if survivor["remote"] is not None
+                else duplicate["remote"],
+                description,
+                description_hash(description),
+                canonical_url,
+                duplicate["ats_provider"]
+                if prefer_duplicate_identity
+                else survivor["ats_provider"] or duplicate["ats_provider"],
+                duplicate["ats_board"]
+                if prefer_duplicate_identity
+                else survivor["ats_board"] or duplicate["ats_board"],
+                duplicate["ats_job_id"]
+                if prefer_duplicate_identity
+                else survivor["ats_job_id"] or duplicate["ats_job_id"],
+                min(survivor["first_seen_at"], duplicate["first_seen_at"]),
+                max(survivor["last_seen_at"], duplicate["last_seen_at"]),
+                survivor_id,
+            ),
+        )
+
+        for source in self._conn.execute(
+            "SELECT * FROM job_sources WHERE job_id = ? ORDER BY id", (duplicate_id,)
+        ).fetchall():
+            self._conn.execute(
+                """
+                INSERT INTO job_sources
+                    (job_id, source, source_job_id, source_url, identity_key,
+                     first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id, identity_key) DO UPDATE SET
+                    first_seen_at = MIN(first_seen_at, excluded.first_seen_at),
+                    last_seen_at = MAX(last_seen_at, excluded.last_seen_at)
+                """,
+                (
+                    survivor_id,
+                    source["source"],
+                    source["source_job_id"],
+                    source["source_url"],
+                    source["identity_key"],
+                    source["first_seen_at"],
+                    source["last_seen_at"],
+                ),
+            )
+        self._conn.execute("DELETE FROM job_sources WHERE job_id = ?", (duplicate_id,))
+
+        for table in ("application_events", "materials", "deliveries", "evaluations"):
+            self._conn.execute(
+                f"UPDATE {table} SET job_id = ? WHERE job_id = ?",
+                (survivor_id, duplicate_id),
+            )
+        self._conn.execute(
+            """
+            UPDATE company_watch SET discovered_from_job_id = ?
+            WHERE discovered_from_job_id = ?
+            """,
+            (survivor_id, duplicate_id),
+        )
+        self._conn.execute("DELETE FROM jobs WHERE id = ?", (duplicate_id,))
+        return survivor_id
+
+    @staticmethod
+    def _has_complete_ats_identity(row: sqlite3.Row) -> bool:
+        return bool(row["ats_provider"] and row["ats_board"] and row["ats_job_id"])
+
+    @staticmethod
+    def _richer_text(current: str, candidate: str) -> str:
+        if candidate and len(candidate.strip()) > len((current or "").strip()):
+            return candidate
+        return current or candidate or ""
+
     def record_job_source(
         self,
         job_id: int,
@@ -358,6 +643,22 @@ class JobStore:
         source_url: str,
     ) -> None:
         """Record a discovery source once while refreshing its last-seen time."""
+        with self._conn:
+            self._record_job_source(
+                job_id,
+                source=source,
+                source_job_id=source_job_id,
+                source_url=source_url,
+            )
+
+    def _record_job_source(
+        self,
+        job_id: int,
+        *,
+        source: str,
+        source_job_id: str | None,
+        source_url: str,
+    ) -> None:
         canonical_source_url = canonicalize_url(source_url)
         identity_key = (
             f"id:{source}:{source_job_id}"
@@ -365,26 +666,25 @@ class JobStore:
             else f"url:{canonical_source_url}"
         )
         now = _now_iso()
-        with self._conn:
-            self._conn.execute(
-                """
-                INSERT INTO job_sources
-                    (job_id, source, source_job_id, source_url, identity_key,
-                     first_seen_at, last_seen_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id, identity_key) DO UPDATE SET
-                    last_seen_at = excluded.last_seen_at
-                """,
-                (
-                    job_id,
-                    source,
-                    source_job_id,
-                    source_url,
-                    identity_key,
-                    now,
-                    now,
-                ),
-            )
+        self._conn.execute(
+            """
+            INSERT INTO job_sources
+                (job_id, source, source_job_id, source_url, identity_key,
+                 first_seen_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id, identity_key) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at
+            """,
+            (
+                job_id,
+                source,
+                source_job_id,
+                source_url,
+                identity_key,
+                now,
+                now,
+            ),
+        )
 
     def list_job_sources(self, job_id: int) -> list[sqlite3.Row]:
         """Return source provenance for a job in insertion order."""
