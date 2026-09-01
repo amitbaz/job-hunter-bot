@@ -1,24 +1,19 @@
-from pathlib import Path
-
 from job_hunter.config import WebhookSettings
-from job_hunter.github_state import ArtifactStateSnapshot
 from job_hunter.models import NavigationCard, NavigationSession
-from job_hunter.navigation_store import create_navigation_session
-from job_hunter.store import JobStore
 from job_hunter.telegram_webhook import create_app
 
 
-class FakeStateLoader:
-    def __init__(self, snapshot=None, error=None):
-        self.snapshot = snapshot
+class FakeNavigationRepository:
+    def __init__(self, session=None, error=None):
+        self.session = session
         self.error = error
-        self.calls = 0
+        self.calls = []
 
-    def load_latest(self):
-        self.calls += 1
+    def get_session(self, session_id):
+        self.calls.append(session_id)
         if self.error is not None:
             raise self.error
-        return self.snapshot
+        return self.session
 
 
 class FakeTelegram:
@@ -46,23 +41,17 @@ def _settings():
     )
 
 
-def _snapshot_with_session(tmp_path: Path):
-    db = tmp_path / "job_hunter.sqlite3"
-    with JobStore(db) as store:
-        create_navigation_session(
-            store,
-            NavigationSession(
-                session_id="session1",
-                cards=[
-                    NavigationCard(1, "Senior A", "Acme", "Berlin", 91, "https://example.test/a"),
-                    NavigationCard(2, "Senior B", "Beta", "Remote", 88, "https://example.test/b"),
-                ],
-                telegram_message_id="99",
-                created_at="2026-09-01T00:00:00+00:00",
-                expires_at="2099-01-01T00:00:00+00:00",
-            ),
-        )
-    return ArtifactStateSnapshot(artifact_id=7, path=db, created_at="2026-09-01T00:00:00Z")
+def _session():
+    return NavigationSession(
+        session_id="session1",
+        cards=[
+            NavigationCard(1, "Senior A", "Acme", "Berlin", 91, "https://example.test/a"),
+            NavigationCard(2, "Senior B", "Beta", "Remote", 88, "https://example.test/b"),
+        ],
+        telegram_message_id="99",
+        created_at="2026-09-01T00:00:00+00:00",
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
 
 
 def _callback_update(data="n|session1|1"):
@@ -76,10 +65,10 @@ def _callback_update(data="n|session1|1"):
     }
 
 
-def test_health_endpoint_does_not_require_secret(tmp_path):
+def test_health_endpoint_does_not_require_secret():
     app = create_app(
         settings=_settings(),
-        state_loader=FakeStateLoader(),
+        navigation_repository=FakeNavigationRepository(),
         telegram=FakeTelegram(),
     )
     response = app.test_client().get("/health")
@@ -87,10 +76,10 @@ def test_health_endpoint_does_not_require_secret(tmp_path):
     assert response.get_json() == {"ok": True}
 
 
-def test_webhook_rejects_wrong_secret_before_loading_state(tmp_path):
-    loader = FakeStateLoader(_snapshot_with_session(tmp_path))
+def test_webhook_rejects_wrong_secret_before_repository_access():
+    repository = FakeNavigationRepository(_session())
     telegram = FakeTelegram()
-    app = create_app(settings=_settings(), state_loader=loader, telegram=telegram)
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
 
     response = app.test_client().post(
         "/telegram/webhook",
@@ -99,14 +88,14 @@ def test_webhook_rejects_wrong_secret_before_loading_state(tmp_path):
     )
 
     assert response.status_code == 403
-    assert loader.calls == 0
+    assert repository.calls == []
     assert telegram.edits == []
 
 
-def test_webhook_navigation_loads_latest_artifact_and_edits_card(tmp_path):
-    loader = FakeStateLoader(_snapshot_with_session(tmp_path))
+def test_webhook_navigation_reads_repository_and_edits_card():
+    repository = FakeNavigationRepository(_session())
     telegram = FakeTelegram()
-    app = create_app(settings=_settings(), state_loader=loader, telegram=telegram)
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
 
     response = app.test_client().post(
         "/telegram/webhook",
@@ -115,16 +104,16 @@ def test_webhook_navigation_loads_latest_artifact_and_edits_card(tmp_path):
     )
 
     assert response.status_code == 200
-    assert loader.calls == 1
+    assert repository.calls == ["session1"]
     assert telegram.edits[0][0:2] == ("123", "99")
     assert "Company: Beta" in telegram.edits[0][2]
     assert telegram.answers[-1] == ("cb-1", None, False)
 
 
-def test_apply_callback_does_not_need_artifact_state():
-    loader = FakeStateLoader(error=AssertionError("state should not load"))
+def test_apply_callback_does_not_need_repository():
+    repository = FakeNavigationRepository(error=AssertionError("repository should not load"))
     telegram = FakeTelegram()
-    app = create_app(settings=_settings(), state_loader=loader, telegram=telegram)
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
 
     response = app.test_client().post(
         "/telegram/webhook",
@@ -133,17 +122,29 @@ def test_apply_callback_does_not_need_artifact_state():
     )
 
     assert response.status_code == 200
-    assert loader.calls == 0
+    assert repository.calls == []
     assert telegram.answers[-1][1] == "Apply functionality coming soon."
 
 
-def test_webhook_missing_session_reports_syncing(tmp_path):
-    db = tmp_path / "job_hunter.sqlite3"
-    with JobStore(db):
-        pass
-    loader = FakeStateLoader(ArtifactStateSnapshot(1, db, "2026-09-01T00:00:00Z"))
+def test_noop_callback_does_not_need_repository():
+    repository = FakeNavigationRepository(error=AssertionError("repository should not load"))
     telegram = FakeTelegram()
-    app = create_app(settings=_settings(), state_loader=loader, telegram=telegram)
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
+
+    response = app.test_client().post(
+        "/telegram/webhook",
+        json=_callback_update("x|session1|0"),
+        headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+    )
+
+    assert response.status_code == 200
+    assert repository.calls == []
+
+
+def test_webhook_missing_session_reports_syncing():
+    repository = FakeNavigationRepository(session=None)
+    telegram = FakeTelegram()
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
 
     response = app.test_client().post(
         "/telegram/webhook",
@@ -152,13 +153,14 @@ def test_webhook_missing_session_reports_syncing(tmp_path):
     )
 
     assert response.status_code == 200
+    assert repository.calls == ["session1"]
     assert telegram.answers[-1][1] == "Job list is still syncing. Try again shortly."
 
 
-def test_webhook_artifact_failure_is_acknowledged():
-    loader = FakeStateLoader(error=RuntimeError("github unavailable"))
+def test_webhook_repository_failure_is_acknowledged():
+    repository = FakeNavigationRepository(error=RuntimeError("github unavailable"))
     telegram = FakeTelegram()
-    app = create_app(settings=_settings(), state_loader=loader, telegram=telegram)
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
 
     response = app.test_client().post(
         "/telegram/webhook",
@@ -171,9 +173,9 @@ def test_webhook_artifact_failure_is_acknowledged():
 
 
 def test_webhook_ignores_non_callback_updates():
-    loader = FakeStateLoader(error=AssertionError("state should not load"))
+    repository = FakeNavigationRepository(error=AssertionError("repository should not load"))
     telegram = FakeTelegram()
-    app = create_app(settings=_settings(), state_loader=loader, telegram=telegram)
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
 
     response = app.test_client().post(
         "/telegram/webhook",
@@ -182,4 +184,4 @@ def test_webhook_ignores_non_callback_updates():
     )
 
     assert response.status_code == 200
-    assert loader.calls == 0
+    assert repository.calls == []
