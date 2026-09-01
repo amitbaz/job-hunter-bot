@@ -144,9 +144,13 @@ def _seed_linkedin_candidate(
     key: str,
     company: str,
     title: str,
+    job_company: str | None = None,
+    job_title: str | None = None,
     with_evaluation: bool = False,
 ) -> int:
     url = f"https://www.linkedin.com/jobs/view/{message_id}/?trackingId=legacy"
+    materialized_company = company if job_company is None else job_company
+    materialized_title = title if job_title is None else job_title
     _record_alert(store, message_id)
     store.stage_inbound_job(
         message_id,
@@ -163,8 +167,8 @@ def _seed_linkedin_candidate(
             source="gmail:linkedin",
             source_job_id=key,
             url=url,
-            company=company,
-            title=title,
+            company=materialized_company,
+            title=materialized_title,
         )
     )
     if with_evaluation:
@@ -228,6 +232,64 @@ def test_legacy_blank_linkedin_cleanup_releases_only_safe_blank_artifacts(tmp_pa
         )
     }
     assert remaining_messages == {"4461012344", "4461012345"}
+
+
+def test_legacy_sign_in_linkedin_cleanup_releases_safe_poisoned_artifact(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id = _seed_linkedin_candidate(
+        store,
+        message_id="4461012350",
+        key="url:legacy-sign-in",
+        company="",
+        title="",
+        job_company="",
+        job_title="  SIGN IN  ",
+    )
+
+    released = release_legacy_blank_linkedin_jobs(store)
+
+    assert released == 1
+    assert store.has_processed_gmail_message("4461012350") is False
+    assert store.get_job(job_id) is None
+
+
+def test_legacy_sign_in_linkedin_cleanup_preserves_dependent_artifact(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id = _seed_linkedin_candidate(
+        store,
+        message_id="4461012351",
+        key="url:dependent-sign-in",
+        company="",
+        title="",
+        job_company="",
+        job_title="Sign in",
+        with_evaluation=True,
+    )
+
+    released = release_legacy_blank_linkedin_jobs(store)
+
+    assert released == 0
+    assert store.has_processed_gmail_message("4461012351") is True
+    assert store.get_job(job_id) is not None
+
+
+def test_legacy_sign_in_linkedin_cleanup_preserves_nonempty_company(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id = _seed_linkedin_candidate(
+        store,
+        message_id="4461012352",
+        key="url:company-sign-in",
+        company="",
+        title="",
+        job_company="Example",
+        job_title="Sign in",
+    )
+
+    released = release_legacy_blank_linkedin_jobs(store)
+
+    assert released == 0
+    assert store.has_processed_gmail_message("4461012352") is True
+    assert store.get_job(job_id) is not None
 
 
 def test_writable_sync_reopens_completed_backfill_after_blank_linkedin_cleanup(tmp_path):
