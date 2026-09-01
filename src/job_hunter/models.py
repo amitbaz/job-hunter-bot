@@ -160,6 +160,18 @@ class CandidatePreferences:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateContextCacheEntry:
+    """A cached, JSON-backed candidate context and its cache identity."""
+
+    cache_key: str
+    profile_hash: str
+    model: str
+    schema_version: str
+    context: dict
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
 class GeminiQuotaSettings:
     rpm: int
     tpm: int

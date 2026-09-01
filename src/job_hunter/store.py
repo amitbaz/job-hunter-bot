@@ -15,7 +15,7 @@ from job_hunter.job_identity import (
     normalize_company_name,
     normalize_job_title,
 )
-from job_hunter.models import Evaluation, Job, Material
+from job_hunter.models import CandidateContextCacheEntry, Evaluation, Job, Material
 from job_hunter.normalize import (
     canonicalize_url,
     description_hash,
@@ -122,6 +122,55 @@ CREATE TABLE IF NOT EXISTS deliveries (
     status              TEXT    NOT NULL DEFAULT 'sent',
     delivered_at        TEXT    NOT NULL,
     telegram_message_id TEXT
+)
+"""
+
+_CREATE_GEMINI_USAGE = """
+CREATE TABLE IF NOT EXISTS gemini_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    occurred_at TEXT NOT NULL,
+    run_id TEXT,
+    model TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    status TEXT NOT NULL,
+    estimated_input_tokens INTEGER NOT NULL DEFAULT 0,
+    prompt_tokens INTEGER,
+    output_tokens INTEGER,
+    thinking_tokens INTEGER,
+    cached_tokens INTEGER,
+    total_tokens INTEGER,
+    http_status INTEGER,
+    error_code TEXT
+)
+"""
+
+_CREATE_GEMINI_QUOTA_STATE = """
+CREATE TABLE IF NOT EXISTS gemini_quota_state (
+    model TEXT PRIMARY KEY,
+    paused_until TEXT,
+    reason TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL
+)
+"""
+
+_CREATE_CANDIDATE_CONTEXT_CACHE = """
+CREATE TABLE IF NOT EXISTS candidate_context_cache (
+    cache_key TEXT PRIMARY KEY,
+    profile_hash TEXT NOT NULL,
+    model TEXT NOT NULL,
+    schema_version TEXT NOT NULL,
+    context_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+_CREATE_PENDING_AI_WORK = """
+CREATE TABLE IF NOT EXISTS pending_ai_work (
+    work_type TEXT NOT NULL,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(work_type, job_id)
 )
 """
 
@@ -245,6 +294,10 @@ class JobStore:
             self._conn.execute(_CREATE_EVALUATIONS)
             self._conn.execute(_CREATE_MATERIALS)
             self._conn.execute(_CREATE_DELIVERIES)
+            self._conn.execute(_CREATE_GEMINI_USAGE)
+            self._conn.execute(_CREATE_GEMINI_QUOTA_STATE)
+            self._conn.execute(_CREATE_CANDIDATE_CONTEXT_CACHE)
+            self._conn.execute(_CREATE_PENDING_AI_WORK)
             self._conn.execute(_CREATE_GMAIL_SYNC_STATE)
             self._conn.execute(_CREATE_GMAIL_MESSAGES)
             self._conn.execute(_CREATE_INBOUND_JOB_CANDIDATES)
@@ -258,6 +311,192 @@ class JobStore:
         for name, definition in _R2_JOB_COLUMNS.items():
             if name not in columns:
                 self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+
+    # ------------------------------------------------------------------
+    # Gemini persistence
+    # ------------------------------------------------------------------
+
+    def record_gemini_usage(
+        self,
+        *,
+        occurred_at: str,
+        run_id: str | None,
+        model: str,
+        purpose: str,
+        status: str,
+        estimated_input_tokens: int,
+        prompt_tokens: int | None = None,
+        output_tokens: int | None = None,
+        thinking_tokens: int | None = None,
+        cached_tokens: int | None = None,
+        total_tokens: int | None = None,
+        http_status: int | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        """Record one Gemini attempt without persisting request or response content."""
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO gemini_usage (
+                    occurred_at, run_id, model, purpose, status,
+                    estimated_input_tokens, prompt_tokens, output_tokens,
+                    thinking_tokens, cached_tokens, total_tokens, http_status,
+                    error_code
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    occurred_at,
+                    run_id,
+                    model,
+                    purpose,
+                    status,
+                    estimated_input_tokens,
+                    prompt_tokens,
+                    output_tokens,
+                    thinking_tokens,
+                    cached_tokens,
+                    total_tokens,
+                    http_status,
+                    error_code,
+                ),
+            )
+
+    def gemini_usage_rows(
+        self,
+        start_at: str,
+        end_at: str,
+        *,
+        model: str | None = None,
+        run_id: str | None = None,
+    ) -> list[sqlite3.Row]:
+        """Return Gemini ledger rows in the half-open time range [start_at, end_at)."""
+        clauses = ["occurred_at >= ?", "occurred_at < ?"]
+        parameters: list[str] = [start_at, end_at]
+        if model is not None:
+            clauses.append("model = ?")
+            parameters.append(model)
+        if run_id is not None:
+            clauses.append("run_id = ?")
+            parameters.append(run_id)
+        return self._conn.execute(
+            f"SELECT * FROM gemini_usage WHERE {' AND '.join(clauses)} "
+            "ORDER BY occurred_at, id",
+            parameters,
+        ).fetchall()
+
+    def set_gemini_pause(
+        self, model: str, paused_until: str | None, reason: str
+    ) -> None:
+        """Persist the active quota pause for a Gemini model."""
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO gemini_quota_state (model, paused_until, reason, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(model) DO UPDATE SET
+                    paused_until = excluded.paused_until,
+                    reason = excluded.reason,
+                    updated_at = excluded.updated_at
+                """,
+                (model, paused_until, reason, _now_iso()),
+            )
+
+    def get_gemini_pause(self, model: str) -> sqlite3.Row | None:
+        """Return the persisted quota pause for a model, if present."""
+        return self._conn.execute(
+            "SELECT * FROM gemini_quota_state WHERE model = ?", (model,)
+        ).fetchone()
+
+    def clear_gemini_pause(self, model: str) -> None:
+        """Remove a model's persisted quota pause."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM gemini_quota_state WHERE model = ?", (model,)
+            )
+
+    def get_candidate_context(self, cache_key: str) -> CandidateContextCacheEntry | None:
+        """Return a cached candidate context, decoding its stored JSON payload."""
+        row = self._conn.execute(
+            "SELECT * FROM candidate_context_cache WHERE cache_key = ?", (cache_key,)
+        ).fetchone()
+        if row is None:
+            return None
+        return CandidateContextCacheEntry(
+            cache_key=row["cache_key"],
+            profile_hash=row["profile_hash"],
+            model=row["model"],
+            schema_version=row["schema_version"],
+            context=json.loads(row["context_json"]),
+            created_at=row["created_at"],
+        )
+
+    def save_candidate_context(
+        self,
+        *,
+        cache_key: str,
+        profile_hash: str,
+        model: str,
+        schema_version: str,
+        context: dict,
+    ) -> None:
+        """Persist a structured candidate context under its cache identity."""
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO candidate_context_cache
+                    (cache_key, profile_hash, model, schema_version, context_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    profile_hash = excluded.profile_hash,
+                    model = excluded.model,
+                    schema_version = excluded.schema_version,
+                    context_json = excluded.context_json,
+                    created_at = excluded.created_at
+                """,
+                (
+                    cache_key,
+                    profile_hash,
+                    model,
+                    schema_version,
+                    json.dumps(context),
+                    _now_iso(),
+                ),
+            )
+
+    def enqueue_ai_work(self, work_type: str, job_id: int) -> None:
+        """Idempotently enqueue deferred AI work and refresh its retry timestamp."""
+        now = _now_iso()
+        with self._conn:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+            self._conn.execute(
+                """
+                INSERT INTO pending_ai_work (work_type, job_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(work_type, job_id) DO UPDATE SET
+                    updated_at = excluded.updated_at
+                """,
+                (work_type, job_id, now, now),
+            )
+
+    def list_pending_ai_work(self, work_type: str) -> list[sqlite3.Row]:
+        """Return pending rows for one AI-work category in stable retry order."""
+        return self._conn.execute(
+            """
+            SELECT * FROM pending_ai_work
+            WHERE work_type = ?
+            ORDER BY created_at, job_id
+            """,
+            (work_type,),
+        ).fetchall()
+
+    def complete_ai_work(self, work_type: str, job_id: int) -> None:
+        """Remove a completed deferred AI-work item."""
+        with self._conn:
+            self._conn.execute(
+                "DELETE FROM pending_ai_work WHERE work_type = ? AND job_id = ?",
+                (work_type, job_id),
+            )
 
     # ------------------------------------------------------------------
     # Job operations
