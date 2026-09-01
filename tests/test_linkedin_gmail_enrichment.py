@@ -20,7 +20,13 @@ class ResponseGemini:
         self.response = response
         self.calls: list[str] = []
 
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         self.calls.append(prompt)
         return json.dumps(self.response)
 
