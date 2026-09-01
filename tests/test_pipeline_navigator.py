@@ -170,7 +170,7 @@ def test_pipeline_failed_navigator_send_keeps_jobs_pending(tmp_path):
     assert job_id in store.pending_delivery_job_ids()
 
 
-def test_pipeline_with_no_deliverable_jobs_sends_placeholder_only(tmp_path):
+def test_pipeline_with_no_deliverable_jobs_sends_nothing(tmp_path):
     settings = _settings(tmp_path)
     store = JobStore(settings.db_path)
     telegram = NavigatorTelegram()
@@ -192,4 +192,4 @@ def test_pipeline_with_no_deliverable_jobs_sends_placeholder_only(tmp_path):
     )
 
     assert telegram.cards == []
-    assert telegram.messages == ["No matching jobs today."]
+    assert telegram.messages == []
