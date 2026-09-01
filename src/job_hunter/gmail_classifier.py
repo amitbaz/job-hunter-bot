@@ -41,6 +41,48 @@ _JOB_FIELDS = frozenset(
         "description",
     }
 )
+_GMAIL_CLASSIFICATION_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "kind": {"type": "STRING", "enum": sorted(SUPPORTED_KINDS)},
+        "confidence": {"type": "NUMBER", "minimum": 0, "maximum": 1},
+        "company": {"type": "STRING", "nullable": True},
+        "role_title": {"type": "STRING", "nullable": True},
+        "source_job_id": {"type": "STRING", "nullable": True},
+        "job_urls": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+        },
+        "jobs": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "source_platform": {"type": "STRING"},
+                    "source_job_id": {"type": "STRING", "nullable": True},
+                    "url": {"type": "STRING"},
+                    "company": {"type": "STRING", "nullable": True},
+                    "title": {"type": "STRING", "nullable": True},
+                    "location": {"type": "STRING", "nullable": True},
+                    "remote": {"type": "BOOLEAN", "nullable": True},
+                    "description": {"type": "STRING", "nullable": True},
+                },
+                "required": [
+                    "source_platform",
+                    "source_job_id",
+                    "url",
+                    "company",
+                    "title",
+                    "location",
+                    "remote",
+                    "description",
+                ],
+            },
+        },
+        "rationale": {"type": "STRING"},
+    },
+    "required": ["kind", "confidence", "rationale"],
+}
 _SCHEMA_INSTRUCTION = """Return one JSON object only with keys:
 kind, confidence, company, role_title, source_job_id, job_urls, jobs, rationale.
 kind must be one of JOB_ALERT, RECRUITER_CONTACT, APPLIED, INTERVIEW, TECHNICAL, OFFER, REJECTED, REVIEW_NEEDED, IRRELEVANT.
@@ -302,11 +344,11 @@ def _parse_jobs(values: object) -> list[ExtractedJob]:
                 source_platform=source_platform,
                 source_job_id=source_job_id,
                 url=normalized_url,
-                company=_validate_string(value, "company"),
-                title=_validate_string(value, "title"),
-                location=_validate_string(value, "location"),
+                company=_optional_text(value, "company"),
+                title=_optional_text(value, "title"),
+                location=_optional_text(value, "location"),
                 remote=remote,
-                description=_validate_string(value, "description"),
+                description=_optional_text(value, "description"),
                 index=index,
             )
         )
@@ -419,6 +461,7 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
                 extract_job_alert=extract_job_alert,
             ),
             json_mode=True,
+            json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
         )
     except Exception as exc:
         raise SemanticClassificationError("gemini_error") from exc
