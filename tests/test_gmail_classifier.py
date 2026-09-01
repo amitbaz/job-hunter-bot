@@ -217,15 +217,27 @@ def test_source_candidate_key_uses_url_id_then_normalized_fallback(job, expected
 class FakeGemini:
     def __init__(self, response: str) -> None:
         self.response = response
-        self.calls: list[tuple[str, bool]] = []
+        self.calls: list[tuple[str, bool, dict | None]] = []
 
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
-        self.calls.append((prompt, json_mode))
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
+        self.calls.append((prompt, json_mode, json_schema))
         return self.response
 
 
 class FailingGemini:
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         raise RuntimeError("provider unavailable")
 
 
@@ -273,6 +285,88 @@ def test_confident_semantic_recruiter_outreach_accepts_gemini_identified_job_url
     assert result.confidence == 0.96
     assert result.job_urls == ["https://jobs.acme.example/frontend"]
     assert [job.url for job in result.jobs] == ["https://jobs.acme.example/frontend"]
+
+
+def test_semantic_classification_requests_response_schema():
+    gemini = FakeGemini(semantic_response(job_urls=[], jobs=[]))
+
+    classify_email(
+        message("Hiring conversation", "Can we discuss a frontend role?"),
+        gemini,
+    )
+
+    _, json_mode, schema = gemini.calls[0]
+    assert json_mode is True
+    assert schema is not None
+    assert schema["type"] == "OBJECT"
+    assert "JOB_ALERT" in schema["properties"]["kind"]["enum"]
+    assert schema["properties"]["jobs"]["type"] == "ARRAY"
+
+
+def test_semantic_job_optional_text_may_be_null():
+    job_url = "https://www.linkedin.com/jobs/view/4461012343/"
+    result = classify_email(
+        message(
+            "Frontend Engineer at Hired",
+            "A new job matches your alert.",
+            sender="jobalerts-noreply@linkedin.com",
+            links=[job_url],
+        ),
+        FakeGemini(
+            semantic_response(
+                kind="JOB_ALERT",
+                company="Hired",
+                role_title="Frontend Engineer",
+                source_job_id="4461012343",
+                job_urls=[job_url],
+                jobs=[
+                    {
+                        "source_platform": "linkedin",
+                        "source_job_id": "4461012343",
+                        "url": job_url,
+                        "company": None,
+                        "title": None,
+                        "location": None,
+                        "remote": None,
+                        "description": None,
+                    }
+                ],
+                rationale="LinkedIn job alert.",
+            )
+        ),
+    )
+
+    assert result.kind == "JOB_ALERT"
+    assert len(result.jobs) == 1
+    job = result.jobs[0]
+    assert job.company == ""
+    assert job.title == ""
+    assert job.location == ""
+    assert job.description == ""
+    assert job.remote is None
+
+
+def test_semantic_job_invalid_remote_type_still_fails():
+    with pytest.raises(RuntimeError):
+        classify_email(
+            message("Hiring conversation", "Can we discuss this role?"),
+            FakeGemini(
+                semantic_response(
+                    jobs=[
+                        {
+                            "source_platform": "acme",
+                            "source_job_id": None,
+                            "url": "https://jobs.acme.example/frontend",
+                            "company": "Acme",
+                            "title": "Frontend Engineer",
+                            "location": "Remote",
+                            "remote": "yes",
+                            "description": "Frontend role",
+                        }
+                    ]
+                )
+            ),
+        )
 
 
 def test_semantic_generic_urls_not_in_email_are_dropped():
