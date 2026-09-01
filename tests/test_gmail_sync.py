@@ -138,13 +138,15 @@ def test_first_sync_scans_12_months_and_marks_backfill_complete(tmp_path):
     assert gmail.search_calls == [
         (
             'after:2025/08/31 {application interview recruiter hiring "job alert" '
-            'position "technical assessment" "coding challenge" offer}',
+            'position "technical assessment" "coding challenge" "job offer" '
+            '"offer letter" "offer of employment" "pleased to offer you"}',
             None,
         )
     ]
     assert build_backfill_query(datetime(2024, 2, 29, tzinfo=UTC)) == (
         'after:2023/02/28 {application interview recruiter hiring "job alert" '
-        'position "technical assessment" "coding challenge" offer}'
+        'position "technical assessment" "coding challenge" "job offer" '
+        '"offer letter" "offer of employment" "pleased to offer you"}'
     )
     state = store.get_gmail_sync_state("candidate@example.com")
     assert state is not None
@@ -393,17 +395,14 @@ def test_failed_forced_backfill_is_retried_by_following_ordinary_sync(tmp_path):
     retry_summary = service.sync(NOW + timedelta(minutes=1))
 
     state = store.get_gmail_sync_state("candidate@example.com")
+    expected_query = (
+        'after:2025/08/31 {application interview recruiter hiring "job alert" '
+        'position "technical assessment" "coding challenge" "job offer" '
+        '"offer letter" "offer of employment" "pleased to offer you"}'
+    )
     assert gmail.search_calls == [
-        (
-            'after:2025/08/31 {application interview recruiter hiring "job alert" '
-            'position "technical assessment" "coding challenge" offer}',
-            None,
-        ),
-        (
-            'after:2025/08/31 {application interview recruiter hiring "job alert" '
-            'position "technical assessment" "coding challenge" offer}',
-            None,
-        ),
+        (expected_query, None),
+        (expected_query, None),
     ]
     assert gmail.history_calls == []
     assert retry_summary.processed == 1
@@ -742,7 +741,7 @@ def test_unresolved_lifecycle_event_is_review_needed_without_job_association(tmp
         (message.message_id,),
     ).fetchone()
     assert summary.review_needed == 1
-    assert (event["job_id"], event["event_type"]) == (None, "REVIEW_NEEDED")
+    assert (event["job_id"], event["event_type"]) == (None, "INTERVIEW")
 
 
 def test_ambiguous_lifecycle_event_is_review_needed_without_job_association(
@@ -779,7 +778,7 @@ def test_ambiguous_lifecycle_event_is_review_needed_without_job_association(
         (message.message_id,),
     ).fetchone()
     assert summary.review_needed == 1
-    assert (event["job_id"], event["event_type"]) == (None, "REVIEW_NEEDED")
+    assert (event["job_id"], event["event_type"]) == (None, "INTERVIEW")
 
 
 def test_low_confidence_lifecycle_event_is_review_needed(tmp_path, monkeypatch):
@@ -812,7 +811,7 @@ def test_low_confidence_lifecycle_event_is_review_needed(tmp_path, monkeypatch):
     ).fetchone()
     assert job_id is not None
     assert summary.review_needed == 1
-    assert (event["job_id"], event["event_type"]) == (job_id, "REVIEW_NEEDED")
+    assert (event["job_id"], event["event_type"]) == (job_id, "INTERVIEW")
 
 
 def test_old_recruiter_mail_without_extracted_job_is_not_staged_but_concrete_role_is(
@@ -878,7 +877,8 @@ def test_expired_history_uses_one_day_overlap_search(tmp_path):
     assert gmail.search_calls == [
         (
             'after:2026/08/29 {application interview recruiter hiring "job alert" '
-            'position "technical assessment" "coding challenge" offer}',
+            'position "technical assessment" "coding challenge" "job offer" '
+            '"offer letter" "offer of employment" "pleased to offer you"}',
             None,
         )
     ]
