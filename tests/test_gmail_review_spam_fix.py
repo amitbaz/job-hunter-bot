@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from job_hunter.gmail_client import GmailPage
 from job_hunter.gmail_models import GmailMessage
@@ -29,6 +29,30 @@ class OneMessageGmail:
         return self.message
 
 
+def _record_review(store: JobStore, message_id: str, rationale: str) -> int:
+    store.record_gmail_message(
+        message_id=message_id,
+        thread_id=f"thread-{message_id}",
+        sender="recruiter@example.com",
+        subject="Application update",
+        occurred_at=NOW.isoformat(),
+        classification="REVIEW_NEEDED",
+        confidence=1.0,
+        rationale=rationale,
+    )
+    return store.save_application_event(
+        job_id=None,
+        event_type="REVIEW_NEEDED",
+        occurred_at=NOW.isoformat(),
+        source_message_id=message_id,
+        source_thread_id=f"thread-{message_id}",
+        confidence=1.0,
+        company="",
+        role_title="",
+        rationale=rationale,
+    )
+
+
 def test_semantic_provider_failure_is_error_not_review_and_remains_retryable(tmp_path):
     message = GmailMessage(
         message_id="m1",
@@ -57,32 +81,9 @@ def test_semantic_provider_failure_is_error_not_review_and_remains_retryable(tmp
 def test_release_legacy_semantic_failures_removes_only_exact_technical_artifacts(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
 
-    for message_id, rationale in (
-        ("legacy", LEGACY_RATIONALE),
-        ("real-review", "ambiguous scheduling language"),
-    ):
-        store.record_gmail_message(
-            message_id=message_id,
-            thread_id=f"thread-{message_id}",
-            sender="recruiter@example.com",
-            subject="Application update",
-            occurred_at=NOW.isoformat(),
-            classification="REVIEW_NEEDED",
-            confidence=1.0,
-            rationale=rationale,
-        )
-        event_id = store.save_application_event(
-            job_id=None,
-            event_type="REVIEW_NEEDED",
-            occurred_at=NOW.isoformat(),
-            source_message_id=message_id,
-            source_thread_id=f"thread-{message_id}",
-            confidence=1.0,
-            company="",
-            role_title="",
-            rationale=rationale,
-        )
-        store.mark_review_delivered([event_id], "telegram-1")
+    legacy_event = _record_review(store, "legacy", LEGACY_RATIONALE)
+    real_event = _record_review(store, "real-review", "ambiguous scheduling language")
+    store.mark_review_delivered([legacy_event, real_event], "telegram-1")
 
     released = store.release_legacy_gmail_semantic_failures()
 
@@ -96,3 +97,42 @@ def test_release_legacy_semantic_failures_removes_only_exact_technical_artifacts
         ("real-review", "ambiguous scheduling language")
     ]
     assert store.release_legacy_gmail_semantic_failures() == 0
+
+
+def test_writable_sync_reopens_completed_backfill_to_reprocess_legacy_failure(tmp_path):
+    message = GmailMessage(
+        message_id="legacy",
+        thread_id="thread-legacy",
+        sender="newsletter@example.com",
+        subject="Weekly newsletter",
+        sent_at=NOW,
+        snippet="General product news",
+        body="General product news",
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    _record_review(store, "legacy", LEGACY_RATIONALE)
+    completed_at = NOW - timedelta(days=1)
+    store.save_gmail_sync_state(
+        account_id="candidate@example.com",
+        history_id="90",
+        last_successful_sync_at=completed_at.isoformat(),
+        backfill_completed_at=completed_at.isoformat(),
+    )
+    service = GmailSyncService(
+        gmail=OneMessageGmail(message),
+        gemini=FailingGemini(),
+        store=store,
+    )
+
+    summary = service.sync(NOW)
+
+    row = store._conn.execute(
+        "SELECT classification, rationale FROM gmail_messages WHERE message_id = 'legacy'"
+    ).fetchone()
+    state = store.get_gmail_sync_state("candidate@example.com")
+    assert summary.processed == 1
+    assert summary.review_needed == 0
+    assert summary.errors == 0
+    assert tuple(row) == ("IRRELEVANT", "no deterministic job signal")
+    assert store.pending_review_events() == []
+    assert state["backfill_completed_at"] == NOW.isoformat()
