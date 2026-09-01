@@ -1,8 +1,41 @@
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, BrokenBarrierError
 
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import Evaluation, Job, Material
 from job_hunter.store import JobStore
+
+
+class _SynchronizedWatchSelectConnection:
+    """Coordinate two real SQLite connections at the legacy watch SELECT."""
+
+    def __init__(self, connection, barrier):
+        self._connection = connection
+        self._barrier = barrier
+        self._synchronized = False
+
+    def execute(self, sql, parameters=()):
+        if (
+            not self._synchronized
+            and "SELECT * FROM company_watch WHERE normalized_company_name" in sql
+        ):
+            self._synchronized = True
+            try:
+                self._barrier.wait(timeout=0.25)
+            except BrokenBarrierError:
+                pass
+        return self._connection.execute(sql, parameters)
+
+    def __enter__(self):
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return self._connection.__exit__(exc_type, exc_value, traceback)
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
 
 
 def _evaluation(job_id, **overrides):
@@ -104,6 +137,31 @@ def test_company_watch_upsert_deduplicates_normalized_company_name(tmp_path):
     assert second_id == first_id
     assert store.get_company_watch("acme")["promotion_source"] == "manual"
     assert store._conn.execute("SELECT COUNT(*) FROM company_watch").fetchone()[0] == 1
+
+
+def test_company_watch_upsert_is_atomic_across_two_connections(tmp_path):
+    database = tmp_path / "state.sqlite3"
+    stores = [JobStore(database), JobStore(database)]
+    barrier = Barrier(2)
+    for store in stores:
+        store._conn = _SynchronizedWatchSelectConnection(store._conn, barrier)
+
+    def upsert(store):
+        return store.upsert_company_watch(
+            company_name="Acme GmbH",
+            careers_url="",
+            ats_provider="greenhouse",
+            ats_identifier="acme",
+            discovered_from_job_id=None,
+            promotion_source="manual",
+            confidence=1.0,
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        watch_ids = list(executor.map(upsert, stores))
+
+    assert watch_ids[0] == watch_ids[1]
+    assert stores[0]._conn.execute("SELECT COUNT(*) FROM company_watch").fetchone()[0] == 1
 
 
 def test_automatic_generic_url_cannot_replace_manual_greenhouse_target(tmp_path):

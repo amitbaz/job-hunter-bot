@@ -7,6 +7,22 @@ from job_hunter.config import load_gmail_settings
 from job_hunter.models import CompanyWatchSeed
 
 
+def _load_manual_watch_config(monkeypatch, tmp_path, manual_watch_yaml):
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds:\n  package: 75\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        f"manual_company_watch: {manual_watch_yaml}\n"
+    )
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv("CANDIDATE_PROFILE_B64", base64.b64encode(b"profile").decode())
+    monkeypatch.setenv(
+        "COVER_LETTER_TEMPLATE_B64", base64.b64encode(b"template").decode()
+    )
+    monkeypatch.setenv("JOB_HUNTER_DRY_RUN", "1")
+    return load_settings(cfg)
+
+
 def test_load_gmail_settings_does_not_require_candidate_profile(monkeypatch):
     monkeypatch.setenv("GMAIL_CLIENT_ID", "client")
     monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
@@ -216,3 +232,52 @@ def test_load_settings_supports_legacy_manual_company_names(monkeypatch, tmp_pat
     assert settings.policy.manual_company_watch == [
         CompanyWatchSeed(company_name="Acme GmbH")
     ]
+
+
+@pytest.mark.parametrize(
+    "manual_watch_yaml",
+    ["Acme", "{company_name: Acme}"],
+    ids=["scalar", "mapping"],
+)
+def test_load_settings_rejects_non_list_manual_company_watch(
+    monkeypatch, tmp_path, manual_watch_yaml
+):
+    with pytest.raises(ValueError, match="manual_company_watch must be a list"):
+        _load_manual_watch_config(monkeypatch, tmp_path, manual_watch_yaml)
+
+
+@pytest.mark.parametrize(
+    "entry_yaml",
+    ["'   '", "{}", "{company_name: 123}"],
+    ids=["empty-string", "missing-company-name", "non-string-company-name"],
+)
+def test_load_settings_rejects_invalid_manual_company_name(
+    monkeypatch, tmp_path, entry_yaml
+):
+    with pytest.raises(
+        ValueError,
+        match=r"manual_company_watch\[0\].*company_name.*non-empty string",
+    ):
+        _load_manual_watch_config(monkeypatch, tmp_path, f"[{entry_yaml}]")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("careers_url", "123"),
+        ("ats_provider", "[greenhouse]"),
+        ("ats_identifier", "{board: acme}"),
+    ],
+)
+def test_load_settings_rejects_non_string_manual_watch_optional_field(
+    monkeypatch, tmp_path, field, value
+):
+    with pytest.raises(
+        ValueError,
+        match=rf"manual_company_watch\[0\].{field} must be a string or null",
+    ):
+        _load_manual_watch_config(
+            monkeypatch,
+            tmp_path,
+            f"[{{company_name: Acme, {field}: {value}}}]",
+        )

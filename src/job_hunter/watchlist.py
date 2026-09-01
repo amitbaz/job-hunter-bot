@@ -62,9 +62,10 @@ def promote_company(
         return None
 
     provider = (job.ats_provider or "").strip().lower()
-    if provider in _SUPPORTED_ATS_PROVIDERS and job.ats_board:
+    board = (job.ats_board or "").strip()
+    if provider in _SUPPORTED_ATS_PROVIDERS and board:
         ats_provider: str | None = provider
-        ats_identifier: str | None = job.ats_board
+        ats_identifier: str | None = board
         careers_url = ""
     else:
         ats_provider = None

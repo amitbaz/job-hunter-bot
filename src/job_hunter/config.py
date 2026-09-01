@@ -100,17 +100,41 @@ def _require_env(name: str) -> str:
     return val
 
 
-def _parse_manual_company_watch(entries: list) -> list[CompanyWatchSeed]:
+def _parse_manual_company_watch(entries: object) -> list[CompanyWatchSeed]:
+    if not isinstance(entries, list):
+        raise ValueError("manual_company_watch must be a list")
+
     seeds: list[CompanyWatchSeed] = []
-    for entry in entries or []:
+    for index, entry in enumerate(entries):
         if isinstance(entry, str):
-            seeds.append(CompanyWatchSeed(company_name=entry))
+            company_name = entry.strip()
+            if not company_name:
+                raise ValueError(
+                    f"manual_company_watch[{index}].company_name "
+                    "must be a non-empty string"
+                )
+            seeds.append(CompanyWatchSeed(company_name=company_name))
             continue
         if not isinstance(entry, dict):
-            raise ValueError("manual_company_watch entries must be names or mappings")
+            raise ValueError(
+                f"manual_company_watch[{index}] must be a non-empty string or mapping"
+            )
+
+        company_name = entry.get("company_name")
+        if not isinstance(company_name, str) or not company_name.strip():
+            raise ValueError(
+                f"manual_company_watch[{index}].company_name "
+                "must be a non-empty string"
+            )
+        for field in ("careers_url", "ats_provider", "ats_identifier"):
+            value = entry.get(field)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"manual_company_watch[{index}].{field} must be a string or null"
+                )
         seeds.append(
             CompanyWatchSeed(
-                company_name=entry.get("company_name", ""),
+                company_name=company_name.strip(),
                 careers_url=entry.get("careers_url", "") or "",
                 ats_provider=entry.get("ats_provider"),
                 ats_identifier=entry.get("ats_identifier"),

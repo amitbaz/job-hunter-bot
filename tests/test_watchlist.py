@@ -140,6 +140,31 @@ def test_automatic_promotion_uses_canonical_url_without_supported_ats(tmp_path):
     assert row["ats_identifier"] is None
 
 
+def test_automatic_promotion_uses_canonical_url_for_whitespace_ats_board(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(
+        source="greenhouse",
+        title="Frontend Engineer",
+        company="Beta",
+        canonical_url="https://beta.test/careers/frontend-engineer",
+        ats_provider="greenhouse",
+        ats_board="   ",
+    )
+    job_id, _, _ = store.upsert_job(job)
+
+    promote_company(
+        store,
+        job_id=job_id,
+        job=job,
+        evaluation=_evaluation("high_priority"),
+    )
+
+    row = store.get_company_watch("Beta")
+    assert row["careers_url"] == "https://beta.test/careers/frontend-engineer"
+    assert row["ats_provider"] is None
+    assert row["ats_identifier"] is None
+
+
 def test_automatic_promotion_stores_company_only_without_usable_endpoint(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job = Job(source="public", title="Frontend Engineer", company="No Endpoint GmbH")

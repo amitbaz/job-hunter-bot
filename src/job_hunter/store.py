@@ -773,35 +773,37 @@ class JobStore:
         now = _now_iso()
 
         with self._conn:
+            insert = self._conn.execute(
+                """
+                INSERT INTO company_watch
+                    (company_name, normalized_company_name, careers_url,
+                     ats_provider, ats_identifier, discovered_from_job_id,
+                     promotion_source, confidence, first_seen_at,
+                     created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(normalized_company_name) DO NOTHING
+                """,
+                (
+                    company_name,
+                    normalized_name,
+                    careers_url,
+                    provider,
+                    identifier,
+                    discovered_from_job_id,
+                    promotion_source,
+                    confidence,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            if insert.rowcount == 1:
+                return int(insert.lastrowid)
+
             row = self._conn.execute(
                 "SELECT * FROM company_watch WHERE normalized_company_name = ?",
                 (normalized_name,),
             ).fetchone()
-            if row is None:
-                cursor = self._conn.execute(
-                    """
-                    INSERT INTO company_watch
-                        (company_name, normalized_company_name, careers_url,
-                         ats_provider, ats_identifier, discovered_from_job_id,
-                         promotion_source, confidence, first_seen_at,
-                         created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        company_name,
-                        normalized_name,
-                        careers_url,
-                        provider,
-                        identifier,
-                        discovered_from_job_id,
-                        promotion_source,
-                        confidence,
-                        now,
-                        now,
-                        now,
-                    ),
-                )
-                return int(cursor.lastrowid)
 
             existing_strength = self._watch_endpoint_strength(
                 row["careers_url"], row["ats_provider"], row["ats_identifier"]
