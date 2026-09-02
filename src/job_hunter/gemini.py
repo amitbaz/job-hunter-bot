@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+_RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 
 
 class GeminiError(RuntimeError):
@@ -133,8 +134,8 @@ class GeminiClient:
                 url,
                 json=payload,
                 headers=headers,
-                retry_status_codes=set(),
-                retry_exceptions=False,
+                retry_status_codes=_RETRYABLE_STATUS_CODES,
+                retry=False,
             )
         except requests.RequestException as exc:
             if self._tracker is not None:
