@@ -102,29 +102,41 @@ def generate_search_queries(policy: SearchPolicy, run_date: date | None = None) 
             continue
 
         slots = allocations[market.id]
-        candidates = []
         roles = market.role_families or policy.role_families
 
+        # Role families are rotated round-robin rather than ranked: the
+        # market's first slot goes to its first role family, the second slot
+        # to its second, and so on, so a market's slots spread over
+        # min(len(roles), slots) distinct role families before any role is
+        # searched twice. Treating role order as a hard priority tier instead
+        # would let one role family's template/domain candidates consume every
+        # slot a market has, leaving the rest of the list never searched.
+        #
+        # Within a role family all (template, source domain) combinations are
+        # equal priority, so the date-seeded hash rotates them: each day a
+        # different template/domain variant surfaces for the same role.
+        market_candidates: list[tuple[tuple[int, int, str], str]] = []
         for r_idx, role in enumerate(roles):
-            for t_idx, template in enumerate(market.query_templates):
-                tier = (r_idx, t_idx)
-                base = template.format(role=role)
-                candidates.append((tier, base))
-                for domain in market.source_domains:
-                    candidates.append((tier, f"site:{domain} {base}"))
+            role_candidates: list[tuple[str, str]] = []
+            local_seen: set[str] = set()
+            for template in market.query_templates:
+                base = " ".join(template.format(role=role).split())
+                variants = [base] + [f"site:{domain} {base}" for domain in market.source_domains]
+                for text in variants:
+                    text = " ".join(text.split())
+                    if not text or text in local_seen:
+                        continue
+                    local_seen.add(text)
+                    role_candidates.append((_rotation_key(run_date, market.id, text), text))
 
-        market_candidates = []
-        local_seen = set()
-        for tier, text in candidates:
-            text = " ".join(text.split())
-            if text and text not in local_seen:
-                local_seen.add(text)
-                market_candidates.append((tier, _rotation_key(run_date, market.id, text), text))
+            role_candidates.sort()
+            for depth, (rotation_key, text) in enumerate(role_candidates):
+                market_candidates.append(((depth, r_idx, rotation_key), text))
 
-        market_candidates.sort(key=lambda x: (x[0], x[1]))
+        market_candidates.sort(key=lambda candidate: candidate[0])
 
         selected = 0
-        for _, _, text in market_candidates:
+        for _, text in market_candidates:
             if selected >= slots:
                 break
             if text not in seen:

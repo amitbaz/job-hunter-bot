@@ -1,7 +1,7 @@
 from datetime import date
 from job_hunter.discovery_queries import allocate_market_query_slots, generate_search_queries
 from job_hunter.models import SearchPolicy
-from tests.market_fixtures import make_market_policy
+from tests.market_fixtures import make_market, make_market_policy
 
 def make_policy(limit: int = 10) -> SearchPolicy:
     return SearchPolicy(
@@ -136,6 +136,107 @@ def test_same_day_query_rotation_is_stable_and_next_day_changes():
     assert first != next_day
     assert len({query.text for query in first}) == len(first)
     assert all(query.market_id for query in first)
+
+
+_TWELVE_ROLE_FAMILIES = [
+    "senior frontend engineer",
+    "staff frontend engineer",
+    "frontend technical lead",
+    "frontend lead",
+    "senior product engineer",
+    "product engineer",
+    "frontend architect",
+    "software architect",
+    "senior full-stack engineer",
+    "full-stack product engineer",
+    "full-stack engineer",
+    "ai product engineer",
+]
+
+
+def make_production_shaped_policy(max_queries: int = 30) -> SearchPolicy:
+    """A policy shaped like the real `config/search.yml`: 12 role families and
+    market-specific query templates."""
+    return SearchPolicy(
+        target_titles=[],
+        positive_keywords=[],
+        blocked_title_keywords=[],
+        salary_floor_eur=90000,
+        thresholds={"package": 75, "possible": 65},
+        role_families=list(_TWELVE_ROLE_FAMILIES),
+        max_search_queries_per_run=max_queries,
+        markets=[
+            make_market(
+                "germany_eu",
+                0.35,
+                templates=['"{role}" remote Germany', '"{role}" remote Europe'],
+                domains=["wellfound.com", "jobs.ashbyhq.com", "boards.greenhouse.io"],
+            ),
+            make_market(
+                "israel_remote",
+                0.25,
+                templates=['"{role}" remote Israel', '"{role}" remote Tel Aviv'],
+                domains=["devjobs.co.il", "jobs.ashbyhq.com", "boards.greenhouse.io"],
+            ),
+            make_market(
+                "london",
+                0.17,
+                templates=['"{role}" London sponsorship', '"{role}" London visa'],
+                domains=["workvisajobs.co.uk", "wellfound.com"],
+            ),
+            make_market(
+                "singapore",
+                0.10,
+                templates=['"{role}" Singapore sponsorship', '"{role}" Singapore visa'],
+                domains=["nodeflair.com", "glints.com"],
+            ),
+            make_market(
+                "us_nyc_sf",
+                0.10,
+                templates=['"{role}" NYC sponsorship', '"{role}" San Francisco sponsorship'],
+                domains=["builtin.com", "wellfound.com"],
+            ),
+            make_market(
+                "secondary_eu_relocation",
+                0.03,
+                templates=['"{role}" Amsterdam English', '"{role}" Paris English'],
+                domains=["wellfound.com", "jobs.ashbyhq.com"],
+            ),
+        ],
+    )
+
+
+def test_each_market_spreads_its_slots_across_distinct_role_families():
+    """Role families rotate round-robin: a market must cover
+    min(len(role_families), slots) distinct roles, not spend every slot on
+    the first one."""
+    policy = make_production_shaped_policy()
+    allocation = allocate_market_query_slots(policy.markets, policy.max_search_queries_per_run)
+    queries = generate_search_queries(policy, date(2026, 9, 2))
+
+    for market_id, slots in allocation.items():
+        texts = [query.text for query in queries if query.market_id == market_id]
+        assert len(texts) == slots
+        covered = {
+            role
+            for role in policy.role_families
+            if any(f'"{role}"' in text for text in texts)
+        }
+        assert len(covered) >= min(len(policy.role_families), slots), (
+            f"{market_id} covered only {sorted(covered)} across {slots} slots"
+        )
+
+
+def test_role_family_coverage_holds_across_rotation_days():
+    policy = make_production_shaped_policy()
+    for run_date in (date(2026, 9, 2), date(2026, 9, 3), date(2026, 9, 10)):
+        queries = generate_search_queries(policy, run_date)
+        germany = [query.text for query in queries if query.market_id == "germany_eu"]
+        covered = {
+            role for role in policy.role_families if any(f'"{role}"' in text for text in germany)
+        }
+        assert len(covered) == len(germany) == 10
+        assert len(set(germany)) == len(germany)
 
 
 def test_allocation_with_budget_less_than_market_count():
