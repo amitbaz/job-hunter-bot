@@ -40,6 +40,7 @@ class DiscoveryStats:
     unique_by_market: dict[str, int] = field(default_factory=dict)
     rejected_by_market: dict[str, int] = field(default_factory=dict)
     eligible_by_market: dict[str, int] = field(default_factory=dict)
+    reattributed_by_market: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -189,6 +190,16 @@ def _bump(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
+def _record_reattribution(
+    stats: DiscoveryStats,
+    before: str | None,
+    after: str | None,
+) -> None:
+    if before == after:
+        return
+    _bump(stats.reattributed_by_market, after or _UNATTRIBUTED)
+
+
 def _cheap_market_attribution(job: Job, policy: SearchPolicy) -> str | None:
     """Attribute a market as cheaply as possible for raw-stage observability.
 
@@ -262,12 +273,14 @@ def collect_candidates(
     resolutions_used = 0
 
     for job in unique_jobs:
+        observed_market_id = _cheap_market_attribution(job, policy)
         if job.url and not job.description:
             enrich_job(job, http)
 
         job_id, _is_new, _description_changed = store.upsert_logical_job(job)
 
         job.market_id = attribute_market(job, policy.markets) if policy.markets else None
+        _record_reattribution(stats, observed_market_id, job.market_id)
         if job.market_id:
             store.set_job_market(job_id, job.market_id)
         market_key = job.market_id or _UNATTRIBUTED
@@ -319,9 +332,11 @@ def collect_candidates(
                     # before the final append. Attribution uncertainty alone
                     # (i.e. falling back to the first enabled market) must
                     # never drop a job -- only prefilter/eligibility do that.
+                    previous_market_id = job.market_id
                     job.market_id = (
                         attribute_market(job, policy.markets) if policy.markets else None
                     )
+                    _record_reattribution(stats, previous_market_id, job.market_id)
                     # Late canonicalization may consolidate stored rows; use
                     # the store's history-preserving survivor ID downstream.
                     job_id, _is_new, _description_changed = store.upsert_logical_job(job)

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
-from datetime import date
+import logging
+import os
+from datetime import date, datetime, timezone
 
 from job_hunter.circuit_breaker import CircuitBreaker
+from job_hunter.discovery_queries import generate_search_queries
 from job_hunter.models import Settings
+from job_hunter.search_backend import build_search_backend
+from job_hunter.search_budget import (
+    SearchUsageLedger,
+    brave_queries_available_today,
+    split_queries_for_brave,
+)
 
 from .arbeitnow import ArbeitnowSource
 from .ashby import AshbySource
@@ -12,15 +21,18 @@ from .company_watch import CompanyWatchSource
 from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
 from .gmail_staged import GmailStagedSource
+from .hackernews import HackerNewsHiringSource
 from .himalayas import HimalayasSource
 from .jobicy import JobicySource
 from .lever import LeverSource
 from .remotive import RemotiveSource
 from .remoteok import RemoteOKSource
+from .targeted_search import TargetedSearchSource
 from .weworkremotely import WeWorkRemotelySource
-from .hackernews import HackerNewsHiringSource
 from .yc import YCSource
-from job_hunter.discovery_queries import generate_search_queries
+
+logger = logging.getLogger(__name__)
+_DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT = 250
 
 __all__ = [
     "JobSource",
@@ -31,18 +43,105 @@ __all__ = [
     "GmailStagedSource",
     "CompanyWatchSource",
     "DuckDuckGoSource",
+    "TargetedSearchSource",
     "AshbySource",
     "LeverSource",
     "GreenhouseSource",
-    "RemoteOKSource", "WeWorkRemotelySource", "HackerNewsHiringSource", "YCSource",
+    "RemoteOKSource",
+    "WeWorkRemotelySource",
+    "HackerNewsHiringSource",
+    "YCSource",
     "build_sources",
 ]
 
 
+def _brave_monthly_query_limit() -> int:
+    raw = os.environ.get(
+        "BRAVE_MONTHLY_QUERY_LIMIT",
+        str(_DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid BRAVE_MONTHLY_QUERY_LIMIT=%r; disabling Brave to fail safe",
+            raw,
+        )
+        return 0
+    if value <= 0:
+        logger.warning(
+            "non-positive BRAVE_MONTHLY_QUERY_LIMIT=%r; disabling Brave to fail safe",
+            raw,
+        )
+        return 0
+    return value
+
+
 def build_sources(
-    settings: Settings, http, search_breaker: CircuitBreaker | None = None,
+    settings: Settings,
+    http,
+    search_breaker: CircuitBreaker | None = None,
     query_date: date | None = None,
 ) -> list[JobSource]:
+    queries = generate_search_queries(settings.policy, query_date)
+    brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+    targeted_sources: list[JobSource] = []
+
+    if brave_api_key:
+        ledger = SearchUsageLedger(settings.db_path)
+        now = datetime.now(timezone.utc)
+        monthly_limit = _brave_monthly_query_limit()
+        brave_limit = brave_queries_available_today(
+            ledger,
+            monthly_limit=monthly_limit,
+            now=now,
+        )
+        brave_queries, fallback_queries = split_queries_for_brave(
+            queries,
+            limit=brave_limit,
+        )
+
+        logger.info(
+            "Brave search budget: monthly_limit=%s available_today=%s selected=%s fallback=%s",
+            monthly_limit,
+            brave_limit,
+            len(brave_queries),
+            len(fallback_queries),
+        )
+
+        if brave_queries:
+            targeted_sources.append(
+                TargetedSearchSource(
+                    build_search_backend(
+                        http,
+                        brave_api_key,
+                        enable_brave=True,
+                        on_brave_attempt=lambda: ledger.record(
+                            provider="brave",
+                            occurred_at=datetime.now(timezone.utc),
+                        ),
+                    ),
+                    brave_queries,
+                    breaker=search_breaker,
+                )
+            )
+        if fallback_queries:
+            targeted_sources.append(
+                DuckDuckGoSource(
+                    http,
+                    fallback_queries,
+                    breaker=search_breaker,
+                )
+            )
+    else:
+        targeted_sources.append(
+            DuckDuckGoSource(
+                http,
+                queries,
+                breaker=search_breaker,
+            )
+        )
+
     sources: list[JobSource] = [
         RemotiveSource(http),
         ArbeitnowSource(http),
@@ -51,9 +150,7 @@ def build_sources(
         RemoteOKSource(http),
         WeWorkRemotelySource(http),
         HackerNewsHiringSource(http),
-        DuckDuckGoSource(
-            http, generate_search_queries(settings.policy, query_date), breaker=search_breaker
-        ),
+        *targeted_sources,
     ]
     if settings.policy.yc_job_pages:
         sources.append(YCSource(http, settings.policy.yc_job_pages))

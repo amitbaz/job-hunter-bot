@@ -212,6 +212,8 @@ class CandidateContext:
     company_environment: list[str]
     career_evidence: list[str]
     evaluation_summary: str
+    source: str = field(default="unknown", compare=False)
+    load_error: str = field(default="", compare=False)
 
 
 @dataclass(frozen=True, slots=True)
