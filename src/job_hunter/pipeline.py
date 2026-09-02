@@ -268,6 +268,16 @@ def _evaluate_and_deliver_job(
     caller should stop attempting further jobs this run (they would hit the
     same exhausted ceiling or persisted pause) and defer those too.
     """
+    # save_evaluation and complete_ai_work are two separate transactions
+    # (below): a crash landing between them leaves a job that was already
+    # evaluated AND delivered still sitting in the `job_evaluation` queue.
+    # A retry must recognize that stale row rather than re-spend a real
+    # Gemini call and re-deliver a duplicate message/PDF for a job that's
+    # already out the door -- it just clears the leftover queue row.
+    if store.get_evaluation(job_id) is not None and store.has_delivery(job_id, "telegram_message"):
+        store.complete_ai_work("job_evaluation", job_id)
+        return False, False
+
     try:
         evaluation = evaluate_job(job, candidate_context, settings.policy, gemini)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):

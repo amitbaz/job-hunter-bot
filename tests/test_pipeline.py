@@ -1448,6 +1448,43 @@ def test_pipeline_retries_pending_evaluation_and_delivers_it(settings):
     assert len(telegram.documents) == 1
 
 
+def test_pipeline_ignores_stale_pending_evaluation_for_already_delivered_job(settings):
+    """A crash between save_evaluation and complete_ai_work can leave an
+
+    already-evaluated-and-delivered job's `job_evaluation` row stuck pending.
+    A later run must not re-spend Gemini or re-deliver duplicates for it --
+    it should just clear the stale row.
+    """
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    # Run 1: fully evaluate and deliver the job normally.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+    job_id, _, _ = store.upsert_job(job)
+    assert store.get_evaluation(job_id) is not None
+    assert store.has_delivery(job_id, "telegram_message") is True
+    assert store.has_delivery(job_id, "telegram_document") is True
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+    assert gemini.eval_calls == 1
+
+    # Simulate the crash window: the queue row survives even though the job
+    # was already fully evaluated and delivered.
+    store.enqueue_ai_work("job_evaluation", job_id)
+
+    # Run 2: no new candidates, only the stale pending row to process.
+    run_pipeline(settings, sources=[FakeSource([])], store=store, gemini=gemini, telegram=telegram)
+
+    assert store.list_pending_ai_work("job_evaluation") == []
+    # Zero wasted Gemini evaluation calls...
+    assert gemini.eval_calls == 1
+    # ...and zero duplicate deliveries.
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+
+
 def test_pipeline_defers_cover_letter_when_budget_exceeded(settings):
     job = _job()
     store = JobStore(settings.db_path)
