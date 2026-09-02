@@ -18,4 +18,9 @@ class DuckDuckGoSource(TargetedSearchSource):
         queries: list[str | SearchQuery],
         breaker: CircuitBreaker | None = None,
     ) -> None:
-        super().__init__(DuckDuckGoSearchBackend(http), queries, breaker=breaker)
+        super().__init__(
+            DuckDuckGoSearchBackend(http),
+            queries,
+            breaker=breaker,
+            source_label="duckduckgo",
+        )
