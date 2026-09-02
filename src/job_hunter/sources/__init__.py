@@ -32,6 +32,7 @@ from .remotive import RemotiveSource
 from .remoteok import RemoteOKSource
 from .targeted_search import TargetedSearchSource
 from .weworkremotely import WeWorkRemotelySource
+from .wellfound import _WELLFOUND_LISTINGS, WellfoundListing, WellfoundSource
 from .yc import YCSource
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ __all__ = [
     "HackerNewsHiringSource",
     "YCSource",
     "LearnedAtsSource",
+    "WellfoundListing",
+    "WellfoundSource",
     "build_sources",
 ]
 
@@ -168,6 +171,19 @@ def build_sources(
         if market.enabled
     ):
         sources.append(DevJobsSource(http))
+
+    wellfound_listings: list[WellfoundListing] = []
+    for market in settings.policy.markets:
+        if not market.enabled:
+            continue
+        if "wellfound" not in (market.direct_sources or []):
+            continue
+        wellfound_listings.extend(
+            WellfoundListing(url=url, market_id=market.id)
+            for url in _WELLFOUND_LISTINGS.get(market.id, [])
+        )
+    if wellfound_listings:
+        sources.append(WellfoundSource(http, wellfound_listings))
 
     ats = settings.policy.ats or {}
     for board in ats.get("ashby", []) or []:

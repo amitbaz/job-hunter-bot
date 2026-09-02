@@ -14,6 +14,7 @@ from job_hunter.sources import (
     JobicySource,
     LeverSource,
     RemotiveSource,
+    WellfoundSource,
     build_sources,
 )
 from job_hunter.store import JobStore
@@ -530,6 +531,82 @@ def test_build_sources_skips_devjobs_when_only_disabled_market_lists_it(
 
     kinds = [type(s).__name__ for s in sources]
     assert "DevJobsSource" not in kinds
+
+
+def test_build_sources_skips_wellfound_when_no_market_lists_it(fake_http, policy):
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "WellfoundSource" not in kinds
+    assert not any(isinstance(s, WellfoundSource) for s in sources)
+
+
+def test_build_sources_builds_one_wellfound_source_from_enabled_markets_in_order(
+    fake_http, policy
+):
+    policy_with_wellfound = dataclasses.replace(
+        policy,
+        markets=[
+            make_market("us_nyc_sf", 0.3, direct_sources=["wellfound"]),
+            make_market("germany_eu", 0.3, direct_sources=["wellfound"]),
+            make_market("london", 0.3, direct_sources=["wellfound"]),
+            make_market("singapore", 0.1, direct_sources=[]),
+        ],
+    )
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_wellfound,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert kinds.count("WellfoundSource") == 1
+    wellfound_source = next(s for s in sources if isinstance(s, WellfoundSource))
+    market_order = [listing.market_id for listing in wellfound_source.listings]
+    # us_nyc_sf listed first in the market config order, then germany_eu, then london
+    assert market_order == ["us_nyc_sf"] * 4 + ["germany_eu"] * 2 + ["london"] * 2
+
+
+def test_build_sources_skips_wellfound_when_only_disabled_market_lists_it(
+    fake_http, policy
+):
+    policy_with_disabled_wellfound = dataclasses.replace(
+        policy,
+        markets=[
+            make_market("london", 1.0, direct_sources=["wellfound"]),
+        ],
+    )
+    policy_with_disabled_wellfound.markets[0].enabled = False
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_disabled_wellfound,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "WellfoundSource" not in kinds
 
 
 def test_duckduckgo_opens_circuit_after_consecutive_failures():
