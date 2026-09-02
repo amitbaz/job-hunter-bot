@@ -14,10 +14,12 @@ from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.discovery import collect_candidates, metric_source_label
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
+from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import normalize_company_name
 from job_hunter.models import (
     AtsReference,
+    CandidateContext,
     DigestItem,
     Job,
     Material,
@@ -33,7 +35,7 @@ from job_hunter.navigation_store import (
     prune_navigation_sessions,
 )
 from job_hunter.pdf import render_cover_letter_pdf
-from job_hunter.preferences import extract_candidate_preferences, preferences_source
+from job_hunter.preferences import preferences_source
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.sources import (
     CompanyWatchSource,
@@ -243,6 +245,169 @@ def _requeue_pending_delivery(
                 summary.errors += 1
 
 
+def _evaluate_and_deliver_job(
+    job_id: int,
+    job: Job,
+    candidate_context: CandidateContext,
+    settings: Settings,
+    store: JobStore,
+    gemini: GeminiClient,
+    out_dir: Path,
+    digest_items: list[DigestItem],
+    pdf_deliveries: list[tuple[int, Path, DigestItem]],
+    summary: RunSummary,
+) -> tuple[bool, bool]:
+    """Evaluate one job and, if ready, generate its cover letter/PDF.
+
+    Returns `(promoted, quota_blocked)`. `quota_blocked` is True when a
+    Gemini quota exception deferred this job's evaluation — the job has
+    already been re-enqueued as pending `job_evaluation` work, and the
+    caller should stop attempting further jobs this run (they would hit the
+    same exhausted ceiling or persisted pause) and defer those too.
+    """
+    try:
+        evaluation = evaluate_job(job, candidate_context, settings.policy, gemini)
+    except (GeminiBudgetExceeded, GeminiQuotaPaused):
+        logger.warning("job evaluation deferred by Gemini quota for job_id=%s", job_id)
+        store.enqueue_ai_work("job_evaluation", job_id)
+        return False, True
+    except Exception:
+        logger.exception("evaluation failed for job_id=%s", job_id)
+        summary.errors += 1
+        return False, False
+
+    store.save_evaluation(job_id, evaluation)
+    store.complete_ai_work("job_evaluation", job_id)
+
+    promoted = False
+    try:
+        promotion_before = _watch_promotion_state(store.get_company_watch(job.company))
+        promoted_watch_id = promote_company(
+            store,
+            job_id=job_id,
+            job=job,
+            evaluation=evaluation,
+            package_threshold=settings.policy.thresholds["package"],
+        )
+        promotion_after = _watch_promotion_state(store.get_company_watch(job.company))
+        promoted = promoted_watch_id is not None and promotion_after != promotion_before
+    except Exception:
+        logger.exception("company watch promotion failed for job_id=%s", job_id)
+        summary.errors += 1
+
+    item = DigestItem(
+        job_id=job_id,
+        company=job.company,
+        title=job.title,
+        score=evaluation.total_score,
+        decision=evaluation.decision,
+        url=job.url,
+        hard_blockers=evaluation.hard_blockers,
+        location=job.location,
+    )
+    digest_items.append(item)
+
+    if evaluation.decision in _READY_DECISIONS:
+        summary.ready_to_apply += 1
+    elif evaluation.decision == "possible_match":
+        summary.possible_matches += 1
+    else:
+        summary.skipped += 1
+
+    if evaluation.decision in _READY_DECISIONS:
+        try:
+            text = generate_cover_letter(
+                job,
+                evaluation,
+                candidate_context,
+                settings.cover_letter_template,
+                gemini,
+                date.today(),
+            )
+        except (GeminiBudgetExceeded, GeminiQuotaPaused):
+            logger.warning("cover letter deferred by Gemini quota for job_id=%s", job_id)
+            store.enqueue_ai_work("cover_letter", job_id)
+        except Exception:
+            logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
+            summary.errors += 1
+        else:
+            try:
+                store.save_material(job_id, Material(job_id=job_id, cover_letter_text=text))
+                pdf_path = render_cover_letter_pdf(text, job.company, job.title, out_dir)
+                pdf_deliveries.append((job_id, pdf_path, item))
+            except Exception:
+                logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
+                summary.errors += 1
+
+    return promoted, False
+
+
+def _retry_pending_cover_letter(
+    job_id: int,
+    candidate_context: CandidateContext,
+    settings: Settings,
+    store: JobStore,
+    gemini: GeminiClient,
+    out_dir: Path,
+    digest_items: list[DigestItem],
+    pdf_deliveries: list[tuple[int, Path, DigestItem]],
+    summary: RunSummary,
+) -> bool:
+    """Regenerate a previously quota-blocked cover letter for an already-evaluated job.
+
+    Uses the saved job + evaluation + cached CandidateContext; never repeats
+    job evaluation. Returns True when generation is quota-blocked again, so
+    the caller can stop attempting further pending cover letters this run.
+    """
+    evaluation = store.get_evaluation(job_id)
+    job = store.get_job(job_id)
+    if evaluation is None or job is None:
+        store.complete_ai_work("cover_letter", job_id)
+        return False
+
+    item = DigestItem(
+        job_id=job_id,
+        company=job.company,
+        title=job.title,
+        score=evaluation.total_score,
+        decision=evaluation.decision,
+        url=job.url,
+        hard_blockers=evaluation.hard_blockers,
+        location=job.location,
+    )
+    if not store.has_delivery(job_id, "telegram_message"):
+        digest_items.append(item)
+
+    try:
+        text = generate_cover_letter(
+            job,
+            evaluation,
+            candidate_context,
+            settings.cover_letter_template,
+            gemini,
+            date.today(),
+        )
+    except (GeminiBudgetExceeded, GeminiQuotaPaused):
+        logger.warning("cover letter retry deferred by Gemini quota for job_id=%s", job_id)
+        return True
+    except Exception:
+        logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
+        summary.errors += 1
+        return False
+
+    try:
+        store.save_material(job_id, Material(job_id=job_id, cover_letter_text=text))
+        pdf_path = render_cover_letter_pdf(text, job.company, job.title, out_dir)
+        pdf_deliveries.append((job_id, pdf_path, item))
+    except Exception:
+        logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
+        summary.errors += 1
+        return False
+
+    store.complete_ai_work("cover_letter", job_id)
+    return False
+
+
 def _build_navigation_session(items: list[DigestItem], now: datetime) -> NavigationSession:
     ordered = sorted(items, key=navigation_sort_key)
     return NavigationSession(
@@ -266,9 +431,10 @@ def _build_navigation_session(items: list[DigestItem], now: datetime) -> Navigat
 
 def run_pipeline(
     settings: Settings,
+    *,
     sources=None,
     store: JobStore | None = None,
-    gemini: GeminiClient | None = None,
+    gemini: GeminiClient,
     telegram: TelegramClient | None = None,
     http: HttpClient | None = None,
 ) -> RunSummary:
@@ -298,7 +464,6 @@ def run_pipeline(
         ),
         watch_target=lambda company: _persisted_watch_target(store, company),
     )
-    gemini = gemini or GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
     if telegram is None and not settings.dry_run:
         telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id, http)
 
@@ -314,13 +479,17 @@ def run_pipeline(
         resolver=resolver,
     )
     watch_checks, watch_paused = _watch_check_outcomes(store, due_watches)
-    preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy, store)
-    profile_mode = preferences_source(preferences)
-    logger.info("profile extraction: source=%s", profile_mode)
-    # Reuses the CandidateContext cached by extract_candidate_preferences above
-    # (same profile/model/schema key), so this is a store lookup, not a second
-    # Gemini call. Task 8 will restructure this into a single upfront load.
-    candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
+    try:
+        candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
+    except (GeminiBudgetExceeded, GeminiQuotaPaused):
+        candidate_context = None
+        logger.warning(
+            "candidate context load deferred by Gemini quota; evaluation and cover letters "
+            "will be deferred this run"
+        )
+    else:
+        logger.info("profile extraction: source=%s", preferences_source(candidate_context.preferences))
+    preferences = candidate_context.preferences if candidate_context is not None else None
     summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy, preferences)
     selected = _select_candidates(ranked, settings.policy, preferences)
@@ -340,78 +509,75 @@ def run_pipeline(
     )
     logger.info("eligible sources: %s", _format_source_counts(eligible_source_counts))
     logger.info("selected sources: %s", _format_source_counts(selected_source_counts))
-    queued_job_ids = {job_id for job_id, _job, _score in selected}
+
+    # Pending retries from earlier quota-blocked runs take priority over this
+    # run's fresh candidates: yesterday's deferred jobs beat today's fresh
+    # discoveries for the shared Gemini budget. Snapshot both categories now
+    # so membership stays stable while rows are completed/re-enqueued below.
+    pending_evaluation_ids = [row["job_id"] for row in store.list_pending_ai_work("job_evaluation")]
+    pending_cover_letter_ids = [row["job_id"] for row in store.list_pending_ai_work("cover_letter")]
+    pending_evaluation_id_set = set(pending_evaluation_ids)
+    pending_cover_letter_id_set = set(pending_cover_letter_ids)
+
+    queued_job_ids = (
+        {job_id for job_id, _job, _score in selected}
+        | pending_evaluation_id_set
+        | pending_cover_letter_id_set
+    )
     companies_promoted = 0
     for job_id in discovery.rediscovered_job_ids:
         _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
 
-    for job_id, job, _score in selected:
-        try:
-            evaluation = evaluate_job(job, candidate_context, settings.policy, gemini)
-        except Exception:
-            logger.exception("evaluation failed for job_id=%s", job_id)
-            summary.errors += 1
-            continue
-
-        store.save_evaluation(job_id, evaluation)
-        try:
-            promotion_before = _watch_promotion_state(
-                store.get_company_watch(job.company)
-            )
-            promoted_watch_id = promote_company(
-                store,
-                job_id=job_id,
-                job=job,
-                evaluation=evaluation,
-                package_threshold=settings.policy.thresholds["package"],
-            )
-            promotion_after = _watch_promotion_state(
-                store.get_company_watch(job.company)
-            )
-            if promoted_watch_id is not None and promotion_after != promotion_before:
-                companies_promoted += 1
-        except Exception:
-            logger.exception("company watch promotion failed for job_id=%s", job_id)
-            summary.errors += 1
-
-        item = DigestItem(
-            job_id=job_id,
-            company=job.company,
-            title=job.title,
-            score=evaluation.total_score,
-            decision=evaluation.decision,
-            url=job.url,
-            hard_blockers=evaluation.hard_blockers,
-            location=job.location,
+    # A missing candidate_context means loading it was itself quota-blocked
+    # (see above): there is nothing to evaluate with, so every pending and
+    # fresh candidate below must defer rather than be misclassified as an
+    # error.
+    quota_blocked = candidate_context is None
+    if quota_blocked and pending_evaluation_ids:
+        logger.warning(
+            "candidate context unavailable this run; leaving %s pending job_evaluation "
+            "retries queued",
+            len(pending_evaluation_ids),
         )
-        digest_items.append(item)
 
-        if evaluation.decision in _READY_DECISIONS:
-            summary.ready_to_apply += 1
-        elif evaluation.decision == "possible_match":
-            summary.possible_matches += 1
-        else:
-            summary.skipped += 1
+    for job_id in pending_evaluation_ids:
+        if quota_blocked:
+            continue
+        job = store.get_job(job_id)
+        if job is None:
+            store.complete_ai_work("job_evaluation", job_id)
+            continue
+        promoted, blocked = _evaluate_and_deliver_job(
+            job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
+        )
+        if promoted:
+            companies_promoted += 1
+        quota_blocked = quota_blocked or blocked
 
-        if evaluation.decision in _READY_DECISIONS:
-            try:
-                text = generate_cover_letter(
-                    job,
-                    evaluation,
-                    candidate_context,
-                    settings.cover_letter_template,
-                    gemini,
-                    date.today(),
-                )
-                store.save_material(job_id, Material(job_id=job_id, cover_letter_text=text))
-                pdf_path = render_cover_letter_pdf(text, job.company, job.title, out_dir)
-                pdf_deliveries.append((job_id, pdf_path, item))
-            except Exception:
-                logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
-                summary.errors += 1
+    for job_id, job, _score in selected:
+        if job_id in pending_evaluation_id_set:
+            continue
+        if quota_blocked:
+            store.enqueue_ai_work("job_evaluation", job_id)
+            continue
+        promoted, blocked = _evaluate_and_deliver_job(
+            job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
+        )
+        if promoted:
+            companies_promoted += 1
+        quota_blocked = quota_blocked or blocked
 
     for job_id in set(store.pending_delivery_job_ids()) - queued_job_ids - set(discovery.rediscovered_job_ids):
         _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
+
+    if candidate_context is not None:
+        cover_letter_blocked = False
+        for job_id in pending_cover_letter_ids:
+            if cover_letter_blocked:
+                continue
+            cover_letter_blocked = _retry_pending_cover_letter(
+                job_id, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
+            )
 
     if not settings.dry_run:
         deliverable_items = select_deliverable_items(digest_items)

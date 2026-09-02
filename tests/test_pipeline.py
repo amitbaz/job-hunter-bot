@@ -5,8 +5,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import (
+    CandidateContext,
     CandidatePreferences,
     CompanyWatchSeed,
     GeminiQuotaSettings,
@@ -183,6 +185,65 @@ def _job(**overrides):
     )
     defaults.update(overrides)
     return Job(**defaults)
+
+
+def _candidate_context(**overrides):
+    defaults = dict(
+        preferences=CandidatePreferences(
+            preferred_roles=["Senior Product Engineer"],
+            preferred_seniority=["senior"],
+            must_have_signals=["React"],
+            nice_to_have_signals=["TypeScript"],
+            preferred_locations=["Germany"],
+            avoid_signals=["manager"],
+            summary="Remote product-oriented frontend engineer.",
+        ),
+        technical_skills=[],
+        architecture_evidence=[],
+        leadership_ownership=[],
+        agentic_ai_evidence=[],
+        product_domain_evidence=[],
+        location_language_facts=[],
+        career_direction=[],
+        company_environment=[],
+        career_evidence=[],
+        evaluation_summary="Remote product-oriented frontend engineer.",
+    )
+    defaults.update(overrides)
+    return CandidateContext(**defaults)
+
+
+class RaisingGemini(FakeGemini):
+    """Raises a Gemini quota exception for one purpose, after `allow` successful
+
+    calls for that purpose; otherwise behaves exactly like FakeGemini.
+    """
+
+    def __init__(self, *, raise_on_purpose, exception, allow=0, **kwargs):
+        super().__init__(**kwargs)
+        self._raise_on_purpose = raise_on_purpose
+        self._exception = exception
+        self._allow = allow
+        self._purpose_calls = 0
+
+    def generate_text(self, prompt, **kwargs):
+        if kwargs.get("purpose") == self._raise_on_purpose:
+            if self._purpose_calls >= self._allow:
+                raise self._exception
+            self._purpose_calls += 1
+        return super().generate_text(prompt, **kwargs)
+
+
+def _budget_exceeded():
+    return GeminiBudgetExceeded("Gemini gemini-test budget exceeded for purpose 'job_evaluation'")
+
+
+def _quota_paused():
+    return GeminiQuotaPaused(
+        "Gemini gemini-test is paused until 2026-09-03T00:00:00+00:00 (daily_quota)",
+        paused_until="2026-09-03T00:00:00+00:00",
+        reason="daily_quota",
+    )
 
 
 def _evaluation_payload(scores, decision):
@@ -1196,36 +1257,204 @@ def test_pipeline_retries_only_missing_pdf_when_digest_already_sent(settings):
     assert gemini.cover_letter_calls == 1
 
 
-def test_pipeline_extracts_preferences_once_without_logging_profile(settings, monkeypatch, caplog):
+def test_pipeline_loads_candidate_context_once_without_logging_profile(settings, monkeypatch, caplog):
     settings.candidate_profile = "SENSITIVE_PROFILE_TEXT"
     job = _job()
     store = JobStore(settings.db_path)
     gemini = FakeGemini()
     telegram = FakeTelegram()
-    extracted = []
+    loaded = []
 
-    def fake_extract(profile, passed_gemini, policy, passed_store):
-        extracted.append((profile, passed_gemini, policy, passed_store))
-        return CandidatePreferences(
-            preferred_roles=["Senior Product Engineer"],
-            preferred_seniority=["senior"],
-            must_have_signals=["React"],
-            nice_to_have_signals=[],
-            preferred_locations=["Germany"],
-            avoid_signals=["manager"],
-            summary="Compact summary",
-        )
+    def fake_get_context(profile, policy, passed_gemini, passed_store):
+        loaded.append((profile, policy, passed_gemini, passed_store))
+        return _candidate_context()
 
-    monkeypatch.setattr("job_hunter.pipeline.extract_candidate_preferences", fake_extract)
+    monkeypatch.setattr("job_hunter.pipeline.get_candidate_context", fake_get_context)
 
     with caplog.at_level(logging.INFO):
         run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
 
-    assert extracted == [(settings.candidate_profile, gemini, settings.policy, store)]
+    # Exactly one load: no redundant second (candidate_context vs.
+    # preferences) call, unlike the pre-Task-8 pipeline.
+    assert loaded == [(settings.candidate_profile, settings.policy, gemini, store)]
     assert "profile extraction: source=" in caplog.text
     assert settings.candidate_profile not in caplog.text
     assert job.description not in caplog.text
     assert gemini.eval_calls == 1
+
+
+def test_pipeline_defers_evaluation_when_budget_exceeded(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = RaisingGemini(raise_on_purpose="job_evaluation", exception=_budget_exceeded())
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    job_id, _, _ = store.upsert_job(job)
+    assert store.get_evaluation(job_id) is None
+    assert [row["job_id"] for row in store.list_pending_ai_work("job_evaluation")] == [job_id]
+    assert summary.errors == 0
+    assert summary.skipped == 0
+    assert summary.possible_matches == 0
+    assert summary.ready_to_apply == 0
+    assert telegram.messages == []
+
+
+def test_pipeline_defers_evaluation_when_quota_paused(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = RaisingGemini(raise_on_purpose="job_evaluation", exception=_quota_paused())
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    job_id, _, _ = store.upsert_job(job)
+    assert store.get_evaluation(job_id) is None
+    assert [row["job_id"] for row in store.list_pending_ai_work("job_evaluation")] == [job_id]
+    assert summary.errors == 0
+    assert summary.skipped == 0
+
+
+def test_pipeline_defers_remaining_candidates_after_first_quota_exception(settings):
+    jobs = _jobs_for_source("ashby", 3)
+    store = JobStore(settings.db_path)
+    # Only the first job_evaluation call succeeds; every later one is blocked.
+    gemini = RaisingGemini(raise_on_purpose="job_evaluation", exception=_budget_exceeded(), allow=1)
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource(jobs)], store=store, gemini=gemini, telegram=telegram)
+
+    job_ids = [store.upsert_job(job)[0] for job in jobs]
+    evaluated = [job_id for job_id in job_ids if store.get_evaluation(job_id) is not None]
+    pending = {row["job_id"] for row in store.list_pending_ai_work("job_evaluation")}
+
+    assert len(evaluated) == 1
+    assert pending == set(job_ids) - set(evaluated)
+    # The blocked jobs were deferred directly, without a second wasted Gemini attempt.
+    assert gemini.eval_calls == 1
+
+
+def test_pipeline_retries_pending_evaluation_before_new_candidates(settings):
+    store = JobStore(settings.db_path)
+    old_job = _job(source_job_id="deferred-job", company="Deferred Co")
+    old_job_id, _, _ = store.upsert_job(old_job)
+    store.enqueue_ai_work("job_evaluation", old_job_id)
+
+    new_job = _job(source_job_id="fresh-job", company="Fresh Co")
+    # Only one job_evaluation call is allowed this run.
+    gemini = RaisingGemini(raise_on_purpose="job_evaluation", exception=_budget_exceeded(), allow=1)
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([new_job])], store=store, gemini=gemini, telegram=telegram)
+
+    new_job_id, _, _ = store.upsert_job(new_job)
+
+    # The older, already-pending job wins the single available call...
+    assert store.get_evaluation(old_job_id) is not None
+    # ...and the fresh candidate is deferred instead of evaluated, taking the
+    # older job's place in the pending queue.
+    assert store.get_evaluation(new_job_id) is None
+    assert [row["job_id"] for row in store.list_pending_ai_work("job_evaluation")] == [new_job_id]
+    assert gemini.eval_calls == 1
+
+
+def test_pipeline_retries_pending_evaluation_and_delivers_it(settings):
+    store = JobStore(settings.db_path)
+    job = _job()
+    job_id, _, _ = store.upsert_job(job)
+    store.enqueue_ai_work("job_evaluation", job_id)
+
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource([])], store=store, gemini=gemini, telegram=telegram)
+
+    assert store.get_evaluation(job_id) is not None
+    assert store.list_pending_ai_work("job_evaluation") == []
+    assert summary.ready_to_apply == 1
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 1
+
+
+def test_pipeline_defers_cover_letter_when_budget_exceeded(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_budget_exceeded())
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    job_id, _, _ = store.upsert_job(job)
+    assert store.get_evaluation(job_id) is not None
+    assert store.get_material(job_id) is None
+    assert [row["job_id"] for row in store.list_pending_ai_work("cover_letter")] == [job_id]
+    assert summary.errors == 0
+    assert summary.ready_to_apply == 1
+    # Still delivered to Telegram without a PDF.
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 0
+
+
+def test_pipeline_defers_cover_letter_when_quota_paused(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_quota_paused())
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    job_id, _, _ = store.upsert_job(job)
+    assert store.get_material(job_id) is None
+    assert [row["job_id"] for row in store.list_pending_ai_work("cover_letter")] == [job_id]
+    assert summary.errors == 0
+    assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 0
+
+
+def test_pipeline_retries_pending_cover_letter_without_reevaluating(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_budget_exceeded())
+    telegram = FakeTelegram()
+
+    # Run 1: evaluation succeeds, cover letter is quota-blocked and deferred.
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+    job_id, _, _ = store.upsert_job(job)
+    assert store.get_material(job_id) is None
+    assert gemini.eval_calls == 1
+
+    # Run 2: quota is back; the pending cover letter is generated using the
+    # saved evaluation, without a second job_evaluation call.
+    gemini2 = FakeGemini()
+    run_pipeline(settings, sources=[FakeSource([])], store=store, gemini=gemini2, telegram=telegram)
+
+    assert store.get_material(job_id) is not None
+    assert store.list_pending_ai_work("cover_letter") == []
+    assert gemini2.eval_calls == 0
+    assert gemini2.cover_letter_calls == 1
+    assert len(telegram.documents) == 1
+    # The message was already delivered in run 1; retry must not resend it.
+    assert len(telegram.messages) == 1
+
+
+def test_pipeline_defers_all_evaluations_when_context_load_is_quota_blocked(settings):
+    jobs = _jobs_for_source("ashby", 2)
+    store = JobStore(settings.db_path)
+    gemini = RaisingGemini(raise_on_purpose="candidate_context", exception=_budget_exceeded())
+    telegram = FakeTelegram()
+
+    summary = run_pipeline(settings, sources=[FakeSource(jobs)], store=store, gemini=gemini, telegram=telegram)
+
+    job_ids = [store.upsert_job(job)[0] for job in jobs]
+    pending = {row["job_id"] for row in store.list_pending_ai_work("job_evaluation")}
+
+    assert pending == set(job_ids)
+    assert all(store.get_evaluation(job_id) is None for job_id in job_ids)
+    assert summary.errors == 0
+    assert summary.skipped == 0
+    # No evaluation was even attempted; ranking degraded gracefully instead.
+    assert gemini.eval_calls == 0
 
 
 def test_pipeline_evaluates_all_eligible_jobs_when_under_budget(settings):
