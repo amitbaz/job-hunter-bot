@@ -4,11 +4,11 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+import requests
+
 from job_hunter.gemini_usage import GeminiQuotaPaused
 
 if TYPE_CHECKING:
-    import requests
-
     from job_hunter.gemini_usage import GeminiPauseKind, GeminiPurpose, GeminiUsageTracker
     from job_hunter.http import HttpClient
 
@@ -129,9 +129,23 @@ class GeminiClient:
         if generation_config:
             payload["generationConfig"] = generation_config
 
-        response = self._http.post(
-            url, json=payload, headers=headers, retry_status_codes=_RETRYABLE_STATUS_CODES
-        )
+        try:
+            response = self._http.post(
+                url,
+                json=payload,
+                headers=headers,
+                retry_status_codes=_RETRYABLE_STATUS_CODES,
+                retry=False,
+            )
+        except requests.RequestException as exc:
+            if self._tracker is not None:
+                self._tracker.record_error(
+                    purpose,
+                    prompt,
+                    now,
+                    error_code=type(exc).__name__,
+                )
+            raise
 
         if response.status_code == 429:
             kind, error_code = _classify_429(response)
