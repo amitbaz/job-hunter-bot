@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from job_hunter.models import (
     CandidatePreferences,
     CompanyWatchSeed,
     GeminiQuotaSettings,
+    GeminiUsageSummary,
     Job,
     RunSummary,
     SearchPolicy,
@@ -21,6 +23,7 @@ from job_hunter.pipeline import run_pipeline, should_run_scheduled
 from job_hunter.sources import GmailStagedSource
 from job_hunter.sources.company_watch import CompanyWatchSource
 from job_hunter.store import JobStore
+from job_hunter.telegram import build_gemini_pause_warning, build_gemini_usage_status
 from job_hunter.watchlist import promote_company as persist_promoted_company
 
 
@@ -158,6 +161,74 @@ class OrderedFakeTelegram(FakeTelegram):
     def send_document(self, path, caption):
         self.calls.append(("document", caption))
         return super().send_document(path, caption)
+
+
+class OrderedNavigatorTelegram:
+    """Records every send in order, including the interactive navigator card."""
+
+    def __init__(self):
+        self.events = []
+        self.messages = []
+        self.documents = []
+
+    def send_message(self, text):
+        self.events.append(("message", text))
+        self.messages.append(text)
+        return f"msg-{len(self.messages)}"
+
+    def send_document(self, path, caption):
+        self.events.append(("document", caption))
+        self.documents.append((path, caption))
+        return f"doc-{len(self.documents)}"
+
+    def send_job_card(self, text, keyboard):
+        self.events.append(("card", text))
+        return "card-1"
+
+
+class FakeUsageTracker:
+    """Stands in for `GeminiUsageTracker`: returns a fixed summary, once per call."""
+
+    def __init__(self, summary):
+        self.summary = summary
+        self.snapshot_calls = 0
+
+    def snapshot(self, now, run_id=None):
+        self.snapshot_calls += 1
+        return self.summary
+
+
+class RaisingSendMessageTelegram(FakeTelegram):
+    """A telegram fake whose send_message raises for messages after the digest."""
+
+    def __init__(self, fail_after=1):
+        super().__init__()
+        self._fail_after = fail_after
+        self._message_count = 0
+
+    def send_message(self, text):
+        self._message_count += 1
+        if self._message_count > self._fail_after:
+            raise RuntimeError("telegram outage")
+        return super().send_message(text)
+
+
+def _usage_summary(**overrides):
+    defaults = dict(
+        requests_today=21,
+        rpd_percent=34.0,
+        rpm_peak_percent=20.0,
+        tpm_peak_percent=17.0,
+        input_tokens_today=100_000,
+        output_tokens_today=30_000,
+        thinking_tokens_today=10_000,
+        cached_tokens_today=2_000,
+        purpose_counts={"job_evaluation": 21},
+        internal_budget_exhausted=False,
+        provider_paused=False,
+    )
+    defaults.update(overrides)
+    return GeminiUsageSummary(**defaults)
 
 
 class FakeSource:
@@ -1543,3 +1614,163 @@ def test_targeted_canonical_search_stops_after_shared_breaker_opens():
         assert _targeted_canonical_candidates(http, job, breaker) == []
 
     assert http.calls == 1
+
+
+def test_pipeline_sends_gemini_usage_status_after_digest_before_navigator(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    summary = _usage_summary()
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+    telegram = OrderedNavigatorTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    kinds = [kind for kind, _payload in telegram.events]
+    # The digest message and PDF document come first, then the usage status,
+    # then the interactive navigator card last.
+    assert kinds[-1] == "card"
+    assert kinds[-2] == "message"
+    assert telegram.events[-2][1] == build_gemini_usage_status(summary)
+    assert kinds.index("message") < kinds.index("card")
+    assert gemini._tracker.snapshot_calls == 1
+
+
+def test_pipeline_sends_gemini_pause_warning_immediately_before_usage_status(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    summary = _usage_summary(provider_paused=True)
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    expected_warning = build_gemini_pause_warning(summary)
+    expected_status = build_gemini_usage_status(summary)
+    assert expected_warning is not None
+    assert telegram.messages[-2] == expected_warning
+    assert telegram.messages[-1] == expected_status
+
+
+def test_pipeline_sends_no_warning_when_usage_is_healthy(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    summary = _usage_summary()
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert build_gemini_pause_warning(summary) is None
+    assert telegram.messages[-1] == build_gemini_usage_status(summary)
+    # Only the digest message and the usage status were sent — no warning.
+    assert len(telegram.messages) == 2
+
+
+def test_pipeline_sends_exactly_one_warning_despite_many_locally_blocked_calls(settings):
+    """Many candidates deferred by quota this run must still yield one warning."""
+    jobs = _jobs_for_source("ashby", 5)
+    store = JobStore(settings.db_path)
+    # Only the first job_evaluation call succeeds; the other four are blocked
+    # without a second wasted Gemini attempt (Task 8's short-circuit) — but
+    # the run-completion summary still reports the day as budget-exhausted.
+    gemini = RaisingGemini(raise_on_purpose="job_evaluation", exception=_budget_exceeded(), allow=1)
+    gemini._tracker = FakeUsageTracker(_usage_summary(internal_budget_exhausted=True))
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource(jobs)], store=store, gemini=gemini, telegram=telegram)
+
+    job_ids = [store.upsert_job(job)[0] for job in jobs]
+    pending = {row["job_id"] for row in store.list_pending_ai_work("job_evaluation")}
+    assert len(pending) == 4  # confirms many calls were in fact locally blocked
+
+    expected_warning = build_gemini_pause_warning(_usage_summary(internal_budget_exhausted=True))
+    warning_occurrences = [msg for msg in telegram.messages if msg == expected_warning]
+    assert len(warning_occurrences) == 1
+    assert gemini._tracker.snapshot_calls == 1
+
+
+def test_pipeline_logs_structured_gemini_usage_line(settings, caplog):
+    job = _job()
+    store = JobStore(settings.db_path)
+    summary = _usage_summary(
+        requests_today=21,
+        rpd_percent=34.0,
+        rpm_peak_percent=20.0,
+        tpm_peak_percent=17.0,
+        input_tokens_today=111,
+        output_tokens_today=22,
+        thinking_tokens_today=3,
+        purpose_counts={
+            "gmail_semantic": 5,
+            "job_evaluation": 13,
+            "cover_letter": 2,
+            "candidate_context": 1,
+        },
+    )
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+    telegram = FakeTelegram()
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert "gemini_usage run_calls=21" in caplog.text
+    assert "rpd_pct=34.0" in caplog.text
+    assert "rpm_peak_pct=20.0" in caplog.text
+    assert "tpm_peak_pct=17.0" in caplog.text
+    assert "input=111" in caplog.text
+    assert "output=22" in caplog.text
+    assert "thinking=3" in caplog.text
+    assert "gmail_semantic:5" in caplog.text
+    assert "job_evaluation:13" in caplog.text
+    assert "cover_letter:2" in caplog.text
+    assert "candidate_context:1" in caplog.text
+
+
+def test_pipeline_logs_gemini_usage_even_in_dry_run(settings, caplog):
+    dry_settings = dataclasses.replace(settings, dry_run=True)
+    job = _job()
+    store = JobStore(dry_settings.db_path)
+    summary = _usage_summary()
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(dry_settings, sources=[FakeSource([job])], store=store, gemini=gemini)
+
+    assert "gemini_usage run_calls=21" in caplog.text
+    assert gemini._tracker.snapshot_calls == 1
+
+
+def test_pipeline_survives_telegram_failure_when_sending_usage_status(settings, caplog):
+    job = _job()
+    store = JobStore(settings.db_path)
+    summary = _usage_summary()
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+    telegram = RaisingSendMessageTelegram(fail_after=1)
+
+    with caplog.at_level(logging.WARNING):
+        summary_result = run_pipeline(
+            settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram
+        )
+
+    # The pipeline completed normally despite the Telegram failure.
+    assert summary_result.ready_to_apply == 1
+    assert "telegram" in caplog.text.lower()
+
+
+def test_pipeline_without_gemini_tracker_sends_no_usage_status(settings):
+    """Legacy/test gemini fakes without a tracker must not break or send usage."""
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()  # no `_tracker` attribute at all
+    telegram = FakeTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    # Only the digest message was sent -- no usage status, no crash.
+    assert len(telegram.messages) == 1

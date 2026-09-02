@@ -2,10 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from job_hunter.models import DigestItem, ReviewItem
+from job_hunter.models import DigestItem, GeminiUsageSummary, ReviewItem
 from job_hunter.telegram import (
     TelegramClient,
     build_digest,
+    build_gemini_pause_warning,
+    build_gemini_usage_status,
     build_gmail_review_digest,
     build_gmail_review_digest_chunks,
     chunk_message,
@@ -45,6 +47,24 @@ def _item(**overrides):
     )
     defaults.update(overrides)
     return DigestItem(**defaults)
+
+
+def _usage_summary(**overrides):
+    defaults = dict(
+        requests_today=21,
+        rpd_percent=34.0,
+        rpm_peak_percent=20.0,
+        tpm_peak_percent=17.0,
+        input_tokens_today=100_000,
+        output_tokens_today=30_000,
+        thinking_tokens_today=10_000,
+        cached_tokens_today=2_000,
+        purpose_counts={"job_evaluation": 21},
+        internal_budget_exhausted=False,
+        provider_paused=False,
+    )
+    defaults.update(overrides)
+    return GeminiUsageSummary(**defaults)
 
 
 def _review_item(**overrides):
@@ -309,3 +329,102 @@ def test_send_document_returns_none_on_failure(tmp_path):
     client = TelegramClient("token123", "chat456", http)
 
     assert client.send_document(doc_path, "caption") is None
+
+
+def test_build_gemini_usage_status_matches_exact_format():
+    status = build_gemini_usage_status(_usage_summary())
+
+    assert status == (
+        "Gemini 🟢 RPD 34% · RPM peak 20% · TPM peak 17% · 21 calls · 142k tokens"
+    )
+
+
+def test_build_gemini_usage_status_rounds_percentages_to_whole_numbers():
+    status = build_gemini_usage_status(
+        _usage_summary(rpd_percent=33.6, rpm_peak_percent=19.4, tpm_peak_percent=59.5)
+    )
+
+    assert "RPD 34%" in status
+    assert "RPM peak 19%" in status
+    assert "TPM peak 60%" in status
+
+
+@pytest.mark.parametrize(
+    ("rpd", "rpm", "tpm", "expected_emoji"),
+    [
+        (10.0, 20.0, 30.0, "🟢"),
+        (59.9, 10.0, 10.0, "🟢"),
+        (60.0, 10.0, 10.0, "🟡"),
+        (10.0, 79.9, 10.0, "🟡"),
+        (10.0, 10.0, 80.0, "🔴"),
+        (95.0, 10.0, 10.0, "🔴"),
+    ],
+)
+def test_build_gemini_usage_status_color_thresholds(rpd, rpm, tpm, expected_emoji):
+    status = build_gemini_usage_status(
+        _usage_summary(rpd_percent=rpd, rpm_peak_percent=rpm, tpm_peak_percent=tpm)
+    )
+
+    assert status.startswith(f"Gemini {expected_emoji} ")
+
+
+def test_build_gemini_usage_status_is_red_when_paused_regardless_of_low_percentages():
+    status = build_gemini_usage_status(
+        _usage_summary(
+            rpd_percent=5.0,
+            rpm_peak_percent=5.0,
+            tpm_peak_percent=5.0,
+            provider_paused=True,
+        )
+    )
+
+    assert status.startswith("Gemini 🔴 ")
+
+
+def test_build_gemini_usage_status_formats_token_totals_compactly():
+    small = build_gemini_usage_status(
+        _usage_summary(
+            input_tokens_today=400,
+            output_tokens_today=100,
+            thinking_tokens_today=0,
+            cached_tokens_today=0,
+        )
+    )
+    millions = build_gemini_usage_status(
+        _usage_summary(
+            input_tokens_today=1_000_000,
+            output_tokens_today=200_000,
+            thinking_tokens_today=34_567,
+            cached_tokens_today=0,
+        )
+    )
+
+    assert small.endswith("500 tokens")
+    assert millions.endswith("1.2M tokens")
+
+
+def test_build_gemini_usage_status_does_not_invent_a_token_quota_percent():
+    status = build_gemini_usage_status(_usage_summary())
+
+    assert "TPM peak 17%" in status
+    assert "token" in status.split("·")[-1]
+    # Only three percentages ever appear: RPD, RPM peak, TPM peak.
+    assert status.count("%") == 3
+
+
+def test_build_gemini_pause_warning_returns_none_when_healthy():
+    assert build_gemini_pause_warning(_usage_summary()) is None
+
+
+def test_build_gemini_pause_warning_when_provider_paused():
+    warning = build_gemini_pause_warning(_usage_summary(provider_paused=True))
+
+    assert warning is not None
+    assert "paused" in warning.lower()
+
+
+def test_build_gemini_pause_warning_when_internal_budget_exhausted():
+    warning = build_gemini_pause_warning(_usage_summary(internal_budget_exhausted=True))
+
+    assert warning is not None
+    assert "deferred" in warning.lower()

@@ -14,13 +14,14 @@ from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.discovery import collect_candidates, metric_source_label
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
-from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
+from job_hunter.gemini_usage import GEMINI_PURPOSES, GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import normalize_company_name
 from job_hunter.models import (
     AtsReference,
     CandidateContext,
     DigestItem,
+    GeminiUsageSummary,
     Job,
     Material,
     NavigationCard,
@@ -47,6 +48,8 @@ from job_hunter.store import JobStore
 from job_hunter.telegram import (
     TelegramClient,
     build_digest,
+    build_gemini_pause_warning,
+    build_gemini_usage_status,
     build_gmail_review_digest_chunks,
     select_deliverable_items,
 )
@@ -408,6 +411,25 @@ def _retry_pending_cover_letter(
     return False
 
 
+def _format_gemini_usage_log(summary: GeminiUsageSummary) -> str:
+    """One structured log line at run completion: totals plus per-purpose counts."""
+    purposes = ",".join(
+        f"{purpose}:{summary.purpose_counts[purpose]}"
+        for purpose in GEMINI_PURPOSES
+        if purpose in summary.purpose_counts
+    )
+    return (
+        f"gemini_usage run_calls={summary.requests_today} "
+        f"rpd_pct={summary.rpd_percent:.1f} "
+        f"rpm_peak_pct={summary.rpm_peak_percent:.1f} "
+        f"tpm_peak_pct={summary.tpm_peak_percent:.1f} "
+        f"input={summary.input_tokens_today} "
+        f"output={summary.output_tokens_today} "
+        f"thinking={summary.thinking_tokens_today} "
+        f"purposes={purposes}"
+    )
+
+
 def _build_navigation_session(items: list[DigestItem], now: datetime) -> NavigationSession:
     ordered = sorted(items, key=navigation_sort_key)
     return NavigationSession(
@@ -579,6 +601,15 @@ def run_pipeline(
                 job_id, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
             )
 
+    # A tracker-less client is a test affordance only (see GeminiClient's docstring);
+    # production code always supplies one. Snapshotting once here, regardless of
+    # dry_run, gives every run (including local dry runs) the same structured log
+    # line for observability even when nothing is sent to Telegram.
+    tracker = getattr(gemini, "_tracker", None)
+    usage_summary = tracker.snapshot(datetime.now(timezone.utc)) if tracker is not None else None
+    if usage_summary is not None:
+        logger.info(_format_gemini_usage_log(usage_summary))
+
     if not settings.dry_run:
         deliverable_items = select_deliverable_items(digest_items)
         interactive_sender = getattr(telegram, "send_job_card", None)
@@ -625,6 +656,22 @@ def run_pipeline(
                 if review_message_id is None:
                     break
                 store.mark_review_delivered(event_ids, review_message_id)
+
+        # Usage status (and, if this run was paused/budget-blocked, a warning
+        # immediately before it) goes out once per run, after the digest/PDFs/Gmail
+        # review messages above but before the navigator so the navigator stays the
+        # most recent message. A Telegram outage here must not fail the pipeline.
+        if usage_summary is not None:
+            warning = build_gemini_pause_warning(usage_summary)
+            if warning is not None:
+                try:
+                    telegram.send_message(warning)
+                except Exception:
+                    logger.exception("failed to send Gemini pause warning to Telegram")
+            try:
+                telegram.send_message(build_gemini_usage_status(usage_summary))
+            except Exception:
+                logger.exception("failed to send Gemini usage status to Telegram")
 
         # Real TelegramClient supports interactive cards. Send the navigator last so it
         # remains the most recent message after PDFs and Gmail review notifications.
