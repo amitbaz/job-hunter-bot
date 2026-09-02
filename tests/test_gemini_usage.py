@@ -437,6 +437,41 @@ def test_snapshot_falls_back_to_estimate_when_no_usage_metadata(store, tracker):
 
     assert summary.input_tokens_today == 17
     assert summary.output_tokens_today == 0
+    # No usageMetadata at all means no total_tokens either; the reconstruction
+    # falls back to input(estimate) + output(0) + thinking(0), same as above.
+    assert summary.total_tokens_today == 17
+
+
+def test_snapshot_uses_authoritative_total_tokens_not_a_naive_component_sum(store, tracker):
+    """`cachedContentTokenCount` is a subset of `promptTokenCount`, not additional
+
+    to it, so Google's own `totalTokenCount` for one call with
+    promptTokenCount=1000 (400 of which were cached), candidatesTokenCount=200,
+    and thoughtsTokenCount=50 is 1250 -- never `1000 + 200 + 50 + 400 = 1650`.
+    """
+    store.record_gemini_usage(
+        occurred_at=NOW.isoformat(),
+        run_id="run-1",
+        model=MODEL,
+        purpose="job_evaluation",
+        status="success",
+        estimated_input_tokens=999,
+        prompt_tokens=1000,
+        output_tokens=200,
+        thinking_tokens=50,
+        cached_tokens=400,
+        total_tokens=1250,
+    )
+
+    summary = tracker.snapshot(NOW)
+
+    assert summary.total_tokens_today == 1250
+    assert (
+        summary.input_tokens_today
+        + summary.output_tokens_today
+        + summary.thinking_tokens_today
+        + summary.cached_tokens_today
+    ) == 1650
 
 
 def test_snapshot_excludes_blocked_budget_rows_from_provider_percentages(store, tracker):

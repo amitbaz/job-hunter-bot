@@ -79,6 +79,21 @@ def _row_input_tokens(row: sqlite3.Row) -> int:
     return row["estimated_input_tokens"]
 
 
+def _row_total_tokens(row: sqlite3.Row) -> int:
+    """Google's own `totalTokenCount` where reported, else a reconstructed estimate.
+
+    `totalTokenCount` already equals `promptTokenCount + candidatesTokenCount +
+    thoughtsTokenCount` with no separate term for cached tokens (they are a
+    subset of `promptTokenCount`), so this is never `input + output + thinking
+    + cached`. A row with no `usageMetadata` at all has no `total_tokens`
+    either; its reconstruction below intentionally mirrors that same formula
+    (input estimate + output + thinking, no cached) rather than inventing one.
+    """
+    if row["total_tokens"] is not None:
+        return row["total_tokens"]
+    return _row_input_tokens(row) + (row["output_tokens"] or 0) + (row["thinking_tokens"] or 0)
+
+
 def _peak_rolling(rows: list[sqlite3.Row], window: timedelta) -> tuple[int, int]:
     """Peak (request count, input tokens) over any `window`-wide span in `rows`.
 
@@ -279,13 +294,14 @@ class GeminiUsageTracker:
         peak_requests, peak_tokens = _peak_rolling(provider_rows, _ROLLING_WINDOW)
 
         purpose_counts: dict[str, int] = {}
-        input_tokens = output_tokens = thinking_tokens = cached_tokens = 0
+        input_tokens = output_tokens = thinking_tokens = cached_tokens = total_tokens = 0
         for row in provider_rows:
             purpose_counts[row["purpose"]] = purpose_counts.get(row["purpose"], 0) + 1
             input_tokens += _row_input_tokens(row)
             output_tokens += row["output_tokens"] or 0
             thinking_tokens += row["thinking_tokens"] or 0
             cached_tokens += row["cached_tokens"] or 0
+            total_tokens += _row_total_tokens(row)
 
         rpd_ceiling = math.floor(quota.rpd * quota.ceiling_ratio)
         core_reserve = math.floor(rpd_ceiling * quota.core_reserve_ratio)
@@ -307,6 +323,7 @@ class GeminiUsageTracker:
             output_tokens_today=output_tokens,
             thinking_tokens_today=thinking_tokens,
             cached_tokens_today=cached_tokens,
+            total_tokens_today=total_tokens,
             purpose_counts=purpose_counts,
             internal_budget_exhausted=requests_today >= non_core_daily_limit,
             provider_paused=provider_paused,

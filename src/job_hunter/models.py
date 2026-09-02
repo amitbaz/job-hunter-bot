@@ -226,6 +226,13 @@ class GeminiUsageSummary:
     Percentages are against the configured provider limit, not the internal
     80% ceiling. Token totals and `requests_today` cover only attempts that
     reached the provider (blocked_budget rows never happened at Google).
+
+    `cached_tokens_today` is a subset of `input_tokens_today` (Google's
+    `cachedContentTokenCount` is part of `promptTokenCount`, not additional to
+    it), so `total_tokens_today` is Google's own `totalTokenCount` for each
+    attempt (falling back to a reconstructed input+output+thinking estimate
+    only when a row has no `usageMetadata` at all) rather than a naive sum of
+    the four token fields above, which would double-count the cached portion.
     """
 
     requests_today: int
@@ -236,6 +243,7 @@ class GeminiUsageSummary:
     output_tokens_today: int
     thinking_tokens_today: int
     cached_tokens_today: int
+    total_tokens_today: int
     purpose_counts: dict[str, int]
     internal_budget_exhausted: bool
     provider_paused: bool

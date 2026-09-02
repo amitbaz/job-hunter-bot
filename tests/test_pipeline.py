@@ -219,10 +219,13 @@ def _usage_summary(**overrides):
         rpd_percent=34.0,
         rpm_peak_percent=20.0,
         tpm_peak_percent=17.0,
-        input_tokens_today=100_000,
+        # cached_tokens_today is a subset of input_tokens_today, so
+        # total_tokens_today is input+output+thinking (142k), not +cached too.
+        input_tokens_today=102_000,
         output_tokens_today=30_000,
         thinking_tokens_today=10_000,
         cached_tokens_today=2_000,
+        total_tokens_today=142_000,
         purpose_counts={"job_evaluation": 21},
         internal_budget_exhausted=False,
         provider_paused=False,
@@ -1765,6 +1768,43 @@ def test_pipeline_logs_structured_gemini_usage_line(settings, caplog):
     assert "job_evaluation:13" in caplog.text
     assert "cover_letter:2" in caplog.text
     assert "candidate_context:1" in caplog.text
+
+
+def test_pipeline_telegram_total_and_log_total_agree_on_cached_tokens(settings, caplog):
+    """Regression: the Telegram usage figure and the structured log must agree.
+
+    One real Gemini call: promptTokenCount=1000 (400 cached),
+    candidatesTokenCount=200, thoughtsTokenCount=50 -> Google's real total is
+    1250. The structured log's input+output+thinking (1000+200+50=1250) must
+    match the Telegram status's token total exactly -- if a future change
+    reintroduces double-counting cached tokens in one of the two call sites
+    but not the other, this test catches the drift between them.
+    """
+    job = _job()
+    store = JobStore(settings.db_path)
+    summary = _usage_summary(
+        requests_today=1,
+        input_tokens_today=1000,
+        output_tokens_today=200,
+        thinking_tokens_today=50,
+        cached_tokens_today=400,
+        total_tokens_today=1250,
+    )
+    gemini = FakeGemini()
+    gemini._tracker = FakeUsageTracker(summary)
+    telegram = FakeTelegram()
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert "input=1000" in caplog.text
+    assert "output=200" in caplog.text
+    assert "thinking=50" in caplog.text
+    log_total = 1000 + 200 + 50  # what the structured log's fields sum to
+    assert log_total == summary.total_tokens_today == 1250
+
+    assert telegram.messages[-1] == build_gemini_usage_status(summary)
+    assert telegram.messages[-1].endswith("1k tokens")
 
 
 def test_pipeline_logs_gemini_usage_even_in_dry_run(settings, caplog):

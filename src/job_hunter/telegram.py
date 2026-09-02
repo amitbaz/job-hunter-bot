@@ -235,21 +235,19 @@ def build_gemini_usage_status(summary: GeminiUsageSummary) -> str:
 
     Only the three provider-quota percentages (RPD/RPM peak/TPM peak) are
     shown; there is no configured daily token quota to compute a percentage
-    against, so none is invented.
+    against, so none is invented. The token total is `total_tokens_today`
+    (Google's own `totalTokenCount`, or the tracker's reconstruction where
+    that was unavailable) rather than a sum of the four component fields --
+    `cached_tokens_today` is a subset of `input_tokens_today`, not additional
+    to it, so summing all four would double-count the cached portion.
     """
-    total_tokens = (
-        summary.input_tokens_today
-        + summary.output_tokens_today
-        + summary.thinking_tokens_today
-        + summary.cached_tokens_today
-    )
     return (
         f"Gemini {_usage_emoji(summary)} "
         f"RPD {round(summary.rpd_percent)}% · "
         f"RPM peak {round(summary.rpm_peak_percent)}% · "
         f"TPM peak {round(summary.tpm_peak_percent)}% · "
         f"{summary.requests_today} calls · "
-        f"{_format_token_total(total_tokens)} tokens"
+        f"{_format_token_total(summary.total_tokens_today)} tokens"
     )
 
 

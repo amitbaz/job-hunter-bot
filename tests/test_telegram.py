@@ -55,10 +55,15 @@ def _usage_summary(**overrides):
         rpd_percent=34.0,
         rpm_peak_percent=20.0,
         tpm_peak_percent=17.0,
-        input_tokens_today=100_000,
+        # cached_tokens_today is a subset of input_tokens_today (Google's
+        # cachedContentTokenCount is part of promptTokenCount, not additional
+        # to it), so total_tokens_today is input+output+thinking (142k), not
+        # input+output+thinking+cached.
+        input_tokens_today=102_000,
         output_tokens_today=30_000,
         thinking_tokens_today=10_000,
         cached_tokens_today=2_000,
+        total_tokens_today=142_000,
         purpose_counts={"job_evaluation": 21},
         internal_budget_exhausted=False,
         provider_paused=False,
@@ -388,6 +393,7 @@ def test_build_gemini_usage_status_formats_token_totals_compactly():
             output_tokens_today=100,
             thinking_tokens_today=0,
             cached_tokens_today=0,
+            total_tokens_today=500,
         )
     )
     millions = build_gemini_usage_status(
@@ -396,11 +402,43 @@ def test_build_gemini_usage_status_formats_token_totals_compactly():
             output_tokens_today=200_000,
             thinking_tokens_today=34_567,
             cached_tokens_today=0,
+            total_tokens_today=1_234_567,
         )
     )
 
     assert small.endswith("500 tokens")
     assert millions.endswith("1.2M tokens")
+
+
+def test_build_gemini_usage_status_does_not_double_count_cached_tokens():
+    """Regression: cachedContentTokenCount is a subset of promptTokenCount.
+
+    One real Gemini call: promptTokenCount=1000 (400 of which were cached),
+    candidatesTokenCount=200, thoughtsTokenCount=50 -> Google's own
+    totalTokenCount is 1250. The old buggy formula
+    (input + output + thinking + cached) rendered 1650, a 32% overcount.
+    """
+    summary = _usage_summary(
+        requests_today=1,
+        input_tokens_today=1000,
+        output_tokens_today=200,
+        thinking_tokens_today=50,
+        cached_tokens_today=400,
+        total_tokens_today=1250,
+    )
+    # The buggy formula this guards against would have summed to 1650.
+    assert (
+        summary.input_tokens_today
+        + summary.output_tokens_today
+        + summary.thinking_tokens_today
+        + summary.cached_tokens_today
+    ) == 1650
+
+    status = build_gemini_usage_status(summary)
+
+    # 1250 compacts to "1k"; the double-counted 1650 would have shown "2k".
+    assert status.endswith("1k tokens")
+    assert not status.endswith("2k tokens")
 
 
 def test_build_gemini_usage_status_does_not_invent_a_token_quota_percent():
