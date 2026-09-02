@@ -6,6 +6,7 @@ from job_hunter.ranking import (
     select_diverse_candidates,
     source_quality,
 )
+from tests.market_fixtures import make_market_policy
 
 
 def make_policy() -> SearchPolicy:
@@ -204,3 +205,66 @@ def test_select_diverse_candidates_fills_budget_when_share_cap_blocks_remaining_
     for _job_id, job, _score in selected:
         counts[job.source] = counts.get(job.source, 0) + 1
     assert counts == {"ashby": 18, "remotive": 17}
+
+
+def test_frontend_heavy_full_stack_beats_backend_heavy_full_stack():
+    policy = make_market_policy()
+    preferences = make_preferences()
+    frontend_heavy = Job(source="wellfound", title="Full-Stack Engineer", market_id="germany_eu", description="React Next.js TypeScript frontend, Node.js REST APIs and PostgreSQL")
+    backend_heavy = Job(source="wellfound", title="Full-Stack Engineer", market_id="germany_eu", description="Go Java Kubernetes distributed systems event-driven backend architecture")
+    assert profile_priority_score(frontend_heavy, preferences, policy) > profile_priority_score(backend_heavy, preferences, policy)
+
+
+def test_london_hybrid_gets_nonzero_location_fit():
+    policy = make_market_policy()
+    job = Job(source="x", title="Senior Frontend Engineer", location="London - Hybrid", remote=False, market_id="london", description="React TypeScript")
+    assert profile_priority_score(job, make_preferences(), policy) > 0
+
+
+def test_strong_london_role_can_outrank_weak_germany_role():
+    # Germany is the highest-priority market (first in policy.markets), so its
+    # market_priority_bonus outweighs London's. A much stronger overall London
+    # candidate should still outrank a weak Germany candidate: the market
+    # bonus must be a modest nudge, not an absolute partition.
+    policy = make_market_policy()
+    preferences = make_preferences()
+    strong_london = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
+        company="A",
+        location="London",
+        remote=False,
+        market_id="london",
+        description="React TypeScript design system mentorship architecture",
+    )
+    weak_germany = Job(
+        source="duckduckgo",
+        title="Backend Developer",
+        company="B",
+        location="",
+        remote=False,
+        market_id="germany_eu",
+        description="Some role at a startup.",
+    )
+    assert profile_priority_score(strong_london, preferences, policy) > profile_priority_score(weak_germany, preferences, policy)
+
+
+def test_market_priority_bonus_rewards_higher_priority_market():
+    policy = make_market_policy()
+    from job_hunter.ranking import market_priority_bonus
+
+    germany_job = Job(source="ashby", title="x", market_id="germany_eu")
+    london_job = Job(source="ashby", title="x", market_id="london")
+    no_market_job = Job(source="ashby", title="x")
+    unknown_market_job = Job(source="ashby", title="x", market_id="nowhere")
+
+    assert market_priority_bonus(germany_job, policy) > market_priority_bonus(london_job, policy) > 0
+    assert market_priority_bonus(no_market_job, policy) == 0
+    assert market_priority_bonus(unknown_market_job, policy) == 0
+
+
+def test_specialist_board_url_source_quality_between_ats_and_generic_web():
+    ats = Job(source="ashby", title="x", url="https://jobs.ashbyhq.com/acme/1")
+    specialist = Job(source="duckduckgo", title="x", url="https://wellfound.com/jobs/123")
+    generic = Job(source="duckduckgo", title="x", url="https://example.com/jobs/123")
+    assert source_quality(ats) > source_quality(specialist) > source_quality(generic)

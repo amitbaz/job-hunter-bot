@@ -8,6 +8,22 @@ from job_hunter.normalize import normalize_text
 
 _ATS_HOSTS = ("jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io")
 
+# Approved market-specialist boards (config/search.yml markets[*].source_domains):
+# hand-picked per market, but not the canonical direct-employer link an ATS
+# host is, so they rank below ATS and above generic web/aggregator results.
+_SPECIALIST_BOARD_HOSTS = (
+    "wellfound.com",
+    "jobs.techaviv.com",
+    "devjobs.co.il",
+    "workvisajobs.co.uk",
+    "nodeflair.com",
+    "sg.jobstreet.com",
+    "mycareersfuture.gov.sg",
+    "builtin.com",
+    "startup.jobs",
+    "ycombinator.com",
+)
+
 _CAREER_SIGNALS = (
     "ownership",
     "architecture",
@@ -35,6 +51,8 @@ def source_quality(job: Job) -> int:
         return 10
     if job.source in {"ashby", "lever", "greenhouse"}:
         return 10
+    if any(host in url for host in _SPECIALIST_BOARD_HOSTS):
+        return 8
     if job.source in {"remoteok", "remotive", "weworkremotely", "arbeitnow"}:
         return 7
     if job.source == "hackernews":
@@ -154,6 +172,83 @@ def _profile_location_fit(job: Job, preferences: CandidatePreferences) -> int:
     return 5
 
 
+# Markets where remote work is the primary/preferred mode of engagement
+# (config/search.yml remote_policy: "preferred" or "required") count as the
+# candidate's "home" market for location scoring - remote roles there score
+# highest, ahead of remote roles in relocation-style markets.
+_HOME_MARKET_REMOTE_POLICIES = frozenset({"preferred", "required"})
+
+
+def _market_location_fit(job: Job, preferences: CandidatePreferences, policy: SearchPolicy) -> int:
+    if not job.market_id:
+        return _profile_location_fit(job, preferences)
+
+    market = next((m for m in policy.markets if m.id == job.market_id), None)
+    if market is None:
+        return _profile_location_fit(job, preferences)
+
+    location_text = normalize_text(" ".join([job.location or "", job.description or ""]))
+    target_city_match = any(normalize_text(city) in location_text for city in market.locations)
+    home_market = market.remote_policy in _HOME_MARKET_REMOTE_POLICIES
+
+    if job.remote:
+        if home_market:
+            return 15
+        return 10 if target_city_match else 8
+    if target_city_match:
+        return 12 if home_market else 10
+    return 0
+
+
+_FULL_STACK_TITLE_PHRASES = ("full stack", "full-stack")
+
+_FRONTEND_SIGNALS = (
+    "react",
+    "next.js",
+    "nextjs",
+    "frontend",
+    "front-end",
+    "typescript",
+    "design system",
+)
+
+_BACKEND_HEAVY_SIGNALS = (
+    "distributed systems",
+    "kubernetes",
+    "golang",
+    "java",
+    "event-driven architecture",
+    "backend architecture",
+    "high-throughput",
+    "message queues",
+)
+
+
+def _backend_transition_penalty(job: Job) -> int:
+    normalized_title = normalize_text(job.title or "")
+    if not any(phrase in normalized_title for phrase in _FULL_STACK_TITLE_PHRASES):
+        return 0
+
+    haystack = normalize_text(" ".join([job.title or "", job.description or ""]))
+    frontend_matches = sum(1 for signal in _FRONTEND_SIGNALS if signal in haystack)
+    backend_matches = sum(1 for signal in _BACKEND_HEAVY_SIGNALS if signal in haystack)
+
+    if backend_matches < 2:
+        return 0
+    if frontend_matches == 0:
+        return 15
+    return 6
+
+
+def market_priority_bonus(job: Job, policy: SearchPolicy) -> int:
+    if not job.market_id:
+        return 0
+    for index, market in enumerate(policy.markets):
+        if market.id == job.market_id:
+            return max(0, len(policy.markets) - index)
+    return 0
+
+
 def _avoid_signal_penalty(job: Job, preferences: CandidatePreferences) -> int:
     avoid_signals = _normalized_phrases(preferences.avoid_signals)
     if not avoid_signals:
@@ -165,13 +260,14 @@ def _avoid_signal_penalty(job: Job, preferences: CandidatePreferences) -> int:
 
 
 def profile_priority_score(job: Job, preferences: CandidatePreferences, policy: SearchPolicy) -> int:
-    del policy
     total = (
         _role_seniority_fit(job, preferences)
         + _signal_coverage(job, preferences)
-        + _profile_location_fit(job, preferences)
+        + _market_location_fit(job, preferences, policy)
         + source_quality(job)
+        + market_priority_bonus(job, policy)
         - _avoid_signal_penalty(job, preferences)
+        - _backend_transition_penalty(job)
     )
     return max(0, min(100, total))
 
