@@ -18,13 +18,39 @@ class HttpClient:
         self._session.headers.update({"User-Agent": "job-hunter-bot/1.0"})
         self._timeout = (5, 25)
 
-    def get(self, url: str, *, retry_status_codes: set[int] | None = None, **kwargs) -> requests.Response:
+    def get(
+        self,
+        url: str,
+        *,
+        retry_status_codes: set[int] | None = None,
+        retry_exceptions: bool = True,
+        **kwargs,
+    ) -> requests.Response:
         kwargs.setdefault("timeout", self._timeout)
-        return self._request("GET", url, retry_status_codes=retry_status_codes, **kwargs)
+        return self._request(
+            "GET",
+            url,
+            retry_status_codes=retry_status_codes,
+            retry_exceptions=retry_exceptions,
+            **kwargs,
+        )
 
-    def post(self, url: str, *, retry_status_codes: set[int] | None = None, **kwargs) -> requests.Response:
+    def post(
+        self,
+        url: str,
+        *,
+        retry_status_codes: set[int] | None = None,
+        retry_exceptions: bool = True,
+        **kwargs,
+    ) -> requests.Response:
         kwargs.setdefault("timeout", self._timeout)
-        return self._request("POST", url, retry_status_codes=retry_status_codes, **kwargs)
+        return self._request(
+            "POST",
+            url,
+            retry_status_codes=retry_status_codes,
+            retry_exceptions=retry_exceptions,
+            **kwargs,
+        )
 
     def get_json(self, url: str, **kwargs) -> dict:
         response = self.get(url, **kwargs)
@@ -37,6 +63,7 @@ class HttpClient:
         url: str,
         *,
         retry_status_codes: set[int] | None = None,
+        retry_exceptions: bool = True,
         **kwargs,
     ) -> requests.Response:
         retry_codes = _RETRY_STATUS_CODES if retry_status_codes is None else retry_status_codes
@@ -50,6 +77,8 @@ class HttpClient:
                 return response
             except requests.RequestException as exc:
                 last_exc = exc
+                if not retry_exceptions:
+                    raise
                 if attempt < _MAX_RETRIES:
                     time.sleep(_BACKOFF_BASE * (2 ** attempt))
         if last_exc is not None:
