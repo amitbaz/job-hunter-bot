@@ -54,12 +54,36 @@ _PREFERENCES_MAX_SUMMARY_LENGTH = 280
 _PREFERENCES_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "preferred_roles": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "preferred_seniority": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "must_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "nice_to_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "preferred_locations": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "avoid_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "preferred_roles": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "preferred_seniority": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "must_have_signals": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "nice_to_have_signals": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "preferred_locations": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "avoid_signals": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
         "summary": {"type": "STRING"},
     },
     "required": list(_PREFERENCES_FIELDS),
@@ -69,7 +93,14 @@ CANDIDATE_CONTEXT_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "preferences": _PREFERENCES_SCHEMA,
-        **{field: {"type": "ARRAY", "items": {"type": "STRING"}} for field in _EVIDENCE_FIELDS},
+        **{
+            field: {
+                "type": "ARRAY",
+                "items": {"type": "STRING"},
+                "maxItems": _MAX_LIST_ITEMS,
+            }
+            for field in _EVIDENCE_FIELDS
+        },
         "evaluation_summary": {"type": "STRING"},
     },
     "required": list(_TOP_LEVEL_FIELDS),
@@ -148,11 +179,16 @@ def _cache_key(profile_hash: str, model: str, schema_version: str) -> str:
     return _hash(f"{profile_hash}\x1f{model}\x1f{schema_version}")
 
 
+def _missing_fields(data: dict, required: tuple[str, ...]) -> list[str]:
+    return [field for field in required if field not in data]
+
+
 def _parse_preferences(data: object) -> CandidatePreferences:
     if not isinstance(data, dict):
         raise ValueError("preferences must be a JSON object")
-    if set(data) != set(_PREFERENCES_FIELDS):
-        raise ValueError(f"preferences must contain exactly {_PREFERENCES_FIELDS}")
+    missing = _missing_fields(data, _PREFERENCES_FIELDS)
+    if missing:
+        raise ValueError(f"preferences missing required fields: {', '.join(missing)}")
 
     summary = data.get("summary")
     if not isinstance(summary, str):
@@ -180,8 +216,9 @@ def _parse_context(raw: str) -> CandidateContext:
 
     if not isinstance(data, dict):
         raise ValueError("response must be a JSON object")
-    if set(data) != set(_TOP_LEVEL_FIELDS):
-        raise ValueError(f"response must contain exactly {_TOP_LEVEL_FIELDS}")
+    missing = _missing_fields(data, _TOP_LEVEL_FIELDS)
+    if missing:
+        raise ValueError(f"response missing required fields: {', '.join(missing)}")
 
     evaluation_summary = data.get("evaluation_summary")
     if not isinstance(evaluation_summary, str):
@@ -238,6 +275,26 @@ def _context_from_dict(data: dict) -> CandidateContext:
     )
 
 
+def _fallback_after_error(policy: SearchPolicy, exc: Exception, *, reason: str = "") -> CandidateContext:
+    error_name = type(exc).__name__
+    if reason:
+        logger.warning(
+            "candidate context extraction failed; using fallback: error=%s reason=%s",
+            error_name,
+            reason,
+        )
+    else:
+        logger.warning(
+            "candidate context extraction failed; using fallback: error=%s",
+            error_name,
+        )
+    return _fallback_context(
+        policy,
+        source="fallback_error",
+        load_error=error_name,
+    )
+
+
 def get_candidate_context(
     profile: str,
     policy: SearchPolicy,
@@ -264,20 +321,17 @@ def get_candidate_context(
             json_mode=True,
             json_schema=CANDIDATE_CONTEXT_SCHEMA,
         )
-        context = _parse_context(raw)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
         raise
     except Exception as exc:
-        error_name = type(exc).__name__
-        logger.warning(
-            "candidate context extraction failed; using fallback: error=%s",
-            error_name,
-        )
-        return _fallback_context(
-            policy,
-            source="fallback_error",
-            load_error=error_name,
-        )
+        return _fallback_after_error(policy, exc)
+
+    try:
+        context = _parse_context(raw)
+    except ValueError as exc:
+        return _fallback_after_error(policy, exc, reason=" ".join(str(exc).split())[:240])
+    except Exception as exc:
+        return _fallback_after_error(policy, exc)
 
     store.save_candidate_context(
         cache_key=cache_key,
