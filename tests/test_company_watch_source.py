@@ -376,3 +376,44 @@ def test_generic_watch_accepts_compatible_json_ld_job_types(tmp_path, job_type):
     assert [(job.title, job.url) for job in jobs] == [
         ("Frontend Engineer", "https://acme.test/jobs/frontend-engineer")
     ]
+
+
+def test_company_only_watch_is_skipped_without_recording_failure(tmp_path, caplog):
+    store = JobStore(tmp_path / "state.sqlite3")
+    placeholder_id = store.upsert_company_watch(
+        company_name="Distribusion Technologies",
+        careers_url="",
+        ats_provider=None,
+        ats_identifier=None,
+        discovered_from_job_id=None,
+        promotion_source="automatic",
+        confidence=1.0,
+    )
+    _watch(store, "Healthy", "healthy")
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    http = FakeHttp(
+        {
+            "jobs": [
+                {
+                    "id": 42,
+                    "title": "Engineer",
+                    "location": {"name": "Remote"},
+                    "absolute_url": "https://boards.greenhouse.io/healthy/jobs/42",
+                    "content": "<p>Work</p>",
+                }
+            ]
+        }
+    )
+
+    with caplog.at_level("WARNING"):
+        jobs = CompanyWatchSource(store, http, now=lambda: now).discover()
+
+    assert [job.source for job in jobs] == ["watch:greenhouse"]
+    assert "Distribusion Technologies" not in caplog.text
+
+    placeholder = store.get_company_watch("Distribusion Technologies")
+    assert placeholder["id"] == placeholder_id
+    assert placeholder["consecutive_failures"] == 0
+    assert placeholder["paused_until"] is None
+    assert placeholder["last_verified_at"] is None
+    assert placeholder["last_successful_check_at"] is None

@@ -54,6 +54,15 @@ class _HealthTrackingHttp:
             raise
 
 
+def _has_endpoint(watch) -> bool:
+    """Return whether a watch names an endpoint that can actually be checked."""
+    provider = (watch["ats_provider"] or "").strip().lower()
+    identifier = (watch["ats_identifier"] or "").strip()
+    if provider in _ATS_SOURCE_TYPES and identifier:
+        return True
+    return bool((watch["careers_url"] or "").strip())
+
+
 class CompanyWatchSource:
     """Check each due watch independently and persist endpoint health."""
 
@@ -72,6 +81,11 @@ class CompanyWatchSource:
         checked_at = self._now()
         discovered: list[Job] = []
         for watch in self._store.list_due_company_watches(checked_at):
+            if not _has_endpoint(watch):
+                # A company-only watch is a placeholder awaiting endpoint
+                # repair, not an unhealthy endpoint. Checking it would record
+                # a failure for a check that never happened.
+                continue
             try:
                 jobs = self._discover_watch(watch)
             except Exception:
