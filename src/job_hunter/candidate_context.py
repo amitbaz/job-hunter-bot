@@ -54,12 +54,36 @@ _PREFERENCES_MAX_SUMMARY_LENGTH = 280
 _PREFERENCES_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "preferred_roles": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "preferred_seniority": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "must_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "nice_to_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "preferred_locations": {"type": "ARRAY", "items": {"type": "STRING"}},
-        "avoid_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "preferred_roles": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "preferred_seniority": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "must_have_signals": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "nice_to_have_signals": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "preferred_locations": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
+        "avoid_signals": {
+            "type": "ARRAY",
+            "items": {"type": "STRING"},
+            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
+        },
         "summary": {"type": "STRING"},
     },
     "required": list(_PREFERENCES_FIELDS),
@@ -69,7 +93,14 @@ CANDIDATE_CONTEXT_SCHEMA = {
     "type": "OBJECT",
     "properties": {
         "preferences": _PREFERENCES_SCHEMA,
-        **{field: {"type": "ARRAY", "items": {"type": "STRING"}} for field in _EVIDENCE_FIELDS},
+        **{
+            field: {
+                "type": "ARRAY",
+                "items": {"type": "STRING"},
+                "maxItems": _MAX_LIST_ITEMS,
+            }
+            for field in _EVIDENCE_FIELDS
+        },
         "evaluation_summary": {"type": "STRING"},
     },
     "required": list(_TOP_LEVEL_FIELDS),
