@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime, timezone
 
 import pytest
 
@@ -670,6 +671,52 @@ def test_collect_candidates_survives_unattributed_uncertainty_for_remote_job(
     job_id, job = result.eligible[0]
     assert job.market_id == "germany_eu"
     assert result.stats.eligible_by_market == {"germany_eu": 1}
+
+
+def test_collect_candidates_teaches_ats_board_even_for_backend_only_role(store, policy):
+    job = Job(
+        source="feed",
+        title="Backend Engineer",
+        company="Example",
+        url="https://jobs.ashbyhq.com/example/backend-1",
+        description="Python backend services",
+    )
+
+    result = collect_candidates([FakeSource([job])], store, NoOpHttp(), policy)
+
+    assert result.eligible == []
+    assert store.count_ats_boards() == 1
+
+
+def test_collect_candidates_teaches_ats_board_from_canonical_resolution(store, policy):
+    job = Job(
+        source="aggregator",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://aggregator.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    resolver = FakeResolver(
+        CanonicalResolution(
+            url="https://boards.greenhouse.io/acme/jobs/123",
+            ats=AtsReference(provider="greenhouse", board="acme", job_id="123"),
+            confidence=0.9,
+            method="targeted_search",
+        )
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    assert len(result.eligible) == 1
+    assert store.count_ats_boards() == 1
+    due = store.list_due_ats_boards(datetime.now(timezone.utc))
+    assert [(entry.provider, entry.board_identifier) for entry in due] == [
+        ("greenhouse", "acme")
+    ]
 
 
 def test_collect_candidates_counts_one_eligible_per_canonical_duplicate_group_by_market(

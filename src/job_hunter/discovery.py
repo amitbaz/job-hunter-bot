@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
+from job_hunter.ats_registry import harvest_ats_board
 from job_hunter.canonical import CanonicalResolver
 from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
@@ -190,6 +192,18 @@ def _bump(counts: dict[str, int], key: str) -> None:
     counts[key] = counts.get(key, 0) + 1
 
 
+def _harvest_ats_board_safely(
+    store: JobStore, job: Job, market_hint: str | None = None
+) -> None:
+    """Learn a job's ATS board without letting a registry write drop the job."""
+    try:
+        harvest_ats_board(store, job, market_hint=market_hint)
+    except Exception:
+        logger.exception(
+            "ATS board harvesting failed: source=%s", metric_source_label(job.source)
+        )
+
+
 def _record_reattribution(
     stats: DiscoveryStats,
     before: str | None,
@@ -274,6 +288,7 @@ def collect_candidates(
 
     for job in unique_jobs:
         observed_market_id = _cheap_market_attribution(job, policy)
+        _harvest_ats_board_safely(store, job, market_hint=observed_market_id)
         if job.url and not job.description:
             enrich_job(job, http)
 
@@ -326,6 +341,7 @@ def collect_candidates(
                         job.ats_provider = resolution.ats.provider
                         job.ats_board = resolution.ats.board
                         job.ats_job_id = resolution.ats.job_id
+                        _harvest_ats_board_safely(store, job)
                     # Canonical resolution can surface stronger, directly
                     # observed location evidence than the query-time hint that
                     # seeded the earlier attribution above, so re-run it
@@ -351,6 +367,16 @@ def collect_candidates(
         eligible_job_ids.add(job_id)
         eligible.append((job_id, job))
         _bump(stats.eligible_by_market, job.market_id or _UNATTRIBUTED)
+        if job.ats_provider and job.ats_board:
+            try:
+                store.record_ats_eligible_job(
+                    job.ats_provider, job.ats_board, datetime.now(timezone.utc)
+                )
+            except Exception:
+                logger.exception(
+                    "recording ATS-eligible job failed: source=%s",
+                    metric_source_label(job.source),
+                )
 
     stats.eligible = len(eligible)
     logger.info(
