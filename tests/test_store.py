@@ -1,6 +1,9 @@
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 from threading import Barrier, BrokenBarrierError
+
+import pytest
 
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import Evaluation, Job, Material
@@ -401,6 +404,66 @@ def test_equal_strength_target_replaces_only_at_higher_confidence(tmp_path):
     assert row["careers_url"] == "https://beta.test/jobs"
     assert row["confidence"] == 0.9
     assert row["promotion_source"] == "manual"
+
+
+def test_ats_registry_upsert_is_provider_board_unique():
+    store = JobStore(":memory:")
+
+    created = store.upsert_ats_board(
+        provider="ashby",
+        board_identifier="omnea",
+        company_name="Omnea",
+        market_hint="london",
+    )
+    repeated = store.upsert_ats_board(
+        provider="ashby",
+        board_identifier="omnea",
+        company_name="Omnea Ltd",
+        market_hint="london",
+    )
+
+    assert created is True
+    assert repeated is False
+    assert store.count_ats_boards() == 1
+
+
+def test_ats_registry_rejects_unsupported_provider():
+    store = JobStore(":memory:")
+    with pytest.raises(ValueError, match="unsupported ATS provider"):
+        store.upsert_ats_board(provider="workday", board_identifier="x")
+
+
+def test_ats_failure_pauses_board_without_rediscovery_bypassing_pause():
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="lever", board_identifier="acme")
+
+    store.record_ats_scan_failure("lever", "acme", now)
+    store.upsert_ats_board(provider="lever", board_identifier="acme")
+
+    assert store.list_due_ats_boards(now + timedelta(hours=1)) == []
+    due = store.list_due_ats_boards(now + timedelta(hours=25))
+    assert [(entry.provider, entry.board_identifier) for entry in due] == [
+        ("lever", "acme")
+    ]
+
+
+def test_ats_scan_success_records_job_count_and_resets_failures():
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="greenhouse", board_identifier="acme")
+
+    store.record_ats_scan_failure("greenhouse", "acme", now)
+    later = now + timedelta(hours=1)
+    store.record_ats_scan_success("greenhouse", "acme", later, job_count=7)
+
+    due = store.list_due_ats_boards(later)
+    assert len(due) == 1
+    entry = due[0]
+    assert entry.last_job_count == 7
+    assert entry.last_success_at == later.isoformat()
+    assert entry.consecutive_failures == 0
+    assert entry.paused_until is None
 
 
 def test_record_job_source_is_idempotent(tmp_path):

@@ -110,6 +110,24 @@ class CanonicalResolution:
     method: str
 
 
+@dataclass(frozen=True, slots=True)
+class AtsRegistryEntry:
+    provider: str
+    board_identifier: str
+    company_name: str
+    market_hint: str
+    first_seen_at: str
+    last_seen_at: str
+    last_checked_at: str | None
+    last_success_at: str | None
+    last_eligible_at: str | None
+    last_job_count: int
+    eligible_jobs_seen: int
+    consecutive_failures: int
+    active: bool
+    paused_until: str | None
+
+
 @dataclass(slots=True)
 class CompanyWatchSeed:
     company_name: str

@@ -15,7 +15,13 @@ from job_hunter.job_identity import (
     normalize_company_name,
     normalize_job_title,
 )
-from job_hunter.models import CandidateContextCacheEntry, Evaluation, Job, Material
+from job_hunter.models import (
+    AtsRegistryEntry,
+    CandidateContextCacheEntry,
+    Evaluation,
+    Job,
+    Material,
+)
 from job_hunter.normalize import (
     canonicalize_url,
     description_hash,
@@ -248,6 +254,26 @@ CREATE TABLE IF NOT EXISTS review_deliveries (
 )
 """
 
+_CREATE_ATS_REGISTRY = """
+CREATE TABLE IF NOT EXISTS ats_registry (
+    provider TEXT NOT NULL,
+    board_identifier TEXT NOT NULL,
+    company_name TEXT NOT NULL DEFAULT '',
+    market_hint TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    last_checked_at TEXT,
+    last_success_at TEXT,
+    last_eligible_at TEXT,
+    last_job_count INTEGER NOT NULL DEFAULT 0,
+    eligible_jobs_seen INTEGER NOT NULL DEFAULT 0,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    active INTEGER NOT NULL DEFAULT 1,
+    paused_until TEXT,
+    PRIMARY KEY(provider, board_identifier)
+)
+"""
+
 _DELIVERABLE_SCORE_FLOOR = 60
 _SUPPORTED_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
 
@@ -307,6 +333,7 @@ class JobStore:
             self._conn.execute(_CREATE_INBOUND_JOB_CANDIDATES)
             self._conn.execute(_CREATE_APPLICATION_EVENTS)
             self._conn.execute(_CREATE_REVIEW_DELIVERIES)
+            self._conn.execute(_CREATE_ATS_REGISTRY)
 
     def _migrate_jobs_to_r2_schema(self) -> None:
         self._add_missing_columns("jobs", _R2_JOB_COLUMNS)
@@ -1243,6 +1270,152 @@ class JobStore:
         if careers_url:
             return 2
         return 1
+
+    def upsert_ats_board(
+        self,
+        provider: str,
+        board_identifier: str,
+        company_name: str = "",
+        market_hint: str = "",
+    ) -> bool:
+        """Insert or refresh one learned ATS board's discovery metadata.
+
+        On conflict, updates display metadata and `last_seen_at` and
+        reactivates the board, but leaves `paused_until` and
+        `consecutive_failures` untouched — ordinary rediscovery must not
+        bypass an unexpired pause; the board becomes due naturally once
+        `paused_until` elapses.
+        """
+        provider = provider.strip().lower()
+        if provider not in _SUPPORTED_ATS_PROVIDERS:
+            raise ValueError(f"unsupported ATS provider: {provider!r}")
+        board_identifier = board_identifier.strip()
+        now = _now_iso()
+
+        with self._conn:
+            insert = self._conn.execute(
+                """
+                INSERT INTO ats_registry
+                    (provider, board_identifier, company_name, market_hint,
+                     first_seen_at, last_seen_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, board_identifier) DO NOTHING
+                """,
+                (provider, board_identifier, company_name, market_hint, now, now),
+            )
+            if insert.rowcount == 1:
+                return True
+
+            self._conn.execute(
+                """
+                UPDATE ats_registry SET
+                    company_name = ?,
+                    market_hint = ?,
+                    last_seen_at = ?,
+                    active = 1
+                WHERE provider = ? AND board_identifier = ?
+                """,
+                (company_name, market_hint, now, provider, board_identifier),
+            )
+            return False
+
+    def list_due_ats_boards(self, now: datetime) -> list[AtsRegistryEntry]:
+        """Return active ATS boards whose health pause has expired."""
+        timestamp = _normalize_utc(now).isoformat()
+        rows = self._conn.execute(
+            """
+            SELECT * FROM ats_registry
+            WHERE active = 1
+              AND (
+                  paused_until IS NULL
+                  OR julianday(paused_until) <= julianday(?)
+              )
+            ORDER BY provider, board_identifier
+            """,
+            (timestamp,),
+        ).fetchall()
+        return [self._ats_entry_from_row(row) for row in rows]
+
+    def record_ats_scan_success(
+        self, provider: str, board_identifier: str, now: datetime, job_count: int
+    ) -> None:
+        """Record a successful scan and clear the board's failure backoff."""
+        timestamp = _normalize_utc(now).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE ats_registry SET
+                    last_checked_at = ?,
+                    last_success_at = ?,
+                    last_job_count = ?,
+                    consecutive_failures = 0,
+                    paused_until = NULL
+                WHERE provider = ? AND board_identifier = ?
+                """,
+                (timestamp, timestamp, job_count, provider, board_identifier),
+            )
+
+    def record_ats_scan_failure(
+        self, provider: str, board_identifier: str, now: datetime
+    ) -> None:
+        """Increment scan failures and pause the board for 24 hours.
+
+        Failures are isolated per board: a failed board is paused rather
+        than failing the whole run.
+        """
+        normalized_now = _normalize_utc(now)
+        timestamp = normalized_now.isoformat()
+        paused_until = (normalized_now + timedelta(hours=24)).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE ats_registry SET
+                    last_checked_at = ?,
+                    consecutive_failures = consecutive_failures + 1,
+                    paused_until = ?
+                WHERE provider = ? AND board_identifier = ?
+                """,
+                (timestamp, paused_until, provider, board_identifier),
+            )
+
+    def record_ats_eligible_job(
+        self, provider: str, board_identifier: str, now: datetime
+    ) -> None:
+        """Record that a scan of this board surfaced a candidate-eligible job."""
+        timestamp = _normalize_utc(now).isoformat()
+        with self._conn:
+            self._conn.execute(
+                """
+                UPDATE ats_registry SET
+                    last_eligible_at = ?,
+                    eligible_jobs_seen = eligible_jobs_seen + 1
+                WHERE provider = ? AND board_identifier = ?
+                """,
+                (timestamp, provider, board_identifier),
+            )
+
+    def count_ats_boards(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) FROM ats_registry").fetchone()
+        return row[0]
+
+    @staticmethod
+    def _ats_entry_from_row(row: sqlite3.Row) -> AtsRegistryEntry:
+        return AtsRegistryEntry(
+            provider=row["provider"],
+            board_identifier=row["board_identifier"],
+            company_name=row["company_name"],
+            market_hint=row["market_hint"],
+            first_seen_at=row["first_seen_at"],
+            last_seen_at=row["last_seen_at"],
+            last_checked_at=row["last_checked_at"],
+            last_success_at=row["last_success_at"],
+            last_eligible_at=row["last_eligible_at"],
+            last_job_count=row["last_job_count"],
+            eligible_jobs_seen=row["eligible_jobs_seen"],
+            consecutive_failures=row["consecutive_failures"],
+            active=bool(row["active"]),
+            paused_until=row["paused_until"],
+        )
 
     def count_jobs(self) -> int:
         row = self._conn.execute("SELECT COUNT(*) FROM jobs").fetchone()
