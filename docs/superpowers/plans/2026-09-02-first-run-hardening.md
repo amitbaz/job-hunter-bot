@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the first market-driven production run trustworthy by hardening targeted search, exposing candidate-context fallback causes, pacing Gemini under the existing RPM ceiling, and correcting market telemetry.
+**Goal:** Make the first market-driven production run trustworthy by hardening targeted search, exposing candidate-context fallback causes, pacing Gemini under the existing RPM ceiling, correcting market telemetry, and keeping Brave Search safely inside the user's free monthly allowance.
 
-**Architecture:** Add a shared targeted-search backend chain (optional Brave API -> DuckDuckGo fallback) and keep the existing query allocator. Keep Gemini quotas unchanged but distinguish temporary rolling-window capacity from daily exhaustion so the client can wait once and retry. Keep candidate-context extraction fail-open while adding explicit source/error metadata. Move market metrics to the correct points in the pipeline and count actual Telegram delivery.
+**Architecture:** Add a targeted-search backend chain with Brave used only for a budgeted subset of market queries and DuckDuckGo as the zero-cost fallback. Persist Brave attempts in a small SQLite search-usage ledger and distribute the remaining allowance across remaining calendar days. Keep Gemini quotas unchanged but distinguish temporary rolling-window capacity from daily exhaustion so the client can wait once and retry. Keep candidate-context extraction fail-open while adding explicit source/error metadata. Move market metrics to the correct points in the pipeline and count actual Telegram delivery.
 
 **Tech Stack:** Python 3.12+, requests, BeautifulSoup, dataclasses, SQLite, pytest, GitHub Actions.
 
@@ -14,7 +14,8 @@
 
 - Do not change market shares, salary floors, or role strategy.
 - Do not change `gemini-3.5-flash-lite`, `GEMINI_FREE_RPM=15`, `GEMINI_FREE_TPM=250000`, `GEMINI_FREE_RPD=500`, or the existing 80% internal safety ceiling.
-- Brave Search support is optional through `BRAVE_SEARCH_API_KEY`; absence must preserve zero-key operation through DuckDuckGo.
+- Brave Search is optional through `BRAVE_SEARCH_API_KEY` and must respect `BRAVE_MONTHLY_QUERY_LIMIT` (default `250`).
+- Canonical lookup must never consume Brave credits.
 - One search backend/query failure must not abort discovery.
 - Never log candidate profile contents, Gemini response bodies from candidate extraction, API keys, or Telegram secrets.
 - Fallback candidate context remains fail-open and must retry on a later run rather than being persisted as a successful extraction.
@@ -30,8 +31,6 @@
 - Create: `src/job_hunter/sources/targeted_search.py`
 - Modify: `src/job_hunter/sources/duckduckgo.py`
 - Modify: `src/job_hunter/sources/__init__.py`
-- Modify: `src/job_hunter/models.py`
-- Modify: `src/job_hunter/config.py`
 - Modify: `.env.example`
 - Test: `tests/test_search_backend.py`
 - Test: `tests/test_sources.py`
@@ -43,7 +42,6 @@
 - `DuckDuckGoSearchBackend.search(query: str) -> SearchResponse`
 - `FallbackSearchBackend.search(query: str) -> SearchResponse`
 - `TargetedSearchSource.stats` exposes planned/attempted/succeeded/results by market.
-- `Settings.brave_search_api_key: str | None`
 
 - [ ] Write tests proving Brave result normalization, Brave failure -> DuckDuckGo fallback, no-key DuckDuckGo behavior, market-hint preservation, and successful zero-result accounting.
 - [ ] Push the tests alone and verify CI fails because the new interfaces do not exist.
@@ -81,6 +79,7 @@
 - Modify: `src/job_hunter/gemini.py`
 - Test: `tests/test_gemini.py`
 - Test: `tests/test_gemini_single_attempt_accounting.py`
+- Test: `tests/test_gemini_pacing.py`
 
 **Interfaces:**
 - Add `GeminiTemporaryCapacity(GeminiBudgetExceeded)` with `retry_after_seconds: float`.
@@ -94,32 +93,56 @@
 - [ ] Verify provider 429 accounting and existing guardrail tests remain unchanged.
 - [ ] Run full CI.
 
-### Task 4: Correct market metrics and canonical search backend use
+### Task 4: Correct market metrics and delivery telemetry
 
 **Files:**
 - Modify: `src/job_hunter/discovery.py`
 - Modify: `src/job_hunter/pipeline.py`
-- Modify: `README.md`
 - Test: `tests/test_discovery.py`
 - Test: `tests/test_pipeline.py`
+- Test: `tests/test_first_run_telemetry.py`
 
 **Interfaces:**
-- Canonical targeted search uses the same `FallbackSearchBackend` selection as market search.
 - Search stats are aggregated only after source discovery.
 - Add per-market `search_results` and `reattributed` metrics.
 - Maintain a `delivered_by_market` counter incremented only after successful `store.mark_delivered(..., "telegram_message", ...)` for a digest/card in this run.
 - `_log_market_metrics(...)` executes after delivery attempts (or at end of dry run with zero deliveries).
+- Preserve existing structured-log field order/labels where possible for compatibility.
 
 - [ ] Write tests reproducing the old `queries_attempted=0` snapshot bug and the old `selected < delivered` mislabeling.
 - [ ] Write a discovery test where enrichment changes the market and assert `reattributed` increments.
 - [ ] Push tests and verify CI fails for the old behavior.
-- [ ] Move stats collection after `collect_candidates`, add result/reattribution counters, share the search backend with canonical lookup, and count actual Telegram delivery.
-- [ ] Update README with optional Brave key and metric semantics.
+- [ ] Move stats collection after `collect_candidates`, add result/reattribution counters, and count actual Telegram delivery.
 - [ ] Run `pytest -q` through CI and verify no regressions.
+
+### Task 5: Enforce Brave free-tier monthly budget
+
+**Files:**
+- Create: `src/job_hunter/search_budget.py`
+- Modify: `src/job_hunter/search_backend.py`
+- Modify: `src/job_hunter/sources/__init__.py`
+- Modify: `.github/workflows/daily.yml`
+- Modify: `.env.example`
+- Test: `tests/test_brave_budget.py`
+
+**Interfaces:**
+- `SearchUsageLedger(db_path)` persists metered provider attempts in the existing SQLite state file.
+- `brave_queries_available_today(..., monthly_limit, now)` returns the safe remaining allowance for the current UTC day.
+- `split_queries_for_brave(queries, limit)` round-robins selected Brave queries across markets and returns all other queries for zero-cost fallback.
+- `BraveSearchBackend(..., on_attempt=...)` records a conservative usage attempt before the provider request.
+- `build_search_backend(..., enable_brave=False)` makes Brave explicit opt-in so canonical lookup cannot spend credits accidentally.
+
+- [ ] Write tests for 250/month persistence, same-day manual rerun protection, market round-robin selection, and canonical lookup never using Brave.
+- [ ] Verify the tests fail before implementation.
+- [ ] Implement the SQLite usage ledger and daily allowance calculation.
+- [ ] Split market queries into budgeted Brave and DuckDuckGo lanes; keep per-query Brave -> DuckDuckGo fallback.
+- [ ] Default `BRAVE_MONTHLY_QUERY_LIMIT` to `250` and allow a GitHub Actions variable to override it later.
+- [ ] Verify the full suite.
 
 ## Completion Verification
 
 - [ ] Compare branch to `main` and inspect every changed file.
 - [ ] Confirm CI is green on the final branch head.
-- [ ] Confirm no market/salary/model/quota configuration changed unintentionally.
+- [ ] Confirm no market/salary/model/Gemini quota configuration changed unintentionally.
+- [ ] Confirm Brave usage cannot exceed the configured monthly allowance even across manual reruns.
 - [ ] Confirm logs can distinguish: planned vs attempted vs succeeded vs results, candidate-context source/error, temporary Gemini pacing, reattribution, and actual delivered jobs.
