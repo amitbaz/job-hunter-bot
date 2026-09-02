@@ -13,7 +13,8 @@ def make_market(
     remote_policy: str = "allowed",
     relocation_policy: str = "allowed",
     sponsorship_policy: str = "not_required",
-    domains: list[str] | None = None,
+    direct_sources: list[str] | None = None,
+    discovery_domains: list[str] | None = None,
     templates: list[str] | None = None,
 ) -> MarketPolicy:
     return MarketPolicy(
@@ -29,7 +30,8 @@ def make_market(
         remote_policy=remote_policy,
         relocation_policy=relocation_policy,
         sponsorship_policy=sponsorship_policy,
-        source_domains=domains or ["wellfound.com", "jobs.ashbyhq.com"],
+        direct_sources=direct_sources or [],
+        discovery_domains=discovery_domains or ["wellfound.com", "jobs.ashbyhq.com"],
         query_templates=templates or ['"{role}" React TypeScript'],
     )
 

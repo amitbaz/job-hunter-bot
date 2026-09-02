@@ -63,7 +63,8 @@ class MarketPolicy:
     remote_policy: str
     relocation_policy: str
     sponsorship_policy: str
-    source_domains: list[str] = field(default_factory=list)
+    direct_sources: list[str] = field(default_factory=list)
+    discovery_domains: list[str] = field(default_factory=list)
     query_templates: list[str] = field(default_factory=list)
     role_families: list[str] = field(default_factory=list)
     enabled: bool = True
@@ -169,6 +170,7 @@ class SearchPolicy:
     manual_company_watch: list[CompanyWatchSeed] = field(default_factory=list)
     max_search_queries_per_run: int = 30
     max_canonical_resolutions_per_run: int = 80
+    max_learned_ats_boards_per_run: int = 75
     engineering_title_keywords: list[str] = field(
         default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_KEYWORDS)
     )
