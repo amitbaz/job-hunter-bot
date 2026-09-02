@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from job_hunter.candidate_context import get_candidate_context
 from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.cover_letter import generate_cover_letter
@@ -316,6 +317,10 @@ def run_pipeline(
     preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy, store)
     profile_mode = preferences_source(preferences)
     logger.info("profile extraction: source=%s", profile_mode)
+    # Reuses the CandidateContext cached by extract_candidate_preferences above
+    # (same profile/model/schema key), so this is a store lookup, not a second
+    # Gemini call. Task 8 will restructure this into a single upfront load.
+    candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
     summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy, preferences)
     selected = _select_candidates(ranked, settings.policy, preferences)
@@ -342,7 +347,7 @@ def run_pipeline(
 
     for job_id, job, _score in selected:
         try:
-            evaluation = evaluate_job(job, settings.candidate_profile, settings.policy, gemini)
+            evaluation = evaluate_job(job, candidate_context, settings.policy, gemini)
         except Exception:
             logger.exception("evaluation failed for job_id=%s", job_id)
             summary.errors += 1
@@ -393,7 +398,7 @@ def run_pipeline(
                 text = generate_cover_letter(
                     job,
                     evaluation,
-                    settings.candidate_profile,
+                    candidate_context,
                     settings.cover_letter_template,
                     gemini,
                     date.today(),
