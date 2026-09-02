@@ -23,7 +23,7 @@ class HttpClient:
         url: str,
         *,
         retry_status_codes: set[int] | None = None,
-        retry_exceptions: bool = True,
+        retry: bool = True,
         **kwargs,
     ) -> requests.Response:
         kwargs.setdefault("timeout", self._timeout)
@@ -31,7 +31,7 @@ class HttpClient:
             "GET",
             url,
             retry_status_codes=retry_status_codes,
-            retry_exceptions=retry_exceptions,
+            retry=retry,
             **kwargs,
         )
 
@@ -40,7 +40,7 @@ class HttpClient:
         url: str,
         *,
         retry_status_codes: set[int] | None = None,
-        retry_exceptions: bool = True,
+        retry: bool = True,
         **kwargs,
     ) -> requests.Response:
         kwargs.setdefault("timeout", self._timeout)
@@ -48,7 +48,7 @@ class HttpClient:
             "POST",
             url,
             retry_status_codes=retry_status_codes,
-            retry_exceptions=retry_exceptions,
+            retry=retry,
             **kwargs,
         )
 
@@ -63,7 +63,7 @@ class HttpClient:
         url: str,
         *,
         retry_status_codes: set[int] | None = None,
-        retry_exceptions: bool = True,
+        retry: bool = True,
         **kwargs,
     ) -> requests.Response:
         retry_codes = _RETRY_STATUS_CODES if retry_status_codes is None else retry_status_codes
@@ -71,13 +71,13 @@ class HttpClient:
         for attempt in range(_MAX_RETRIES + 1):
             try:
                 response = self._session.request(method, url, **kwargs)
-                if response.status_code in retry_codes and attempt < _MAX_RETRIES:
+                if retry and response.status_code in retry_codes and attempt < _MAX_RETRIES:
                     time.sleep(_BACKOFF_BASE * (2 ** attempt))
                     continue
                 return response
             except requests.RequestException as exc:
                 last_exc = exc
-                if not retry_exceptions:
+                if not retry:
                     raise
                 if attempt < _MAX_RETRIES:
                     time.sleep(_BACKOFF_BASE * (2 ** attempt))
