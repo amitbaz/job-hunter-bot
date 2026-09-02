@@ -33,10 +33,13 @@ class TargetedSearchSource:
         backend: SearchBackend,
         queries: list[str | SearchQuery],
         breaker: CircuitBreaker | None = None,
+        *,
+        source_label: str | None = None,
     ) -> None:
         self._backend = backend
         self._queries = [_normalize_query(query) for query in queries]
         self._breaker = breaker
+        self._source_label = source_label
         self.stats = TargetedSearchStats()
         for query in self._queries:
             _bump(self.stats.planned_by_market, query.market_id or "legacy")
@@ -71,10 +74,11 @@ class TargetedSearchSource:
             _bump(self.stats.succeeded_by_market, market_key)
             _bump(self.stats.results_by_market, market_key, len(response.hits))
 
+            source = self._source_label or f"search:{response.backend}"
             for hit in response.hits:
                 jobs.append(
                     Job(
-                        source=f"search:{response.backend}",
+                        source=source,
                         title=hit.title,
                         url=hit.url,
                         market_hint=query.market_id,
