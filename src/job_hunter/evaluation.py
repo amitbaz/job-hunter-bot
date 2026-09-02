@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from job_hunter.models import CandidateContext, Evaluation, Job, SearchPolicy
+from job_hunter.market_eligibility import evaluate_market_eligibility
+from job_hunter.market_policy import market_by_id, salary_floor_for_job
+from job_hunter.models import CandidateContext, Evaluation, Job, MarketPolicy, SearchPolicy
 
 if TYPE_CHECKING:
     from job_hunter.gemini import GeminiClient
@@ -70,9 +72,79 @@ def _serialize_context(context: CandidateContext) -> str:
     return "\n".join(lines)
 
 
-def _build_evaluation_prompt(job: Job, context: CandidateContext, policy: SearchPolicy) -> str:
+_FULL_STACK_TITLE_MARKERS = ("full stack", "full-stack")
+
+# Verbatim per the market-driven search strategy plan: the candidate is a
+# senior frontend engineer, not a senior backend engineer, and Gemini must
+# not credit backend seniority it has no evidence for.
+_FULL_STACK_BACKEND_RAMP_PARAGRAPH = (
+    "The candidate is a senior frontend engineer but is earlier than junior-level "
+    "in backend depth today. Treat React/Next.js/TypeScript ownership as senior "
+    "evidence. Node.js/TypeScript APIs, REST/GraphQL, PostgreSQL/Supabase and "
+    "similar product-backend work may be realistic ramp-up areas. Do not invent "
+    "senior backend experience. Backend-dominant ownership is a gap and may make "
+    "the role unsuitable."
+)
+
+
+def _is_full_stack_role(title: str) -> bool:
+    normalized = (title or "").lower()
+    return any(marker in normalized for marker in _FULL_STACK_TITLE_MARKERS)
+
+
+def _market_policy_block(job: Job, market: MarketPolicy) -> str:
+    """Render the market's configured policy plus deterministic eligibility
+    signals (reusing evaluate_market_eligibility rather than reimplementing
+    sponsorship/remote/warning detection) for the prompt."""
+    eligibility = evaluate_market_eligibility(job, market)
+    salary_floor = salary_floor_for_job(job, market)
+    allowed_languages = ", ".join(market.allowed_languages) or "none configured"
+    warnings_text = "; ".join(eligibility.warnings) if eligibility.warnings else "none noted"
+
+    return "\n".join(
+        [
+            f"Market ID: {market.id}",
+            f"Gross base salary floor: {market.salary.currency} {salary_floor}",
+            f"Allowed required languages: {allowed_languages}",
+            f"Remote policy: {market.remote_policy}",
+            f"Relocation policy: {market.relocation_policy}",
+            f"Sponsorship policy: {market.sponsorship_policy}",
+            f"Deterministic sponsorship status: {eligibility.sponsorship_status}",
+            f"Deterministic international-remote status: {eligibility.international_remote_status}",
+            f"Deterministic warnings: {warnings_text}",
+        ]
+    )
+
+
+def _market_rules_block(job: Job) -> str:
+    rules = """Rules:
+- Only use evidence present in the candidate context and job description below. Never invent candidate facts.
+- Unstated or unclear requirements are gaps, not invented facts.
+- Missing salary is unknown, not a blocker.
+- Disclosed gross base max below market floor is a blocker.
+- Hybrid/onsite/relocation is not a blocker when market policy allows it.
+- Explicit no-sponsorship is a blocker when sponsorship is required; omission is unknown.
+- Disallowed language blocks only when explicitly required; nice-to-have does not.
+- Time-zone overlap is informational and must be preserved in location_note.
+- Sponsorship/international-remote uncertainty must be preserved in location_note.
+- List every hard blocker in hard_blockers; otherwise leave it empty."""
+
+    if _is_full_stack_role(job.title):
+        rules += "\n\n" + _FULL_STACK_BACKEND_RAMP_PARAGRAPH
+
+    return rules
+
+
+def _build_evaluation_prompt(
+    job: Job,
+    context: CandidateContext,
+    policy: SearchPolicy,
+    market: MarketPolicy | None = None,
+) -> str:
     maxima_lines = "\n".join(f"- {key}: max {value}" for key, value in SCORE_MAXIMA.items())
-    return f"""You are evaluating a job posting against a candidate profile for a remote-only job search.
+
+    if market is None:
+        return f"""You are evaluating a job posting against a candidate profile for a remote-only job search.
 
 Score EXACTLY these components, each an integer from 0 up to its stated maximum:
 {maxima_lines}
@@ -98,10 +170,36 @@ Job description:
 {job.description}
 """
 
+    return f"""You are evaluating a job posting against a candidate profile for a remote-only job search.
+
+Score EXACTLY these components, each an integer from 0 up to its stated maximum:
+{maxima_lines}
+
+{_market_rules_block(job)}
+
+Market policy:
+{_market_policy_block(job, market)}
+
+Return ONLY JSON with this exact shape and no markdown fences:
+{{"scores": {{"role_seniority": int, "technical": int, "product_architecture": int, "career_direction": int, "location_language": int, "company_environment": int}}, "total_score": int, "hard_blockers": [string], "strengths": [string], "gaps": [string], "salary_note": string, "location_note": string, "decision": string, "rationale": string}}
+
+Candidate context:
+{_serialize_context(context)}
+
+Job title: {job.title}
+Company: {job.company}
+Location: {job.location}
+Remote: {job.remote}
+Job description:
+{job.description}
+"""
+
 
 def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemini: "GeminiClient") -> Evaluation:
+    market = market_by_id(policy, job.market_id) if job.market_id and policy.markets else None
+
     raw = gemini.generate_text(
-        _build_evaluation_prompt(job, context, policy),
+        _build_evaluation_prompt(job, context, policy, market),
         purpose="job_evaluation",
         thinking_level="low",
         max_output_tokens=1200,
@@ -161,4 +259,5 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
         location_note=data.get("location_note", "") or "",
         rationale=data.get("rationale", "") or "",
         model=gemini.model,
+        market_id=job.market_id or "",
     )

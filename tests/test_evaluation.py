@@ -4,6 +4,7 @@ import pytest
 
 from job_hunter.evaluation import EvaluationError, evaluate_job
 from job_hunter.models import CandidateContext, CandidatePreferences, Job, SearchPolicy
+from tests.market_fixtures import make_market_policy
 
 # A sentinel that would only appear in the prompt if some future change
 # reintroduced sending the raw candidate profile wholesale. It is never
@@ -214,3 +215,114 @@ def test_evaluation_uses_expected_resource_controls(fake_gemini, job, policy, co
     assert thinking_level == "low"
     assert max_output_tokens == 1200
     assert json_mode is True
+
+
+# --- Market-aware prompt content (Task 6) -----------------------------------
+
+
+def test_evaluation_prompt_includes_london_market_details(fake_gemini, context):
+    policy = make_market_policy()
+    job = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
+        location="London",
+        description="Hybrid role, 2 days a week in our London office. React and TypeScript.",
+        market_id="london",
+    )
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    lower = prompt.lower()
+
+    assert "GBP" in prompt
+    assert "90000" in prompt
+    assert "relocation policy: allowed" in lower
+    assert "sponsorship policy: required" in lower
+    assert "deterministic sponsorship status: unknown" in lower
+    assert "omission is unknown" in lower
+
+
+def test_evaluation_prompt_includes_sf_market_salary_floor(fake_gemini, context):
+    policy = make_market_policy()
+    job = Job(
+        source="ashby",
+        title="Senior Product Engineer",
+        location="San Francisco",
+        description="React and TypeScript, remote friendly.",
+        market_id="us_nyc_sf",
+    )
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+
+    assert "USD" in prompt
+    assert "200000" in prompt
+
+
+def test_evaluation_prompt_full_stack_adds_backend_ramp_language(fake_gemini, context):
+    policy = make_market_policy()
+    job = Job(
+        source="ashby",
+        title="Full-Stack Engineer",
+        location="Berlin",
+        description="React, Node.js, PostgreSQL.",
+        market_id="germany_eu",
+    )
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    lower = prompt.lower()
+
+    assert "senior frontend engineer" in lower
+    assert "do not invent senior backend experience" in lower
+
+
+def test_evaluation_prompt_full_stack_hyphenated_title_also_matches(fake_gemini, context):
+    policy = make_market_policy()
+    job = Job(
+        source="ashby",
+        title="Full Stack Engineer",
+        location="Berlin",
+        description="React, Node.js, PostgreSQL.",
+        market_id="germany_eu",
+    )
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+
+    assert "do not invent senior backend experience" in prompt.lower()
+
+
+def test_evaluation_prompt_falls_back_to_legacy_without_market_id(fake_gemini, context):
+    """A market-enabled policy with a job that has no attributed market must
+    still produce the exact legacy global prompt, not a market-shaped one."""
+    policy = make_market_policy()
+    job = Job(source="ashby", title="Senior Product Engineer", description="React TypeScript remote")
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    lower = prompt.lower()
+
+    assert f"eur {policy.salary_floor_eur}" in lower
+    assert "not remote, or requires relocation" in lower
+
+
+def test_evaluate_job_sets_market_id_from_job(fake_gemini, context):
+    policy = make_market_policy()
+    job = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
+        location="London",
+        market_id="london",
+    )
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+
+    assert evaluation.market_id == "london"
+
+
+def test_evaluate_job_market_id_defaults_to_empty_string(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+
+    assert evaluation.market_id == ""
