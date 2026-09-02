@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Callable, Protocol
 
 from bs4 import BeautifulSoup
 
@@ -35,13 +35,25 @@ class SearchBackend(Protocol):
 class BraveSearchBackend:
     name = "brave"
 
-    def __init__(self, http, api_key: str) -> None:
+    def __init__(
+        self,
+        http,
+        api_key: str,
+        *,
+        on_attempt: Callable[[], None] | None = None,
+    ) -> None:
         if not api_key.strip():
             raise ValueError("Brave Search API key must be non-empty")
         self._http = http
         self._api_key = api_key.strip()
+        self._on_attempt = on_attempt
 
     def search(self, query: str) -> SearchResponse:
+        # Count conservatively before the request: if the network outcome is
+        # ambiguous, treating the attempt as billable is safer than risking the
+        # configured monthly free-tier ceiling.
+        if self._on_attempt is not None:
+            self._on_attempt()
         response = self._http.get(
             _BRAVE_URL,
             params={"q": query, "count": 20, "safesearch": "moderate"},
@@ -108,7 +120,22 @@ class FallbackSearchBackend:
         return self._secondary.search(query)
 
 
-def build_search_backend(http, brave_api_key: str | None = None) -> SearchBackend:
+def build_search_backend(
+    http,
+    brave_api_key: str | None = None,
+    *,
+    enable_brave: bool = False,
+    on_brave_attempt: Callable[[], None] | None = None,
+) -> SearchBackend:
+    """Build the search chain.
+
+    Brave is deliberately opt-in even when a key exists so auxiliary lookups
+    such as canonical resolution cannot silently consume the metered allowance.
+    """
     secondary = DuckDuckGoSearchBackend(http)
-    primary = BraveSearchBackend(http, brave_api_key) if brave_api_key else None
+    primary = (
+        BraveSearchBackend(http, brave_api_key, on_attempt=on_brave_attempt)
+        if brave_api_key and enable_brave
+        else None
+    )
     return FallbackSearchBackend(primary, secondary)
