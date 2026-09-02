@@ -11,6 +11,7 @@ from job_hunter.models import (
     SearchPolicy,
 )
 from job_hunter.store import JobStore
+from tests.market_fixtures import make_market_policy
 
 
 class FakeSource:
@@ -98,6 +99,11 @@ def policy():
 @pytest.fixture
 def store(tmp_path):
     return JobStore(tmp_path / "state.sqlite3")
+
+
+@pytest.fixture
+def market_policy():
+    return make_market_policy()
 
 
 def test_collect_candidates_continues_after_source_failure(store, policy):
@@ -605,3 +611,105 @@ def test_collect_candidates_emits_one_entry_when_canonicalization_merges_jobs(
 
     assert result.stats.unique == 2
     assert len(result.eligible) == 1
+
+
+def test_collect_candidates_attributes_market_before_prefilter(store, market_policy):
+    source = FakeSource([
+        Job(
+            source="fake",
+            title="Senior Frontend Engineer",
+            location="London - Hybrid",
+            remote=False,
+            description="React TypeScript. Visa sponsorship available.",
+        )
+    ])
+    result = collect_candidates([source], store, NoOpHttp(), market_policy)
+    assert len(result.eligible) == 1
+    job_id, job = result.eligible[0]
+    assert job.market_id == "london"
+    assert store.get_job(job_id).market_id == "london"
+    assert result.stats.eligible_by_market == {"london": 1}
+
+
+def test_collect_candidates_rejects_onsite_israel_job(store, market_policy):
+    source = FakeSource([
+        Job(
+            source="fake",
+            title="Senior Product Engineer",
+            location="Tel Aviv - onsite",
+            remote=False,
+            description="React TypeScript. Onsite role in our Tel Aviv office.",
+        )
+    ])
+
+    result = collect_candidates([source], store, NoOpHttp(), market_policy)
+
+    assert result.eligible == []
+    assert result.stats.rejected_by_market == {"israel_remote": 1}
+
+
+def test_collect_candidates_survives_unattributed_uncertainty_for_remote_job(
+    store, market_policy
+):
+    source = FakeSource([
+        Job(
+            source="fake",
+            title="Senior Product Engineer",
+            location="",
+            remote=True,
+            description="React TypeScript. Fully remote role.",
+        )
+    ])
+
+    result = collect_candidates([source], store, NoOpHttp(), market_policy)
+
+    # No location evidence at all falls back to the first enabled market
+    # rather than being dropped -- attribution uncertainty alone must never
+    # reject a job.
+    assert len(result.eligible) == 1
+    job_id, job = result.eligible[0]
+    assert job.market_id == "germany_eu"
+    assert result.stats.eligible_by_market == {"germany_eu": 1}
+
+
+def test_collect_candidates_counts_one_eligible_per_canonical_duplicate_group_by_market(
+    store, market_policy
+):
+    jobs = [
+        Job(
+            source="aggregator",
+            source_job_id="1",
+            title="Senior Product Engineer",
+            company="Acme",
+            location="London",
+            url="https://aggregator.test/jobs/1",
+            description="React TypeScript. Visa sponsorship available.",
+            remote=False,
+        ),
+        Job(
+            source="specialist",
+            source_job_id="2",
+            title="Senior Product Engineer",
+            company="Acme GmbH",
+            location="London - Hybrid",
+            url="https://specialist.test/jobs/2",
+            description="React TypeScript. Visa sponsorship available.",
+            remote=False,
+        ),
+    ]
+    resolver = CountingResolver(
+        CanonicalResolution(
+            url="https://jobs.lever.co/acme/abc",
+            ats=AtsReference(provider="lever", board="acme", job_id="abc"),
+            confidence=0.9,
+            method="targeted_search",
+        )
+    )
+
+    result = collect_candidates(
+        [FakeSource(jobs)], store, NoOpHttp(), market_policy, resolver=resolver
+    )
+
+    assert result.stats.unique == 2
+    assert len(result.eligible) == 1
+    assert result.stats.eligible_by_market == {"london": 1}

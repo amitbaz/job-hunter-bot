@@ -7,6 +7,7 @@ from job_hunter.canonical import CanonicalResolver
 from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import job_fallback_identity
+from job_hunter.market_policy import attribute_market, market_by_id
 from job_hunter.models import Job, SearchPolicy
 from job_hunter.normalize import canonicalize_url
 from job_hunter.prefilter import prefilter_job
@@ -15,6 +16,12 @@ from job_hunter.store import JobStore
 logger = logging.getLogger(__name__)
 
 _ATS_HOSTS = ("jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io")
+
+# Bucket key for jobs that could not be tied to any configured market (or when
+# no markets are configured at all). Kept distinct from real market ids so
+# per-market observability never silently merges unattributed jobs into a
+# real market's counters.
+_UNATTRIBUTED = "unattributed"
 
 
 @dataclass(slots=True)
@@ -29,6 +36,10 @@ class DiscoveryStats:
     profession_rejected: int = 0
     eligible: int = 0
     per_source: dict[str, int] = field(default_factory=dict)
+    raw_by_market: dict[str, int] = field(default_factory=dict)
+    unique_by_market: dict[str, int] = field(default_factory=dict)
+    rejected_by_market: dict[str, int] = field(default_factory=dict)
+    eligible_by_market: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -174,6 +185,24 @@ def metric_source_label(source: str) -> str:
     return source
 
 
+def _bump(counts: dict[str, int], key: str) -> None:
+    counts[key] = counts.get(key, 0) + 1
+
+
+def _cheap_market_attribution(job: Job, policy: SearchPolicy) -> str | None:
+    """Attribute a market as cheaply as possible for raw-stage observability.
+
+    A query-time hint is free; otherwise fall back to the same evidence-based
+    attribution used later, using whatever fields the raw job already carries
+    (this never performs network I/O, so it's still cheap at this stage).
+    """
+    if job.market_hint:
+        return job.market_hint
+    if not policy.markets:
+        return None
+    return attribute_market(job, policy.markets)
+
+
 def _format_source_contribution(per_source: dict[str, int]) -> str:
     """Render compact source totals without including any job content."""
     metric_counts: dict[str, int] = {}
@@ -215,6 +244,8 @@ def collect_candidates(
             stats.per_source[job.source] = stats.per_source.get(job.source, 0) + 1
             if job.url:
                 job.original_url = job.original_url or job.url
+            raw_market_id = _cheap_market_attribution(job, policy)
+            _bump(stats.raw_by_market, raw_market_id or _UNATTRIBUTED)
             raw_jobs.append(job)
 
     # Persist every source copy before collapsing the run so provenance is
@@ -236,16 +267,24 @@ def collect_candidates(
 
         job_id, _is_new, _description_changed = store.upsert_logical_job(job)
 
+        job.market_id = attribute_market(job, policy.markets) if policy.markets else None
+        if job.market_id:
+            store.set_job_market(job_id, job.market_id)
+        market_key = job.market_id or _UNATTRIBUTED
+        _bump(stats.unique_by_market, market_key)
+
         if not store.needs_evaluation(job_id):
             rediscovered_job_ids.append(job_id)
             continue
 
-        prefilter_result = prefilter_job(job, policy)
+        market = market_by_id(policy, job.market_id) if job.market_id else None
+        prefilter_result = prefilter_job(job, policy, market)
         if not prefilter_result.should_evaluate:
             if prefilter_result.reason_code == "off_target_profession":
                 stats.profession_rejected += 1
             else:
                 stats.prefilter_rejected += 1
+            _bump(stats.rejected_by_market, market_key)
             continue
 
         # Canonical resolution costs a page fetch plus a public search, so it
@@ -274,9 +313,20 @@ def collect_candidates(
                         job.ats_provider = resolution.ats.provider
                         job.ats_board = resolution.ats.board
                         job.ats_job_id = resolution.ats.job_id
+                    # Canonical resolution can surface stronger, directly
+                    # observed location evidence than the query-time hint that
+                    # seeded the earlier attribution above, so re-run it
+                    # before the final append. Attribution uncertainty alone
+                    # (i.e. falling back to the first enabled market) must
+                    # never drop a job -- only prefilter/eligibility do that.
+                    job.market_id = (
+                        attribute_market(job, policy.markets) if policy.markets else None
+                    )
                     # Late canonicalization may consolidate stored rows; use
                     # the store's history-preserving survivor ID downstream.
                     job_id, _is_new, _description_changed = store.upsert_logical_job(job)
+                    if job.market_id:
+                        store.set_job_market(job_id, job.market_id)
                     if not store.needs_evaluation(job_id):
                         rediscovered_job_ids.append(job_id)
                         continue
@@ -285,6 +335,7 @@ def collect_candidates(
             continue
         eligible_job_ids.add(job_id)
         eligible.append((job_id, job))
+        _bump(stats.eligible_by_market, job.market_id or _UNATTRIBUTED)
 
     stats.eligible = len(eligible)
     logger.info(
