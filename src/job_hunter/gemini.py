@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import requests
 
-from job_hunter.gemini_usage import GeminiQuotaPaused
+from job_hunter.gemini_usage import GeminiQuotaPaused, GeminiTemporaryCapacity
 
 if TYPE_CHECKING:
     from job_hunter.gemini_usage import GeminiPauseKind, GeminiPurpose, GeminiUsageTracker
@@ -86,11 +87,36 @@ class GeminiClient:
         model: str,
         http: HttpClient,
         tracker: GeminiUsageTracker | None = None,
+        *,
+        sleep_fn: Callable[[float], None] = time.sleep,
     ) -> None:
         self._api_key = api_key
         self.model = model
         self._http = http
         self._tracker = tracker
+        self._sleep_fn = sleep_fn
+
+    def _preflight_with_pacing(
+        self,
+        purpose: GeminiPurpose | None,
+        prompt: str,
+    ) -> datetime:
+        now = _now()
+        if self._tracker is None:
+            return now
+
+        try:
+            self._tracker.preflight(purpose, prompt, now)
+        except GeminiTemporaryCapacity as exc:
+            logger.info(
+                "Gemini rolling capacity full; waiting %.2fs before retry: purpose=%s",
+                exc.retry_after_seconds,
+                purpose,
+            )
+            self._sleep_fn(exc.retry_after_seconds)
+            now = _now()
+            self._tracker.preflight(purpose, prompt, now)
+        return now
 
     def generate_text(
         self,
@@ -102,14 +128,12 @@ class GeminiClient:
         json_mode: bool = False,
         json_schema: dict | None = None,
     ) -> str:
-        now = _now()
-
         # A tracker-less client is a test affordance only (see class docstring);
-        # production code always supplies one. Its own purpose validation is the
-        # single guard for a missing/invalid `purpose`, so it must run before any
-        # HTTP call is attempted.
-        if self._tracker is not None:
-            self._tracker.preflight(purpose, prompt, now)
+        # production code always supplies one. The tracker's own purpose
+        # validation remains the single guard for a missing/invalid purpose.
+        # Temporary rolling RPM/TPM pressure waits locally once and re-runs
+        # preflight before any provider request is made.
+        now = self._preflight_with_pacing(purpose, prompt)
 
         url = f"{_BASE_URL}/{self.model}:generateContent"
         headers = {
@@ -152,14 +176,7 @@ class GeminiClient:
             if self._tracker is not None:
                 # INVARIANT: every 429, of every kind, raises GeminiQuotaPaused
                 # directly from what record_429 just persisted, writes exactly
-                # one `quota_429` row, and writes zero `blocked_budget` rows —
-                # regardless of rate_pause_seconds or how full the daily
-                # budget is. Never re-derive the pause via a second
-                # preflight() call: that re-runs the daily budget check, which
-                # counts the quota_429 row just written and can trip
-                # GeminiBudgetExceeded instead — the wrong exception type for
-                # a call that indisputably reached Google. Tasks 5-8 branch on
-                # GeminiQuotaPaused specifically.
+                # one `quota_429` row, and writes zero `blocked_budget` rows.
                 paused_until, reason = self._tracker.record_429(
                     purpose, prompt, now, kind=kind, error_code=error_code
                 )
