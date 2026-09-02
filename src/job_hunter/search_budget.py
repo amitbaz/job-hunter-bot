@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from job_hunter.models import SearchQuery
@@ -63,8 +63,23 @@ def _normalize_utc(value: datetime) -> datetime:
 
 def _next_month_start(now: datetime) -> datetime:
     if now.month == 12:
-        return now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    return now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        return now.replace(
+            year=now.year + 1,
+            month=1,
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    return now.replace(
+        month=now.month + 1,
+        day=1,
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
 
 def brave_queries_available_today(
@@ -86,8 +101,6 @@ def brave_queries_available_today(
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
     next_month = _next_month_start(now)
     day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    next_day = day_start.replace() + (next_month - next_month)  # typed timedelta zero
-    from datetime import timedelta
     next_day = day_start + timedelta(days=1)
 
     used_month = ledger.count(provider="brave", start_at=month_start, end_at=next_month)
