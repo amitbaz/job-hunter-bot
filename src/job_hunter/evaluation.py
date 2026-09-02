@@ -170,7 +170,7 @@ Job description:
 {job.description}
 """
 
-    return f"""You are evaluating a job posting against a candidate profile for a remote-only job search.
+    return f"""You are evaluating a job posting against a candidate profile for a market-driven job search. Remote, hybrid, onsite, and relocation compatibility is governed by the specific market policy below, not by a single global remote-only rule.
 
 Score EXACTLY these components, each an integer from 0 up to its stated maximum:
 {maxima_lines}

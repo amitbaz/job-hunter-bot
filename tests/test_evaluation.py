@@ -220,6 +220,38 @@ def test_evaluation_uses_expected_resource_controls(fake_gemini, job, policy, co
 # --- Market-aware prompt content (Task 6) -----------------------------------
 
 
+def test_market_aware_prompt_drops_the_legacy_remote_only_framing(fake_gemini, context):
+    """The market-aware prompt must not open by declaring a remote-only search
+    while its market rules block says hybrid/onsite is allowed."""
+    policy = make_market_policy()
+    job = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
+        location="London",
+        description="Hybrid role, 2 days a week in our London office. React and TypeScript.",
+        market_id="london",
+    )
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+
+    assert "for a remote-only job search" not in prompt
+    assert "for a market-driven job search" in prompt
+    assert "not by a single global remote-only rule" in prompt
+
+
+def test_legacy_prompt_keeps_the_remote_only_framing(fake_gemini, job, policy, context):
+    """The no-market (legacy) path's opening sentence must stay unchanged."""
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+
+    assert prompt.startswith(
+        "You are evaluating a job posting against a candidate profile "
+        "for a remote-only job search."
+    )
+
+
 def test_evaluation_prompt_includes_london_market_details(fake_gemini, context):
     policy = make_market_policy()
     job = Job(
