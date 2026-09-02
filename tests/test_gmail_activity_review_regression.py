@@ -100,7 +100,7 @@ def test_unresolved_lifecycle_persists_original_event_type(tmp_path, monkeypatch
         role_title="Frontend Engineer",
         rationale="interview details",
     )
-    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_, **__: classification)
     monkeypatch.setattr(
         "job_hunter.gmail_sync.match_job",
         lambda *_: JobMatch(job_id=None, reason="unresolved", ambiguous=False),
@@ -140,7 +140,7 @@ def test_low_confidence_lifecycle_persists_original_event_type(tmp_path, monkeyp
         role_title="Frontend Engineer",
         rationale="model was uncertain",
     )
-    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_, **__: classification)
     monkeypatch.setattr(
         "job_hunter.gmail_sync.match_job",
         lambda *_: JobMatch(job_id=job_id, reason="company_and_title", ambiguous=False),

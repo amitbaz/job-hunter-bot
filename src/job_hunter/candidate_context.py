@@ -1,0 +1,268 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from dataclasses import asdict
+from typing import TYPE_CHECKING
+
+from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
+from job_hunter.models import CandidateContext, CandidatePreferences, SearchPolicy
+from job_hunter.normalize import normalize_text
+from job_hunter.preferences import _build_fallback_preferences
+
+if TYPE_CHECKING:
+    from job_hunter.gemini import GeminiClient
+    from job_hunter.store import JobStore
+
+CANDIDATE_CONTEXT_SCHEMA_VERSION = "1"
+
+FALLBACK_CONTEXT_SUMMARY = "Fallback candidate context derived from search policy."
+
+_EVIDENCE_FIELDS = (
+    "technical_skills",
+    "architecture_evidence",
+    "leadership_ownership",
+    "agentic_ai_evidence",
+    "product_domain_evidence",
+    "location_language_facts",
+    "career_direction",
+    "company_environment",
+    "career_evidence",
+)
+_TOP_LEVEL_FIELDS = ("preferences", *_EVIDENCE_FIELDS, "evaluation_summary")
+_MAX_LIST_ITEMS = 20
+_MAX_ITEM_LENGTH = 180
+_MAX_SUMMARY_LENGTH = 1500
+
+_PREFERENCES_FIELDS = (
+    "preferred_roles",
+    "preferred_seniority",
+    "must_have_signals",
+    "nice_to_have_signals",
+    "preferred_locations",
+    "avoid_signals",
+    "summary",
+)
+_PREFERENCES_LIST_FIELDS = tuple(f for f in _PREFERENCES_FIELDS if f != "summary")
+_PREFERENCES_MAX_LIST_ITEMS = 8
+_PREFERENCES_MAX_ITEM_LENGTH = 80
+_PREFERENCES_MAX_SUMMARY_LENGTH = 280
+
+_PREFERENCES_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "preferred_roles": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "preferred_seniority": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "must_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "nice_to_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "preferred_locations": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "avoid_signals": {"type": "ARRAY", "items": {"type": "STRING"}},
+        "summary": {"type": "STRING"},
+    },
+    "required": list(_PREFERENCES_FIELDS),
+}
+
+CANDIDATE_CONTEXT_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "preferences": _PREFERENCES_SCHEMA,
+        **{field: {"type": "ARRAY", "items": {"type": "STRING"}} for field in _EVIDENCE_FIELDS},
+        "evaluation_summary": {"type": "STRING"},
+    },
+    "required": list(_TOP_LEVEL_FIELDS),
+}
+
+
+def _strip_code_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines)
+    return text.strip()
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = normalize_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(value.strip())
+    return deduped
+
+
+def _validate_string_list(data: dict, key: str, *, max_items: int, max_length: int) -> list[str]:
+    values = data.get(key)
+    if not isinstance(values, list):
+        raise ValueError(f"{key} must be a list")
+    if len(values) > max_items:
+        raise ValueError(f"{key} exceeds {max_items} items")
+    cleaned: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"{key} entries must be strings")
+        item = value.strip()
+        if not item:
+            raise ValueError(f"{key} entries must be non-empty")
+        if len(item) > max_length:
+            raise ValueError(f"{key} entries must be <= {max_length} characters")
+        cleaned.append(item)
+    return _dedupe_preserve_order(cleaned)
+
+
+def _build_extraction_prompt(profile: str) -> str:
+    return f"""Extract a compact, rich candidate context from the candidate profile below,
+for reuse across every job evaluation and cover letter in this job search.
+
+Return ONLY JSON with exactly these fields and no markdown fences:
+{{"preferences": {{"preferred_roles": [string], "preferred_seniority": [string], "must_have_signals": [string], "nice_to_have_signals": [string], "preferred_locations": [string], "avoid_signals": [string], "summary": string}}, "technical_skills": [string], "architecture_evidence": [string], "leadership_ownership": [string], "agentic_ai_evidence": [string], "product_domain_evidence": [string], "location_language_facts": [string], "career_direction": [string], "company_environment": [string], "career_evidence": [string], "evaluation_summary": string}}
+
+Rules:
+- Every fact you output must be directly supported by the candidate profile below. Never infer, guess, or
+  extrapolate a fact that is not stated. If a fact is unknown or not mentioned in the profile, omit it
+  entirely rather than inventing or assuming it.
+- Do not invent credentials, employers, skills, degrees, certifications, locations, or achievements.
+- Keep every list compact and deduplicated.
+- preferences.summary must be one short sentence. evaluation_summary must be at most a few sentences
+  summarizing the candidate for downstream job evaluation.
+
+Candidate profile:
+{profile}
+"""
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _cache_key(profile_hash: str, model: str, schema_version: str) -> str:
+    return _hash(f"{profile_hash}\x1f{model}\x1f{schema_version}")
+
+
+def _parse_preferences(data: object) -> CandidatePreferences:
+    if not isinstance(data, dict):
+        raise ValueError("preferences must be a JSON object")
+    if set(data) != set(_PREFERENCES_FIELDS):
+        raise ValueError(f"preferences must contain exactly {_PREFERENCES_FIELDS}")
+
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        raise ValueError("preferences.summary must be a string")
+    summary = summary.strip()
+    if not summary:
+        raise ValueError("preferences.summary must be non-empty")
+    if len(summary) > _PREFERENCES_MAX_SUMMARY_LENGTH:
+        raise ValueError(f"preferences.summary must be <= {_PREFERENCES_MAX_SUMMARY_LENGTH} characters")
+
+    fields = {
+        name: _validate_string_list(
+            data, name, max_items=_PREFERENCES_MAX_LIST_ITEMS, max_length=_PREFERENCES_MAX_ITEM_LENGTH
+        )
+        for name in _PREFERENCES_LIST_FIELDS
+    }
+    return CandidatePreferences(summary=summary, **fields)
+
+
+def _parse_context(raw: str) -> CandidateContext:
+    try:
+        data = json.loads(_strip_code_fences(raw))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid JSON: {exc}") from exc
+
+    if not isinstance(data, dict):
+        raise ValueError("response must be a JSON object")
+    if set(data) != set(_TOP_LEVEL_FIELDS):
+        raise ValueError(f"response must contain exactly {_TOP_LEVEL_FIELDS}")
+
+    evaluation_summary = data.get("evaluation_summary")
+    if not isinstance(evaluation_summary, str):
+        raise ValueError("evaluation_summary must be a string")
+    evaluation_summary = evaluation_summary.strip()
+    if not evaluation_summary:
+        raise ValueError("evaluation_summary must be non-empty")
+    if len(evaluation_summary) > _MAX_SUMMARY_LENGTH:
+        raise ValueError(f"evaluation_summary must be <= {_MAX_SUMMARY_LENGTH} characters")
+
+    evidence = {
+        field: _validate_string_list(data, field, max_items=_MAX_LIST_ITEMS, max_length=_MAX_ITEM_LENGTH)
+        for field in _EVIDENCE_FIELDS
+    }
+
+    return CandidateContext(
+        preferences=_parse_preferences(data.get("preferences")),
+        evaluation_summary=evaluation_summary,
+        **evidence,
+    )
+
+
+def _fallback_context(policy: SearchPolicy) -> CandidateContext:
+    return CandidateContext(
+        preferences=_build_fallback_preferences(policy),
+        technical_skills=[],
+        architecture_evidence=[],
+        leadership_ownership=[],
+        agentic_ai_evidence=[],
+        product_domain_evidence=[],
+        location_language_facts=[],
+        career_direction=[],
+        company_environment=[],
+        career_evidence=[],
+        evaluation_summary=FALLBACK_CONTEXT_SUMMARY,
+    )
+
+
+def _context_from_dict(data: dict) -> CandidateContext:
+    preferences_data = data["preferences"]
+    return CandidateContext(
+        preferences=CandidatePreferences(**{name: preferences_data[name] for name in _PREFERENCES_FIELDS}),
+        **{field: list(data[field]) for field in _EVIDENCE_FIELDS},
+        evaluation_summary=data["evaluation_summary"],
+    )
+
+
+def get_candidate_context(
+    profile: str,
+    policy: SearchPolicy,
+    gemini: "GeminiClient",
+    store: "JobStore",
+) -> CandidateContext:
+    """Return the cached candidate context, extracting and caching it once if needed."""
+    if not profile.strip():
+        return _fallback_context(policy)
+
+    profile_hash = _hash(profile)
+    cache_key = _cache_key(profile_hash, gemini.model, CANDIDATE_CONTEXT_SCHEMA_VERSION)
+
+    cached = store.get_candidate_context(cache_key)
+    if cached is not None:
+        return _context_from_dict(cached.context)
+
+    try:
+        raw = gemini.generate_text(
+            _build_extraction_prompt(profile),
+            purpose="candidate_context",
+            thinking_level="medium",
+            max_output_tokens=1800,
+            json_mode=True,
+            json_schema=CANDIDATE_CONTEXT_SCHEMA,
+        )
+        context = _parse_context(raw)
+    except (GeminiBudgetExceeded, GeminiQuotaPaused):
+        raise
+    except Exception:
+        return _fallback_context(policy)
+
+    store.save_candidate_context(
+        cache_key=cache_key,
+        profile_hash=profile_hash,
+        model=gemini.model,
+        schema_version=CANDIDATE_CONTEXT_SCHEMA_VERSION,
+        context=asdict(context),
+    )
+    return context

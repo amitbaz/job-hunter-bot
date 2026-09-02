@@ -7,6 +7,24 @@ from job_hunter.config import load_gmail_settings
 from job_hunter.models import CompanyWatchSeed
 
 
+def _set_required_bot_env(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv(
+        "CANDIDATE_PROFILE_B64", base64.b64encode(b"profile").decode()
+    )
+    monkeypatch.setenv(
+        "COVER_LETTER_TEMPLATE_B64", base64.b64encode(b"template").decode()
+    )
+    monkeypatch.setenv("JOB_HUNTER_DRY_RUN", "1")
+
+
+@pytest.fixture(autouse=True)
+def _set_gemini_free_tier_limits(monkeypatch):
+    monkeypatch.setenv("GEMINI_FREE_RPM", "10")
+    monkeypatch.setenv("GEMINI_FREE_TPM", "250000")
+    monkeypatch.setenv("GEMINI_FREE_RPD", "500")
+
+
 def _load_manual_watch_config(monkeypatch, tmp_path, manual_watch_yaml):
     cfg = tmp_path / "search.yml"
     cfg.write_text(
@@ -21,6 +39,68 @@ def _load_manual_watch_config(monkeypatch, tmp_path, manual_watch_yaml):
     )
     monkeypatch.setenv("JOB_HUNTER_DRY_RUN", "1")
     return load_settings(cfg)
+
+
+def test_loaders_receive_identical_gemini_free_tier_quota(monkeypatch, tmp_path):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds:\n  package: 75\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+    )
+    monkeypatch.setenv("GMAIL_CLIENT_ID", "client")
+    monkeypatch.setenv("GMAIL_CLIENT_SECRET", "secret")
+    monkeypatch.setenv("GMAIL_REFRESH_TOKEN", "refresh")
+
+    bot_settings = load_settings(cfg)
+    gmail_settings = load_gmail_settings()
+
+    assert bot_settings.gemini_quota == gmail_settings.gemini_quota
+    assert bot_settings.gemini_quota.rpm == 10
+    assert bot_settings.gemini_quota.tpm == 250000
+    assert bot_settings.gemini_quota.rpd == 500
+    assert bot_settings.gemini_quota.ceiling_ratio == 0.80
+    assert bot_settings.gemini_quota.core_reserve_ratio == 0.25
+    assert bot_settings.gemini_quota.rate_pause_seconds == 90
+
+
+@pytest.mark.parametrize(
+    "name", ["GEMINI_FREE_RPM", "GEMINI_FREE_TPM", "GEMINI_FREE_RPD"]
+)
+def test_gemini_free_tier_limit_is_required(monkeypatch, tmp_path, name):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds:\n  package: 75\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+    )
+    monkeypatch.delenv(name)
+
+    with pytest.raises(ValueError, match=name):
+        load_settings(cfg)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GEMINI_FREE_RPM", "0"),
+        ("GEMINI_FREE_TPM", "-1"),
+        ("GEMINI_FREE_RPD", "not-an-integer"),
+    ],
+)
+def test_gemini_free_tier_limit_must_be_a_positive_integer(
+    monkeypatch, tmp_path, name, value
+):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds:\n  package: 75\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+    )
+    monkeypatch.setenv(name, value)
+
+    with pytest.raises(ValueError, match=f"{name} must be a positive integer"):
+        load_settings(cfg)
 
 
 def test_load_gmail_settings_does_not_require_candidate_profile(monkeypatch):

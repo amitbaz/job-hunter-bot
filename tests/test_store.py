@@ -112,6 +112,141 @@ def test_r2_schema_upgrades_legacy_jobs_table(tmp_path):
     assert "company_watch" in tables
 
 
+def test_gemini_usage_rows_persist_success_without_prompt_or_response_content():
+    store = JobStore(":memory:")
+
+    store.record_gemini_usage(
+        occurred_at="2026-09-01T08:00:00+00:00",
+        run_id="run-1",
+        model="gemini-3.6-flash",
+        purpose="job_evaluation",
+        status="success",
+        estimated_input_tokens=120,
+        prompt_tokens=100,
+        output_tokens=20,
+        thinking_tokens=5,
+        cached_tokens=10,
+        total_tokens=125,
+    )
+
+    rows = store.gemini_usage_rows(
+        "2026-09-01T00:00:00+00:00",
+        "2026-09-02T00:00:00+00:00",
+        model="gemini-3.6-flash",
+        run_id="run-1",
+    )
+
+    assert len(rows) == 1
+    assert dict(rows[0]) == {
+        "id": 1,
+        "occurred_at": "2026-09-01T08:00:00+00:00",
+        "run_id": "run-1",
+        "model": "gemini-3.6-flash",
+        "purpose": "job_evaluation",
+        "status": "success",
+        "estimated_input_tokens": 120,
+        "prompt_tokens": 100,
+        "output_tokens": 20,
+        "thinking_tokens": 5,
+        "cached_tokens": 10,
+        "total_tokens": 125,
+        "http_status": None,
+        "error_code": None,
+    }
+    assert "prompt" not in rows[0].keys()
+    assert "response" not in rows[0].keys()
+
+
+def test_gemini_usage_rows_persist_429_attempt():
+    store = JobStore(":memory:")
+
+    store.record_gemini_usage(
+        occurred_at="2026-09-01T08:00:00+00:00",
+        run_id="run-1",
+        model="gemini-3.6-flash",
+        purpose="cover_letter",
+        status="quota_429",
+        estimated_input_tokens=80,
+        http_status=429,
+        error_code="RESOURCE_EXHAUSTED",
+    )
+
+    rows = store.gemini_usage_rows(
+        "2026-09-01T00:00:00+00:00", "2026-09-02T00:00:00+00:00"
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["status"] == "quota_429"
+    assert rows[0]["http_status"] == 429
+    assert rows[0]["error_code"] == "RESOURCE_EXHAUSTED"
+
+
+def test_gemini_pause_round_trip_and_clear():
+    store = JobStore(":memory:")
+
+    store.set_gemini_pause(
+        "gemini-3.6-flash",
+        "2026-09-01T08:01:30+00:00",
+        "rate_limit",
+    )
+
+    pause = store.get_gemini_pause("gemini-3.6-flash")
+
+    assert pause is not None
+    assert pause["paused_until"] == "2026-09-01T08:01:30+00:00"
+    assert pause["reason"] == "rate_limit"
+    assert pause["updated_at"]
+
+    store.clear_gemini_pause("gemini-3.6-flash")
+
+    assert store.get_gemini_pause("gemini-3.6-flash") is None
+
+
+def test_candidate_context_cache_round_trip_serializes_json_inside_store():
+    store = JobStore(":memory:")
+    context = {"summary": "Frontend engineer", "technical_skills": ["Python"]}
+
+    store.save_candidate_context(
+        cache_key="profile:model:v1",
+        profile_hash="profile-hash",
+        model="gemini-3.6-flash",
+        schema_version="v1",
+        context=context,
+    )
+
+    cached = store.get_candidate_context("profile:model:v1")
+
+    assert cached is not None
+    assert cached.cache_key == "profile:model:v1"
+    assert cached.profile_hash == "profile-hash"
+    assert cached.model == "gemini-3.6-flash"
+    assert cached.schema_version == "v1"
+    assert cached.context == context
+
+
+def test_pending_ai_work_is_idempotent_and_updates_its_timestamp(monkeypatch):
+    store = JobStore(":memory:")
+    job_id, _, _ = store.upsert_job(Job(source="manual", title="Frontend Engineer"))
+    timestamps = iter(
+        ["2026-09-01T08:00:00+00:00", "2026-09-01T08:01:00+00:00"]
+    )
+    monkeypatch.setattr("job_hunter.store._now_iso", lambda: next(timestamps))
+
+    store.enqueue_ai_work("cover_letter", job_id)
+    store.enqueue_ai_work("cover_letter", job_id)
+
+    pending = store.list_pending_ai_work("cover_letter")
+
+    assert len(pending) == 1
+    assert pending[0]["job_id"] == job_id
+    assert pending[0]["created_at"] == "2026-09-01T08:00:00+00:00"
+    assert pending[0]["updated_at"] == "2026-09-01T08:01:00+00:00"
+
+    store.complete_ai_work("cover_letter", job_id)
+
+    assert store.list_pending_ai_work("cover_letter") == []
+
+
 def test_company_watch_upsert_deduplicates_normalized_company_name(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
 

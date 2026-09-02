@@ -105,6 +105,20 @@ Set these under **Settings -> Secrets and variables -> Actions** on your fork/re
 | `GMAIL_CLIENT_SECRET` | OAuth client secret used only by the Gmail intelligence sync |
 | `GMAIL_REFRESH_TOKEN` | Refresh token printed by the local Gmail OAuth bootstrap |
 
+## Required GitHub Actions variables
+
+Set these under **Settings -> Secrets and variables -> Actions -> Variables** tab. They are your free-tier rate limits, not credentials, so they belong in Variables, not Secrets:
+
+| Variable | Purpose |
+| --- | --- |
+| `GEMINI_FREE_RPM` | Gemini free-tier requests-per-minute limit, copied from the AI Studio Rate Limits page |
+| `GEMINI_FREE_TPM` | Gemini free-tier input-tokens-per-minute limit, copied from the AI Studio Rate Limits page |
+| `GEMINI_FREE_RPD` | Gemini free-tier requests-per-day limit, copied from the AI Studio Rate Limits page |
+
+The bot enforces its own ceiling at 80% of each of these three values, and both Gemini-using workflow steps (`sync-gmail` and `run`) fail closed at startup if any of the three is unset. See [Gemini API key and free-tier quota setup](#gemini-api-key-and-free-tier-quota-setup) below for exactly where to read these values and how often to refresh them.
+
+`GEMINI_RUN_ID` is not something you configure: the workflow supplies it automatically as `${{ github.run_id }}` on both Gemini-using steps, so the Gmail sync process and the main pipeline process share one GitHub Actions run id and are accounted against one usage ledger for that run.
+
 Never commit your CV or cover letter template text in plain form. Encode them locally and paste only the base64 output into the GitHub secret:
 
 ```bash
@@ -123,11 +137,18 @@ Paste the resulting string as the secret value. The bot decodes it in memory at 
 3. Find your chat id without exposing the token in git: call `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser or with `curl` locally (substitute your real token only in that local command, never in a committed file), and read the `chat.id` field from the JSON response for your message.
 4. Store the bot token and chat id as the `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` GitHub secrets above. Do not put either value in `config/search.yml`, `.env`, or any committed file.
 
-## Gemini API key setup
+## Gemini API key and free-tier quota setup
 
-1. Create a free-tier API key at [Google AI Studio](https://aistudio.google.com/).
-2. Store it as the `GEMINI_API_KEY` secret.
-3. The model used is controlled by the `GEMINI_MODEL` environment variable, defaulting to `gemini-3.6-flash` if unset. Override it (as a repo secret or variable, or in your local `.env`) if you want to point at a different Gemini model.
+This bot is designed to run entirely on the Gemini API free tier, at €0 cost. Follow this sequence exactly, in order, both on first setup and any time you change the Gemini project or model:
+
+1. **Keep the Job Hunter Gemini Google Cloud project unlinked from Cloud Billing.** This is an operator-enforced deployment gate, not something the bot's code can verify or turn off. The bot's 80% usage ceilings and its 429 circuit breaker (see below) reduce how much of the free-tier quota gets used, but they cannot make overspending impossible: those guardrails run in application code and have no way to detect or block a linked billing account. If Cloud Billing is ever linked to this project, quota limits can stop being a hard wall and calls could be billed instead of rejected. Confirm "No billing account" in Google Cloud Console's **Billing** page for the project behind your API key, not just in AI Studio.
+2. Create a free-tier API key for that unbilled project at [Google AI Studio](https://aistudio.google.com/).
+3. Store the key as the `GEMINI_API_KEY` GitHub Actions **secret**.
+4. In AI Studio, open **Rate Limits** for the same project and for the model configured via the `GEMINI_MODEL` environment variable (defaulting to `gemini-3.6-flash` if unset; override it as a repo secret or variable, or in your local `.env`, to point at a different model). Read off the RPM (requests/minute), input TPM (tokens/minute), and RPD (requests/day) values shown there.
+5. Copy those three numbers into the GitHub Actions **variables** `GEMINI_FREE_RPM`, `GEMINI_FREE_TPM`, and `GEMINI_FREE_RPD` (see [Required GitHub Actions variables](#required-github-actions-variables)). Both Gemini-using workflow steps read these and enforce an 80%-of-quota ceiling before ever calling Gemini.
+6. Whenever the Gemini project changes or `GEMINI_MODEL` changes, return to AI Studio's Rate Limits page first and refresh all three variables before the next run — free-tier limits differ per model and per project, and a stale, too-high value would let the app under-protect itself against the real provider limit.
+7. Each normal bot run sends one Telegram usage line, for example `Gemini 🟢 RPD 34% · RPM peak 20% · TPM peak 17% · 21 calls · 142k tokens`. Those percentages are of your actual provider quota (the `GEMINI_FREE_RPD`/`RPM`/`TPM` values above), not of some smaller internal number — read them directly against 100%. Because the app stops itself at 80% of quota, a healthy run should top out at or below roughly 80%, never higher: 🟢 means under 60% of quota used, 🟡 means 60-79%, and 🔴 means 80%+ or that a pause is currently active.
+8. If Gemini returns HTTP 429 (quota exceeded), the bot does not retry that call automatically and does not fall back to any paid path. It records a pause, defers or skips the affected work for the rest of that run, and Telegram carries a warning; the deferred work is picked up again on a later run once the provider's quota window has reset. Free tier is the only mode this bot runs in — a 429 means "wait," never "switch to paid."
 
 ## Local dry run
 
@@ -166,9 +187,9 @@ python -m job_hunter sync-gmail --dry-run
 python -m job_hunter sync-gmail --force-backfill
 ```
 
-`--dry-run` classifies and extracts without advancing the Gmail cursor or persisting Gmail-derived state. `--force-backfill` repeats the 12-month backfill idempotently and is non-destructive. A completed sync with individual message errors keeps its cursor so those messages retry on the next sync; setup, authorization, profile, or listing failures return a nonzero status.
+`--dry-run` classifies and extracts without advancing the Gmail cursor or persisting Gmail-derived state. `--force-backfill` repeats the 120-day backfill idempotently and is non-destructive. A completed sync with individual message errors keeps its cursor so those messages retry on the next sync; setup, authorization, profile, or listing failures return a nonzero status.
 
-The first successful Gmail setup performs a 12-month historical backfill. Historical processing is resumable and intentionally bounded to 100 previously unprocessed messages per sync invocation, so a large mailbox may need multiple workflow runs to finish. Successfully processed message IDs are stored in the SQLite state artifact and skipped on later runs. In GitHub Actions the Gmail step also has a 10-minute fail-open timeout; if it reaches that safety limit, the normal Job Hunter pipeline continues and the next run resumes the remaining Gmail backlog.
+The first successful Gmail setup performs a 120-day historical backfill. Historical processing is resumable and intentionally bounded to 100 previously unprocessed messages per sync invocation, so a large mailbox may need multiple workflow runs to finish. Successfully processed message IDs are stored in the SQLite state artifact and skipped on later runs. In GitHub Actions the Gmail step also has a 10-minute fail-open timeout; if it reaches that safety limit, the normal Job Hunter pipeline continues and the next run resumes the remaining Gmail backlog.
 
 ## Manual GitHub Actions dispatch
 

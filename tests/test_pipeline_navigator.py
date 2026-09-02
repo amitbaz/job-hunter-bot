@@ -1,6 +1,6 @@
 import json
 
-from job_hunter.models import Job, SearchPolicy, Settings
+from job_hunter.models import GeminiQuotaSettings, Job, SearchPolicy, Settings
 from job_hunter.navigation_store import get_navigation_session
 from job_hunter.pipeline import run_pipeline
 from job_hunter.store import JobStore
@@ -10,17 +10,38 @@ from job_hunter.telegram_navigation import parse_callback
 class FakeGemini:
     model = "gemini-test"
 
-    def generate_text(self, prompt, *, json_mode=False):
-        if json_mode and "preferred_roles" in prompt:
+    def generate_text(
+        self,
+        prompt,
+        *,
+        purpose=None,
+        thinking_level=None,
+        max_output_tokens=None,
+        json_mode=False,
+        json_schema=None,
+    ):
+        if purpose == "candidate_context":
             return json.dumps(
                 {
-                    "preferred_roles": ["Senior Product Engineer"],
-                    "preferred_seniority": ["senior"],
-                    "must_have_signals": ["React"],
-                    "nice_to_have_signals": ["TypeScript"],
-                    "preferred_locations": ["Germany"],
-                    "avoid_signals": [],
-                    "summary": "Senior frontend/product engineer.",
+                    "preferences": {
+                        "preferred_roles": ["Senior Product Engineer"],
+                        "preferred_seniority": ["senior"],
+                        "must_have_signals": ["React"],
+                        "nice_to_have_signals": ["TypeScript"],
+                        "preferred_locations": ["Germany"],
+                        "avoid_signals": [],
+                        "summary": "Senior frontend/product engineer.",
+                    },
+                    "technical_skills": [],
+                    "architecture_evidence": [],
+                    "leadership_ownership": [],
+                    "agentic_ai_evidence": [],
+                    "product_domain_evidence": [],
+                    "location_language_facts": [],
+                    "career_direction": [],
+                    "company_environment": [],
+                    "career_evidence": [],
+                    "evaluation_summary": "Senior frontend/product engineer.",
                 }
             )
         if json_mode:
@@ -95,6 +116,7 @@ def _settings(tmp_path):
             thresholds={"package": 75, "possible": 65},
             max_jobs_per_run=35,
         ),
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
         dry_run=False,
         telegram_bot_token="token",
         telegram_chat_id="chat",

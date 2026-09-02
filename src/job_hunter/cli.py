@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
 from job_hunter.config import load_gmail_settings, load_settings
 from job_hunter.gemini import GeminiClient
+from job_hunter.gemini_usage import GeminiUsageTracker
 from job_hunter.gmail_auth import GoogleOAuthTokenProvider
 from job_hunter.gmail_client import GmailClient
 from job_hunter.gmail_sync import GmailSyncService
@@ -38,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument(
         "--force-backfill",
         action="store_true",
-        help="Repeat the 12-month backfill idempotently",
+        help="Repeat the 120-day backfill idempotently",
     )
 
     return parser
@@ -75,7 +77,14 @@ def _run(args: argparse.Namespace) -> int:
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     cover_letter_output_dir(settings).mkdir(parents=True, exist_ok=True)
 
-    summary = run_pipeline(settings)
+    store = JobStore(settings.db_path)
+    http = HttpClient()
+    tracker = GeminiUsageTracker(
+        store, settings.gemini_quota, settings.gemini_model, run_id=os.getenv("GEMINI_RUN_ID")
+    )
+    gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, http, tracker=tracker)
+
+    summary = run_pipeline(settings, store=store, gemini=gemini, http=http)
     logger.info(
         "Run complete: ready_to_apply=%d possible_matches=%d skipped=%d errors=%d",
         summary.ready_to_apply,
@@ -95,13 +104,26 @@ def _sync_gmail(args: argparse.Namespace) -> int:
             if db_path.exists()
             else JobStore(":memory:")
         )
+        # A GeminiUsageTracker WRITES usage/pause rows, and `store` above is
+        # opened read-only against the real db precisely so --dry-run can
+        # never persist anything there. A dry run still makes real Gemini
+        # calls (see GmailSyncService.process_message), so the guardrails
+        # must still be active for it -- just against a dedicated, ephemeral
+        # in-memory ledger rather than the real one, so the "never persists"
+        # guarantee for --dry-run holds regardless of how much quota history
+        # a real (non-dry-run) process has already written today.
+        tracker_store = JobStore(":memory:")
     else:
         db_path.parent.mkdir(parents=True, exist_ok=True)
         store = JobStore(db_path)
+        tracker_store = store
 
     http = HttpClient()
     gmail = GmailClient(http, GoogleOAuthTokenProvider(settings))
-    gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, http)
+    tracker = GeminiUsageTracker(
+        tracker_store, settings.gemini_quota, settings.gemini_model, run_id=os.getenv("GEMINI_RUN_ID")
+    )
+    gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, http, tracker=tracker)
     service = GmailSyncService(gmail=gmail, gemini=gemini, store=store)
     summary = service.sync(
         datetime.now(timezone.utc),

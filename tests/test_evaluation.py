@@ -3,7 +3,14 @@ import json
 import pytest
 
 from job_hunter.evaluation import EvaluationError, evaluate_job
-from job_hunter.models import Job, SearchPolicy
+from job_hunter.models import CandidateContext, CandidatePreferences, Job, SearchPolicy
+
+# A sentinel that would only appear in the prompt if some future change
+# reintroduced sending the raw candidate profile wholesale. It is never
+# passed into evaluate_job (the signature no longer accepts a profile
+# string at all), so its absence proves the prompt is built solely from
+# the compact CandidateContext.
+_FULL_PROFILE_SENTINEL = "FULL_PROFILE_TEXT_MUST_NOT_LEAK_9f3a"
 
 
 class FakeGemini:
@@ -12,8 +19,17 @@ class FakeGemini:
         self.model = "gemini-2.5-flash-lite"
         self.prompts = []
 
-    def generate_text(self, prompt, *, json_mode=False):
-        self.prompts.append((prompt, json_mode))
+    def generate_text(
+        self,
+        prompt,
+        *,
+        purpose=None,
+        thinking_level=None,
+        max_output_tokens=None,
+        json_mode=False,
+        json_schema=None,
+    ):
+        self.prompts.append((prompt, purpose, thinking_level, max_output_tokens, json_mode))
         return self.text
 
 
@@ -36,6 +52,31 @@ def policy():
 @pytest.fixture
 def job():
     return Job(source="ashby", title="Senior Product Engineer", description="React TypeScript remote")
+
+
+@pytest.fixture
+def context():
+    return CandidateContext(
+        preferences=CandidatePreferences(
+            preferred_roles=["Senior Product Engineer"],
+            preferred_seniority=["senior"],
+            must_have_signals=["React"],
+            nice_to_have_signals=["TypeScript"],
+            preferred_locations=["Germany", "EU remote"],
+            avoid_signals=["on-site only"],
+            summary="Senior frontend/product engineer looking for remote roles.",
+        ),
+        technical_skills=["React", "TypeScript", "Node.js"],
+        architecture_evidence=["Led migration to microservices at Acme"],
+        leadership_ownership=["Managed a team of 3 engineers"],
+        agentic_ai_evidence=["Built an LLM-based job evaluation pipeline"],
+        product_domain_evidence=["5 years building B2B SaaS products"],
+        location_language_facts=["Based in Germany", "Fluent in English and German"],
+        career_direction=["Moving toward staff-level product engineering"],
+        company_environment=["Prefers small, product-focused teams"],
+        career_evidence=["Senior engineer at Acme for 5 years"],
+        evaluation_summary="Strong senior product engineer with deep React and architecture experience.",
+    )
 
 
 def _valid_payload(**overrides):
@@ -61,61 +102,61 @@ def _valid_payload(**overrides):
     return payload
 
 
-def test_evaluate_job_maps_high_priority_decision(fake_gemini, job, policy):
+def test_evaluate_job_maps_high_priority_decision(fake_gemini, job, policy, context):
     fake_gemini.text = json.dumps(_valid_payload())
-    evaluation = evaluate_job(job, "profile", policy, fake_gemini)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
     assert evaluation.total_score == 89
     assert evaluation.decision == "high_priority"
     assert evaluation.model == "gemini-2.5-flash-lite"
 
 
-def test_evaluate_job_recomputes_total_from_components(fake_gemini, job, policy):
+def test_evaluate_job_recomputes_total_from_components(fake_gemini, job, policy, context):
     payload = _valid_payload(total_score=89)
     payload["scores"]["company_environment"] = 3
     fake_gemini.text = json.dumps(payload)
     with pytest.raises(EvaluationError):
-        evaluate_job(job, "profile", policy, fake_gemini)
+        evaluate_job(job, context, policy, fake_gemini)
 
 
-def test_evaluate_job_strips_markdown_code_fences(fake_gemini, job, policy):
+def test_evaluate_job_strips_markdown_code_fences(fake_gemini, job, policy, context):
     fake_gemini.text = "```json\n" + json.dumps(_valid_payload()) + "\n```"
-    evaluation = evaluate_job(job, "profile", policy, fake_gemini)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
     assert evaluation.total_score == 89
 
 
-def test_evaluation_rejects_component_over_max(fake_gemini, job, policy):
+def test_evaluation_rejects_component_over_max(fake_gemini, job, policy, context):
     payload = _valid_payload()
     payload["scores"]["role_seniority"] = 31
     payload["total_score"] = 92
     fake_gemini.text = json.dumps(payload)
     with pytest.raises(EvaluationError):
-        evaluate_job(job, "profile", policy, fake_gemini)
+        evaluate_job(job, context, policy, fake_gemini)
 
 
-def test_evaluation_rejects_unknown_score_key(fake_gemini, job, policy):
+def test_evaluation_rejects_unknown_score_key(fake_gemini, job, policy, context):
     payload = _valid_payload()
     payload["scores"]["extra_key"] = 1
     fake_gemini.text = json.dumps(payload)
     with pytest.raises(EvaluationError):
-        evaluate_job(job, "profile", policy, fake_gemini)
+        evaluate_job(job, context, policy, fake_gemini)
 
 
-def test_evaluation_rejects_missing_score_key(fake_gemini, job, policy):
+def test_evaluation_rejects_missing_score_key(fake_gemini, job, policy, context):
     payload = _valid_payload()
     del payload["scores"]["company_environment"]
     fake_gemini.text = json.dumps(payload)
     with pytest.raises(EvaluationError):
-        evaluate_job(job, "profile", policy, fake_gemini)
+        evaluate_job(job, context, policy, fake_gemini)
 
 
-def test_evaluation_hard_blocker_forces_blocked_decision(fake_gemini, job, policy):
+def test_evaluation_hard_blocker_forces_blocked_decision(fake_gemini, job, policy, context):
     payload = _valid_payload(hard_blockers=["Not remote"])
     fake_gemini.text = json.dumps(payload)
-    evaluation = evaluate_job(job, "profile", policy, fake_gemini)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
     assert evaluation.decision == "blocked"
 
 
-def test_evaluation_maps_skip_band(fake_gemini, job, policy):
+def test_evaluation_maps_skip_band(fake_gemini, job, policy, context):
     payload = _valid_payload(
         scores={
             "role_seniority": 15,
@@ -128,11 +169,48 @@ def test_evaluation_maps_skip_band(fake_gemini, job, policy):
         total_score=52,
     )
     fake_gemini.text = json.dumps(payload)
-    evaluation = evaluate_job(job, "profile", policy, fake_gemini)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
     assert evaluation.decision == "skip"
 
 
-def test_evaluation_rejects_invalid_json(fake_gemini, job, policy):
+def test_evaluation_rejects_invalid_json(fake_gemini, job, policy, context):
     fake_gemini.text = "not json"
     with pytest.raises(EvaluationError):
-        evaluate_job(job, "profile", policy, fake_gemini)
+        evaluate_job(job, context, policy, fake_gemini)
+
+
+def test_evaluation_prompt_uses_compact_context_not_full_profile(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+
+    # Compact evidence/summary from the context must reach the prompt...
+    assert context.evaluation_summary in prompt
+    assert "Led migration to microservices at Acme" in prompt
+    assert "Managed a team of 3 engineers" in prompt
+
+    # ...and an arbitrary full-profile sentinel must never appear, guarding
+    # against a regression that reintroduces sending the raw profile.
+    assert _FULL_PROFILE_SENTINEL not in prompt
+
+
+def test_evaluation_prompt_preserves_hard_blockers_and_thresholds(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+
+    assert str(policy.salary_floor_eur) in prompt
+    assert "hard blocker" in prompt.lower()
+    assert "remote" in prompt.lower()
+    assert "relocation" in prompt.lower()
+
+
+def test_evaluation_uses_expected_resource_controls(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    _prompt, purpose, thinking_level, max_output_tokens, json_mode = fake_gemini.prompts[0]
+
+    assert purpose == "job_evaluation"
+    assert thinking_level == "low"
+    assert max_output_tokens == 1200
+    assert json_mode is True

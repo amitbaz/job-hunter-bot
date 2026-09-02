@@ -13,7 +13,16 @@ LEGACY_RATIONALE = "semantic classification unavailable or invalid"
 
 
 class FailingGemini:
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         raise RuntimeError("provider unavailable")
 
 
@@ -22,6 +31,9 @@ class InvalidSemanticGemini:
         self,
         prompt: str,
         *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
         json_mode: bool = False,
         json_schema: dict | None = None,
     ) -> str:

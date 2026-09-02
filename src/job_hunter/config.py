@@ -13,6 +13,7 @@ from .models import (
     DEFAULT_ENGINEERING_TITLE_KEYWORDS,
     DEFAULT_ENGINEERING_TITLE_PHRASES,
     CompanyWatchSeed,
+    GeminiQuotaSettings,
     SearchPolicy,
     Settings,
 )
@@ -34,6 +35,11 @@ def load_gmail_settings() -> GmailSettings:
         client_secret=_require_env("GMAIL_CLIENT_SECRET"),
         refresh_token=_require_env("GMAIL_REFRESH_TOKEN"),
         gemini_api_key=_require_env("GEMINI_API_KEY"),
+        gemini_quota=GeminiQuotaSettings(
+            rpm=_require_positive_int_env("GEMINI_FREE_RPM"),
+            tpm=_require_positive_int_env("GEMINI_FREE_TPM"),
+            rpd=_require_positive_int_env("GEMINI_FREE_RPD"),
+        ),
         gemini_model=os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"),
         db_path=os.environ.get("JOB_HUNTER_DB_PATH", "var/job_hunter.sqlite3"),
     )
@@ -100,6 +106,11 @@ def load_settings(config_path: Path) -> Settings:
         timezone=data.get("timezone", "Europe/Berlin"),
         scheduled_hour=data.get("scheduled_hour", 9),
         policy=policy,
+        gemini_quota=GeminiQuotaSettings(
+            rpm=_require_positive_int_env("GEMINI_FREE_RPM"),
+            tpm=_require_positive_int_env("GEMINI_FREE_TPM"),
+            rpd=_require_positive_int_env("GEMINI_FREE_RPD"),
+        ),
         dry_run=dry_run,
         telegram_bot_token=telegram_bot_token,
         telegram_chat_id=telegram_chat_id,
@@ -128,6 +139,17 @@ def _require_env(name: str) -> str:
     if not val:
         raise ValueError(f"Required environment variable {name!r} is not set")
     return val
+
+
+def _require_positive_int_env(name: str) -> int:
+    raw = _require_env(name)
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
 
 
 def _parse_manual_company_watch(entries: object) -> list[CompanyWatchSeed]:

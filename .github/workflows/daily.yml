@@ -29,10 +29,18 @@ jobs:
           GMAIL_CLIENT_SECRET: ${{ secrets.GMAIL_CLIENT_SECRET }}
           GMAIL_REFRESH_TOKEN: ${{ secrets.GMAIL_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_FREE_RPM: ${{ vars.GEMINI_FREE_RPM }}
+          GEMINI_FREE_TPM: ${{ vars.GEMINI_FREE_TPM }}
+          GEMINI_FREE_RPD: ${{ vars.GEMINI_FREE_RPD }}
+          GEMINI_RUN_ID: ${{ github.run_id }}
         run: python -m job_hunter sync-gmail
       - name: Run job hunter
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_FREE_RPM: ${{ vars.GEMINI_FREE_RPM }}
+          GEMINI_FREE_TPM: ${{ vars.GEMINI_FREE_TPM }}
+          GEMINI_FREE_RPD: ${{ vars.GEMINI_FREE_RPD }}
+          GEMINI_RUN_ID: ${{ github.run_id }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           CANDIDATE_PROFILE_B64: ${{ secrets.CANDIDATE_PROFILE_B64 }}

@@ -159,6 +159,96 @@ class CandidatePreferences:
     summary: str
 
 
+@dataclass(frozen=True, slots=True)
+class CandidateContext:
+    """A single rich extraction of the candidate profile, reused everywhere.
+
+    Replaces repeated full-profile prompts across evaluation and cover-letter
+    generation: extracted once per (profile, model, schema version) and
+    cached by job_hunter.candidate_context.get_candidate_context.
+    """
+
+    preferences: CandidatePreferences
+    technical_skills: list[str]
+    architecture_evidence: list[str]
+    leadership_ownership: list[str]
+    agentic_ai_evidence: list[str]
+    product_domain_evidence: list[str]
+    location_language_facts: list[str]
+    career_direction: list[str]
+    company_environment: list[str]
+    career_evidence: list[str]
+    evaluation_summary: str
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateContextCacheEntry:
+    """A cached, JSON-backed candidate context and its cache identity."""
+
+    cache_key: str
+    profile_hash: str
+    model: str
+    schema_version: str
+    context: dict
+    created_at: str
+
+
+@dataclass(frozen=True, slots=True)
+class GeminiQuotaSettings:
+    rpm: int
+    tpm: int
+    rpd: int
+    ceiling_ratio: float = 0.80
+    core_reserve_ratio: float = 0.25
+    rate_pause_seconds: int = 90
+
+    def __post_init__(self) -> None:
+        # config.py's _require_positive_int_env already rejects a non-positive
+        # rpm/tpm/rpd from the environment; this guard closes the same gap for
+        # any other construction path (tests, future callers) so it can never
+        # contradict that validation, only extend it. rate_pause_seconds has
+        # no env-level guard at all today, and a non-positive value is the
+        # root cause of a real correctness bug: a zero-length rate-limit pause
+        # (`paused_until == now`) makes GeminiUsageTracker.record_429's caller
+        # look paused-and-already-expired in the same instant, so a 429 could
+        # surface as the wrong exception type. See gemini.py's 429 handling.
+        for field_name in ("rpm", "tpm", "rpd", "rate_pause_seconds"):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(
+                    f"GeminiQuotaSettings.{field_name} must be a positive integer"
+                )
+
+
+@dataclass(frozen=True, slots=True)
+class GeminiUsageSummary:
+    """A point-in-time rollup of Gemini usage against configured free-tier quotas.
+
+    Percentages are against the configured provider limit, not the internal
+    80% ceiling. Token totals and `requests_today` cover only attempts that
+    reached the provider (blocked_budget rows never happened at Google).
+
+    `cached_tokens_today` is a subset of `input_tokens_today` (Google's
+    `cachedContentTokenCount` is part of `promptTokenCount`, not additional to
+    it), so `total_tokens_today` is Google's own `totalTokenCount` for each
+    attempt (falling back to a reconstructed input+output+thinking estimate
+    only when a row has no `usageMetadata` at all) rather than a naive sum of
+    the four token fields above, which would double-count the cached portion.
+    """
+
+    requests_today: int
+    rpd_percent: float
+    rpm_peak_percent: float
+    tpm_peak_percent: float
+    input_tokens_today: int
+    output_tokens_today: int
+    thinking_tokens_today: int
+    cached_tokens_today: int
+    total_tokens_today: int
+    purpose_counts: dict[str, int]
+    internal_budget_exhausted: bool
+    provider_paused: bool
+
+
 @dataclass(slots=True)
 class Settings:
     gemini_api_key: str
@@ -167,6 +257,7 @@ class Settings:
     timezone: str
     scheduled_hour: int
     policy: SearchPolicy
+    gemini_quota: GeminiQuotaSettings
     dry_run: bool = False
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None

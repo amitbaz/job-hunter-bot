@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 
+from job_hunter.gemini_usage import GeminiQuotaPaused
 from job_hunter.gmail_client import GmailHistoryExpired, GmailHistoryPage, GmailPage
 from job_hunter.gmail_matching import JobMatch
 from job_hunter.gmail_models import ExtractedJob, GmailClassification, GmailMessage
@@ -41,7 +42,16 @@ def _job_alert(message_id: str, *, sent_at: datetime) -> GmailMessage:
 
 
 class FakeGemini:
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         raise AssertionError("irrelevant fixture must not call Gemini")
 
 
@@ -49,8 +59,41 @@ class ResponseGemini:
     def __init__(self, response: dict) -> None:
         self.response = response
 
-    def generate_text(self, prompt: str, *, json_mode: bool = False) -> str:
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
         return json.dumps(self.response)
+
+
+class SequencedGemini:
+    """Returns/raises each entry of `responses` in order, one per call."""
+
+    def __init__(self, responses: list[object]) -> None:
+        self._responses = list(responses)
+        self.calls: list[str] = []
+
+    def generate_text(
+        self,
+        prompt: str,
+        *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
+        json_mode: bool = False,
+        json_schema: dict | None = None,
+    ) -> str:
+        self.calls.append(prompt)
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return json.dumps(response)
 
 
 class FakeGmail:
@@ -126,7 +169,7 @@ def test_first_sync_uses_profile_email_as_account_id(tmp_path):
     assert store.get_gmail_sync_state("primary") is None
 
 
-def test_first_sync_scans_12_months_and_marks_backfill_complete(tmp_path):
+def test_first_sync_scans_120_days_and_marks_backfill_complete(tmp_path):
     gmail = FakeGmail(
         message_ids=["m1"],
         messages={"m1": _message("m1")},
@@ -137,14 +180,14 @@ def test_first_sync_scans_12_months_and_marks_backfill_complete(tmp_path):
 
     assert gmail.search_calls == [
         (
-            'after:2025/08/31 {application interview recruiter hiring "job alert" '
+            'after:2026/05/03 {application interview recruiter hiring "job alert" '
             'position "technical assessment" "coding challenge" "job offer" '
             '"offer letter" "offer of employment" "pleased to offer you"}',
             None,
         )
     ]
     assert build_backfill_query(datetime(2024, 2, 29, tzinfo=UTC)) == (
-        'after:2023/02/28 {application interview recruiter hiring "job alert" '
+        'after:2023/11/01 {application interview recruiter hiring "job alert" '
         'position "technical assessment" "coding challenge" "job offer" '
         '"offer letter" "offer of employment" "pleased to offer you"}'
     )
@@ -396,7 +439,7 @@ def test_failed_forced_backfill_is_retried_by_following_ordinary_sync(tmp_path):
 
     state = store.get_gmail_sync_state("candidate@example.com")
     expected_query = (
-        'after:2025/08/31 {application interview recruiter hiring "job alert" '
+        'after:2026/05/03 {application interview recruiter hiring "job alert" '
         'position "technical assessment" "coding challenge" "job offer" '
         '"offer letter" "offer of employment" "pleased to offer you"}'
     )
@@ -542,6 +585,183 @@ def test_generic_job_board_alert_is_semantically_extracted_and_staged(tmp_path):
     assert tuple(candidate) == ("talentboard", "frontend-42", job_url)
 
 
+def _generic_job_alert(message_id: str, *, sent_at: datetime, job_url: str) -> GmailMessage:
+    return GmailMessage(
+        message_id=message_id,
+        thread_id=f"thread-{message_id}",
+        sender="alerts@talentboard.example",
+        subject="Job alert",
+        sent_at=sent_at,
+        snippet="A new frontend role matches your preferences.",
+        body="A new frontend role matches your preferences.",
+        links=[job_url],
+    )
+
+
+def test_stale_backfill_job_alert_skips_semantic_extraction_and_stages_nothing(tmp_path):
+    job_url = "https://talentboard.example/jobs/frontend-42"
+    alert = _generic_job_alert(
+        "stale-alert", sent_at=NOW - timedelta(days=15), job_url=job_url
+    )
+    gmail = FakeGmail(message_ids=[alert.message_id], messages={alert.message_id: alert})
+    # FakeGemini raises if generate_text is ever called: proves zero Gemini
+    # calls for a 15+ day backfill job alert.
+    service, store = _service(tmp_path, gmail)
+
+    summary = service.sync(NOW)
+
+    assert store.has_processed_gmail_message("stale-alert") is True
+    assert summary.job_alerts == 1
+    assert (
+        store._conn.execute("SELECT COUNT(*) FROM inbound_job_candidates").fetchone()[0]
+        == 0
+    )
+
+
+def test_fresh_backfill_job_alert_still_uses_semantic_extraction(tmp_path):
+    job_url = "https://talentboard.example/jobs/frontend-42"
+    alert = _generic_job_alert(
+        "fresh-alert", sent_at=NOW - timedelta(days=13), job_url=job_url
+    )
+    gmail = FakeGmail(message_ids=[alert.message_id], messages={alert.message_id: alert})
+    store = JobStore(tmp_path / "state.sqlite3")
+    gemini = ResponseGemini(
+        {
+            "kind": "JOB_ALERT",
+            "confidence": 0.96,
+            "company": "Acme",
+            "role_title": "Frontend Engineer",
+            "source_job_id": "frontend-42",
+            "job_urls": [job_url],
+            "jobs": [
+                {
+                    "source_platform": "talentboard",
+                    "source_job_id": "frontend-42",
+                    "url": job_url,
+                    "company": "Acme",
+                    "title": "Frontend Engineer",
+                    "location": "Remote",
+                    "remote": True,
+                    "description": "Frontend role from the alert.",
+                }
+            ],
+            "rationale": "Job-board alert with one frontend opening.",
+        }
+    )
+    service = GmailSyncService(gmail=gmail, gemini=gemini, store=store)
+
+    summary = service.sync(NOW)
+
+    assert summary.job_alerts == 1
+    candidate = store._conn.execute(
+        "SELECT source_message_id FROM inbound_job_candidates"
+    ).fetchone()
+    assert candidate is not None
+    assert candidate["source_message_id"] == "fresh-alert"
+
+
+def _semantic_job_alert(message_id: str) -> GmailMessage:
+    return GmailMessage(
+        message_id=message_id,
+        thread_id=f"thread-{message_id}",
+        sender="alerts@talentboard.example",
+        subject="Job alert",
+        sent_at=NOW,
+        snippet="A new frontend role matches your preferences.",
+        body="A new frontend role matches your preferences.",
+        links=[],
+    )
+
+
+def test_quota_pause_stops_backfill_batch_and_leaves_remainder_unprocessed(tmp_path):
+    gmail = FakeGmail(
+        message_ids=["m1", "m2", "m3"],
+        messages={
+            "m1": _semantic_job_alert("m1"),
+            "m2": _semantic_job_alert("m2"),
+            "m3": _semantic_job_alert("m3"),
+        },
+    )
+    gemini = SequencedGemini(
+        [
+            {
+                "kind": "JOB_ALERT",
+                "confidence": 0.9,
+                "company": "",
+                "role_title": "",
+                "source_job_id": None,
+                "job_urls": [],
+                "jobs": [],
+                "rationale": "generic alert",
+            },
+            GeminiQuotaPaused(
+                "paused",
+                paused_until="2026-09-02T00:00:00+00:00",
+                reason="daily_quota",
+            ),
+        ]
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    service = GmailSyncService(gmail=gmail, gemini=gemini, store=store)
+
+    summary = service.sync(NOW)
+
+    # m3 is never even fetched: the batch stops attempting further messages
+    # as soon as the pause is raised.
+    assert gmail.message_calls == ["m1", "m2"]
+    assert summary.processed == 1
+    assert summary.errors == 0
+    assert store.has_processed_gmail_message("m1") is True
+    assert store.has_processed_gmail_message("m2") is False
+    assert store.has_processed_gmail_message("m3") is False
+    # Not counted as a permanent malformed-email review item, and backfill
+    # is not marked complete while messages remain unprocessed.
+    assert store.get_gmail_sync_state("candidate@example.com") is None
+
+
+def test_quota_pause_during_incremental_sync_does_not_advance_history_cursor(tmp_path):
+    gmail = FakeGmail(
+        messages={
+            "m1": _semantic_job_alert("m1"),
+            "m2": _semantic_job_alert("m2"),
+        }
+    )
+    gmail.history_pages = {
+        None: GmailHistoryPage(["m1", "m2"], "new-cursor", None)
+    }
+    gemini = SequencedGemini(
+        [
+            {
+                "kind": "JOB_ALERT",
+                "confidence": 0.9,
+                "company": "",
+                "role_title": "",
+                "source_job_id": None,
+                "job_urls": [],
+                "jobs": [],
+                "rationale": "generic alert",
+            },
+            GeminiQuotaPaused(
+                "paused",
+                paused_until="2026-09-02T00:00:00+00:00",
+                reason="daily_quota",
+            ),
+        ]
+    )
+    store = JobStore(tmp_path / "state.sqlite3")
+    _save_completed_state(store, history_id="old-cursor")
+    service = GmailSyncService(gmail=gmail, gemini=gemini, store=store)
+
+    summary = service.sync(NOW)
+
+    state = store.get_gmail_sync_state("candidate@example.com")
+    assert gmail.message_calls == ["m1", "m2"]
+    assert summary.processed == 1
+    assert state["history_id"] == "old-cursor"
+    assert store.has_processed_gmail_message("m1") is True
+    assert store.has_processed_gmail_message("m2") is False
+
+
 def test_semantic_gmail_job_description_is_not_persisted(tmp_path, monkeypatch):
     private_body = "PRIVATE EMAIL BODY THAT MUST NOT ENTER SQLITE"
     alert = GmailMessage(
@@ -572,7 +792,7 @@ def test_semantic_gmail_job_description_is_not_persisted(tmp_path, monkeypatch):
     gmail = FakeGmail(message_ids=[alert.message_id], messages={alert.message_id: alert})
     database_path = tmp_path / "state.sqlite3"
     store = JobStore(database_path)
-    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_, **__: classification)
 
     GmailSyncService(gmail=gmail, gemini=FakeGemini(), store=store).sync(NOW)
 
@@ -765,7 +985,7 @@ def test_ambiguous_lifecycle_event_is_review_needed_without_job_association(
         role_title="Frontend Engineer",
         rationale="interview details",
     )
-    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_, **__: classification)
     monkeypatch.setattr(
         "job_hunter.gmail_sync.match_job",
         lambda *_: JobMatch(job_id=job_id, reason="ambiguous_title", ambiguous=True),
@@ -801,7 +1021,7 @@ def test_low_confidence_lifecycle_event_is_review_needed(tmp_path, monkeypatch):
         role_title="Frontend Engineer",
         rationale="model was uncertain",
     )
-    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_: classification)
+    monkeypatch.setattr("job_hunter.gmail_sync.classify_email", lambda *_, **__: classification)
 
     summary = service.sync(NOW)
 
@@ -847,7 +1067,7 @@ def test_old_recruiter_mail_without_extracted_job_is_not_staged_but_concrete_rol
         ]
     )
     monkeypatch.setattr(
-        "job_hunter.gmail_sync.classify_email", lambda *_: next(classifications)
+        "job_hunter.gmail_sync.classify_email", lambda *_, **__: next(classifications)
     )
 
     service.sync(NOW)

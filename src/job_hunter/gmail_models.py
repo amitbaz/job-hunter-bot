@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from .models import GeminiQuotaSettings
+
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
 SUPPORTED_KINDS = frozenset(
@@ -28,6 +30,7 @@ class GmailSettings:
     client_secret: str
     refresh_token: str
     gemini_api_key: str
+    gemini_quota: GeminiQuotaSettings
     gemini_model: str = "gemini-3.6-flash"
     db_path: str = "var/job_hunter.sqlite3"
 

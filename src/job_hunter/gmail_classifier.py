@@ -7,6 +7,7 @@ from email.utils import parseaddr
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
+from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.gmail_models import (
     AUTO_CONFIDENCE_THRESHOLD,
     SUPPORTED_KINDS,
@@ -94,6 +95,10 @@ _JOB_ALERT_EXTRACTION_INSTRUCTION = """Deterministic rules identified this messa
 Keep kind as JOB_ALERT and extract only job candidates evidenced by the email.
 Use a URL only when it appears in the supplied email links or body.
 """
+# Free-tier guardrail: keep the semantic prompt small. Classification only
+# needs a representative slice of the body, not the whole email.
+_SEMANTIC_BODY_CHAR_LIMIT = 6_000
+_SEMANTIC_LINK_LIMIT = 20
 
 
 class SemanticClassificationError(RuntimeError):
@@ -434,8 +439,8 @@ def _build_semantic_prompt(
         "sender": message.sender,
         "subject": message.subject,
         "snippet": message.snippet,
-        "body": message.body[:20_000],
-        "links": _message_urls(message),
+        "body": normalize_text(message.body)[:_SEMANTIC_BODY_CHAR_LIMIT],
+        "links": _message_urls(message)[:_SEMANTIC_LINK_LIMIT],
     }
     extraction_instruction = (
         f"\n{_JOB_ALERT_EXTRACTION_INSTRUCTION}" if extract_job_alert else ""
@@ -453,19 +458,19 @@ def _generate_semantic_text(
     extract_job_alert: bool,
 ) -> str:
     prompt = _build_semantic_prompt(message, extract_job_alert=extract_job_alert)
-    try:
-        return gemini.generate_text(
-            prompt,
-            json_mode=True,
-            json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
-        )
-    except TypeError as exc:
-        if "unexpected keyword argument 'json_schema'" not in str(exc):
-            raise
-        return gemini.generate_text(prompt, json_mode=True)
+    return gemini.generate_text(
+        prompt,
+        purpose="gmail_semantic",
+        thinking_level="minimal",
+        max_output_tokens=800,
+        json_mode=True,
+        json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
+    )
 
 
-def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassification:
+def classify_email(
+    message: GmailMessage, gemini: GeminiClient, *, is_fresh: bool = True
+) -> GmailClassification:
     if not is_probably_job_related(message):
         return GmailClassification(
             kind="IRRELEVANT",
@@ -485,7 +490,12 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
             )
         )
     )
-    if deterministic is not None and not extract_job_alert:
+    # A stale job alert is never worth a Gemini call. This gate runs before
+    # extraction is requested, not after, so a 15+ day backfill alert costs
+    # zero generate_text calls. Lifecycle messages don't reach here at all
+    # (extract_job_alert is only set for JOB_ALERT), so their deterministic-
+    # first behavior is unaffected by freshness.
+    if deterministic is not None and (not extract_job_alert or not is_fresh):
         return deterministic
 
     try:
@@ -494,6 +504,8 @@ def classify_email(message: GmailMessage, gemini: GeminiClient) -> GmailClassifi
             gemini,
             extract_job_alert=extract_job_alert,
         )
+    except (GeminiBudgetExceeded, GeminiQuotaPaused):
+        raise
     except Exception as exc:
         raise SemanticClassificationError("gemini_error") from exc
 

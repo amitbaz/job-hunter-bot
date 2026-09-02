@@ -67,6 +67,47 @@ def test_request_raises_after_exhausting_retries_on_connection_error(monkeypatch
         pass
 
 
+def test_retry_status_codes_override_excludes_429_from_retry(monkeypatch):
+    monkeypatch.setattr("job_hunter.http.time.sleep", lambda _: None)
+
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return FakeResponse(429)
+
+    client = HttpClient()
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    response = client.post(
+        "https://example.com/thing", retry_status_codes={500, 502, 503, 504}
+    )
+
+    assert response.status_code == 429
+    assert len(calls) == 1
+    # The override must not reach requests.Session.request as a kwarg.
+    assert "retry_status_codes" not in calls[0][2]
+
+
+def test_retry_status_codes_default_still_retries_429(monkeypatch):
+    monkeypatch.setattr("job_hunter.http.time.sleep", lambda _: None)
+
+    responses = [FakeResponse(429), FakeResponse(200)]
+    calls = []
+
+    def fake_request(method, url, **kwargs):
+        calls.append((method, url, kwargs))
+        return responses[len(calls) - 1]
+
+    client = HttpClient()
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    response = client.post("https://example.com/thing")
+
+    assert response.status_code == 200
+    assert len(calls) == 2
+
+
 def test_post_body_is_byte_identical_across_retry_attempts(monkeypatch):
     monkeypatch.setattr("job_hunter.http.time.sleep", lambda _: None)
 
