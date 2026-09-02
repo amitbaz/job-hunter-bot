@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
@@ -13,6 +14,8 @@ from job_hunter.preferences import _build_fallback_preferences
 if TYPE_CHECKING:
     from job_hunter.gemini import GeminiClient
     from job_hunter.store import JobStore
+
+logger = logging.getLogger(__name__)
 
 CANDIDATE_CONTEXT_SCHEMA_VERSION = "1"
 
@@ -197,11 +200,17 @@ def _parse_context(raw: str) -> CandidateContext:
     return CandidateContext(
         preferences=_parse_preferences(data.get("preferences")),
         evaluation_summary=evaluation_summary,
+        source="gemini",
         **evidence,
     )
 
 
-def _fallback_context(policy: SearchPolicy) -> CandidateContext:
+def _fallback_context(
+    policy: SearchPolicy,
+    *,
+    source: str,
+    load_error: str = "",
+) -> CandidateContext:
     return CandidateContext(
         preferences=_build_fallback_preferences(policy),
         technical_skills=[],
@@ -214,6 +223,8 @@ def _fallback_context(policy: SearchPolicy) -> CandidateContext:
         company_environment=[],
         career_evidence=[],
         evaluation_summary=FALLBACK_CONTEXT_SUMMARY,
+        source=source,
+        load_error=load_error,
     )
 
 
@@ -223,6 +234,7 @@ def _context_from_dict(data: dict) -> CandidateContext:
         preferences=CandidatePreferences(**{name: preferences_data[name] for name in _PREFERENCES_FIELDS}),
         **{field: list(data[field]) for field in _EVIDENCE_FIELDS},
         evaluation_summary=data["evaluation_summary"],
+        source="cache",
     )
 
 
@@ -234,7 +246,7 @@ def get_candidate_context(
 ) -> CandidateContext:
     """Return the cached candidate context, extracting and caching it once if needed."""
     if not profile.strip():
-        return _fallback_context(policy)
+        return _fallback_context(policy, source="fallback_empty_profile")
 
     profile_hash = _hash(profile)
     cache_key = _cache_key(profile_hash, gemini.model, CANDIDATE_CONTEXT_SCHEMA_VERSION)
@@ -255,8 +267,17 @@ def get_candidate_context(
         context = _parse_context(raw)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
         raise
-    except Exception:
-        return _fallback_context(policy)
+    except Exception as exc:
+        error_name = type(exc).__name__
+        logger.warning(
+            "candidate context extraction failed; using fallback: error=%s",
+            error_name,
+        )
+        return _fallback_context(
+            policy,
+            source="fallback_error",
+            load_error=error_name,
+        )
 
     store.save_candidate_context(
         cache_key=cache_key,
