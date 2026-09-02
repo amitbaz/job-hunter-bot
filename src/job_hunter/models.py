@@ -90,6 +90,8 @@ class Job:
     ats_provider: str | None = None
     ats_board: str | None = None
     ats_job_id: str | None = None
+    market_hint: str | None = None
+    market_id: str | None = None
 
 
 @dataclass(slots=True)

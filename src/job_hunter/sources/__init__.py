@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import date
+
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.models import Settings
 
@@ -38,7 +40,8 @@ __all__ = [
 
 
 def build_sources(
-    settings: Settings, http, search_breaker: CircuitBreaker | None = None
+    settings: Settings, http, search_breaker: CircuitBreaker | None = None,
+    query_date: date | None = None,
 ) -> list[JobSource]:
     sources: list[JobSource] = [
         RemotiveSource(http),
@@ -49,7 +52,7 @@ def build_sources(
         WeWorkRemotelySource(http),
         HackerNewsHiringSource(http),
         DuckDuckGoSource(
-            http, generate_search_queries(settings.policy), breaker=search_breaker
+            http, generate_search_queries(settings.policy, query_date), breaker=search_breaker
         ),
     ]
     if settings.policy.yc_job_pages:
