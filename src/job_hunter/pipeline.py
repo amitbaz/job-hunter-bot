@@ -313,7 +313,7 @@ def run_pipeline(
         resolver=resolver,
     )
     watch_checks, watch_paused = _watch_check_outcomes(store, due_watches)
-    preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy)
+    preferences = extract_candidate_preferences(settings.candidate_profile, gemini, settings.policy, store)
     profile_mode = preferences_source(preferences)
     logger.info("profile extraction: source=%s", profile_mode)
     summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected

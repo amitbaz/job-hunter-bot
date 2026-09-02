@@ -10,17 +10,38 @@ from job_hunter.telegram_navigation import parse_callback
 class FakeGemini:
     model = "gemini-test"
 
-    def generate_text(self, prompt, *, json_mode=False):
-        if json_mode and "preferred_roles" in prompt:
+    def generate_text(
+        self,
+        prompt,
+        *,
+        purpose=None,
+        thinking_level=None,
+        max_output_tokens=None,
+        json_mode=False,
+        json_schema=None,
+    ):
+        if purpose == "candidate_context":
             return json.dumps(
                 {
-                    "preferred_roles": ["Senior Product Engineer"],
-                    "preferred_seniority": ["senior"],
-                    "must_have_signals": ["React"],
-                    "nice_to_have_signals": ["TypeScript"],
-                    "preferred_locations": ["Germany"],
-                    "avoid_signals": [],
-                    "summary": "Senior frontend/product engineer.",
+                    "preferences": {
+                        "preferred_roles": ["Senior Product Engineer"],
+                        "preferred_seniority": ["senior"],
+                        "must_have_signals": ["React"],
+                        "nice_to_have_signals": ["TypeScript"],
+                        "preferred_locations": ["Germany"],
+                        "avoid_signals": [],
+                        "summary": "Senior frontend/product engineer.",
+                    },
+                    "technical_skills": [],
+                    "architecture_evidence": [],
+                    "leadership_ownership": [],
+                    "agentic_ai_evidence": [],
+                    "product_domain_evidence": [],
+                    "location_language_facts": [],
+                    "career_direction": [],
+                    "company_environment": [],
+                    "career_evidence": [],
+                    "evaluation_summary": "Senior frontend/product engineer.",
                 }
             )
         if json_mode:

@@ -31,17 +31,38 @@ class FakeGemini:
         self.preference_payload = preference_payload
         self.evaluation_payload = evaluation_payload
 
-    def generate_text(self, prompt, *, json_mode=False):
-        if json_mode and "preferred_roles" in prompt:
+    def generate_text(
+        self,
+        prompt,
+        *,
+        purpose=None,
+        thinking_level=None,
+        max_output_tokens=None,
+        json_mode=False,
+        json_schema=None,
+    ):
+        if purpose == "candidate_context":
             self.preference_calls += 1
             payload = self.preference_payload or {
-                "preferred_roles": ["Senior Product Engineer"],
-                "preferred_seniority": ["senior"],
-                "must_have_signals": ["React"],
-                "nice_to_have_signals": ["TypeScript"],
-                "preferred_locations": ["Germany"],
-                "avoid_signals": ["manager"],
-                "summary": "Remote product-oriented frontend engineer.",
+                "preferences": {
+                    "preferred_roles": ["Senior Product Engineer"],
+                    "preferred_seniority": ["senior"],
+                    "must_have_signals": ["React"],
+                    "nice_to_have_signals": ["TypeScript"],
+                    "preferred_locations": ["Germany"],
+                    "avoid_signals": ["manager"],
+                    "summary": "Remote product-oriented frontend engineer.",
+                },
+                "technical_skills": [],
+                "architecture_evidence": [],
+                "leadership_ownership": [],
+                "agentic_ai_evidence": [],
+                "product_domain_evidence": [],
+                "location_language_facts": [],
+                "career_direction": [],
+                "company_environment": [],
+                "career_evidence": [],
+                "evaluation_summary": "Remote product-oriented frontend engineer.",
             }
             return json.dumps(payload)
         if json_mode:
@@ -1183,8 +1204,8 @@ def test_pipeline_extracts_preferences_once_without_logging_profile(settings, mo
     telegram = FakeTelegram()
     extracted = []
 
-    def fake_extract(profile, passed_gemini, policy):
-        extracted.append((profile, passed_gemini, policy))
+    def fake_extract(profile, passed_gemini, policy, passed_store):
+        extracted.append((profile, passed_gemini, policy, passed_store))
         return CandidatePreferences(
             preferred_roles=["Senior Product Engineer"],
             preferred_seniority=["senior"],
@@ -1200,7 +1221,7 @@ def test_pipeline_extracts_preferences_once_without_logging_profile(settings, mo
     with caplog.at_level(logging.INFO):
         run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
 
-    assert extracted == [(settings.candidate_profile, gemini, settings.policy)]
+    assert extracted == [(settings.candidate_profile, gemini, settings.policy, store)]
     assert "profile extraction: source=" in caplog.text
     assert settings.candidate_profile not in caplog.text
     assert job.description not in caplog.text

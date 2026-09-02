@@ -160,6 +160,28 @@ class CandidatePreferences:
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateContext:
+    """A single rich extraction of the candidate profile, reused everywhere.
+
+    Replaces repeated full-profile prompts across evaluation and cover-letter
+    generation: extracted once per (profile, model, schema version) and
+    cached by job_hunter.candidate_context.get_candidate_context.
+    """
+
+    preferences: CandidatePreferences
+    technical_skills: list[str]
+    architecture_evidence: list[str]
+    leadership_ownership: list[str]
+    agentic_ai_evidence: list[str]
+    product_domain_evidence: list[str]
+    location_language_facts: list[str]
+    career_direction: list[str]
+    company_environment: list[str]
+    career_evidence: list[str]
+    evaluation_summary: str
+
+
+@dataclass(frozen=True, slots=True)
 class CandidateContextCacheEntry:
     """A cached, JSON-backed candidate context and its cache identity."""
 
