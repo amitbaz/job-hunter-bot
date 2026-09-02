@@ -52,3 +52,12 @@ def test_gemini_api_key_stays_a_secret_not_a_variable():
 
     for step in (gmail_step, run_step):
         assert step["env"]["GEMINI_API_KEY"] == "${{ secrets.GEMINI_API_KEY }}"
+
+
+def test_run_step_carries_brave_secret_and_monthly_budget():
+    _, _, run_step = _load_workflow_steps()
+
+    assert run_step["env"]["BRAVE_SEARCH_API_KEY"] == "${{ secrets.BRAVE_SEARCH_API_KEY }}"
+    assert run_step["env"]["BRAVE_MONTHLY_QUERY_LIMIT"] == (
+        "${{ vars.BRAVE_MONTHLY_QUERY_LIMIT || '250' }}"
+    )
