@@ -74,6 +74,24 @@ def test_berlin_german_nice_to_have_survives():
     assert result.allowed is True
 
 
+def test_disallowed_language_explicitly_waived_in_its_own_clause_survives():
+    """`required` governs the clause it sits in: English is required here and
+    German is explicitly waived, so the job must not be blocked."""
+    policy = make_market_policy()
+    market = market_by_id(policy, "germany_eu")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="Berlin",
+            description="Fluent English required, German not necessary.",
+        ),
+        market,
+    )
+    assert result.allowed is True
+    assert result.reason_code != "required_language"
+
+
 def test_london_sponsorship_omitted_is_unknown():
     policy = make_market_policy()
     market = market_by_id(policy, "london")
@@ -168,6 +186,40 @@ def test_israel_hybrid_is_blocked():
         market,
     )
     assert result.allowed is False
+
+
+def test_israel_negated_hybrid_mention_is_not_blocked():
+    """A posting that explicitly denies being hybrid must stay eligible."""
+    policy = make_market_policy()
+    market = market_by_id(policy, "israel_remote")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="Remote - Israel",
+            remote=True,
+            description="We are fully remote, not a hybrid company. React TypeScript.",
+        ),
+        market,
+    )
+    assert result.allowed is True
+    assert result.reason_code != "work_mode_incompatible"
+
+
+def test_israel_no_onsite_requirement_is_not_blocked():
+    policy = make_market_policy()
+    market = market_by_id(policy, "israel_remote")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="Remote",
+            remote=True,
+            description="There is no onsite requirement for this role.",
+        ),
+        market,
+    )
+    assert result.allowed is True
 
 
 def test_israel_must_be_based_in_israel_is_blocked():
@@ -369,6 +421,44 @@ def test_sf_salary_below_floor_is_blocked():
     assert result.allowed is False
     assert result.reason_code == "salary_below_floor"
     assert result.disclosed_salary_max == 190000
+
+
+def test_perks_currency_and_numeric_range_is_not_read_as_salary():
+    """Incidental money/number prose (a learning budget plus vacation days)
+    discloses no salary, so it must never become a salary blocker."""
+    policy = make_market_policy()
+    market = market_by_id(policy, "us_nyc_sf")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="New York, NY",
+            description="We offer a $1,000 annual learning budget and 25-30 days of vacation.",
+        ),
+        market,
+    )
+    assert result.allowed is True
+    assert result.reason_code != "salary_below_floor"
+    assert result.disclosed_salary_max is None
+
+
+def test_currency_adjacent_range_below_floor_is_still_blocked():
+    """The perks fix must not stop a genuinely money-marked range from
+    being compared against the market floor."""
+    policy = make_market_policy()
+    market = market_by_id(policy, "us_nyc_sf")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="San Francisco",
+            description="The range for this role is $150,000-170,000.",
+        ),
+        market,
+    )
+    assert result.allowed is False
+    assert result.reason_code == "salary_below_floor"
+    assert result.disclosed_salary_max == 170000
 
 
 def test_total_comp_language_is_not_compared_against_floor():

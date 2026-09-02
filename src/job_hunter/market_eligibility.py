@@ -60,6 +60,12 @@ _SPONSORSHIP_AVAILABLE = (
 _ONSITE_OR_HYBRID_MARKERS = ("onsite", "on-site", "in-office", "hybrid")
 _INTERNATIONAL_REMOTE_MARKERS = ("worldwide", "global", "anywhere", "international remote")
 
+# Cues that flip an onsite/hybrid mention into a *denial* of that work mode
+# ("not a hybrid company", "no onsite requirement"). Matched only inside the
+# same comma-delimited clause as the marker, so "we are not remote, this is a
+# hybrid role" still blocks.
+_WORK_MODE_NEGATION_CUES = ("not", "no", "never", "without", "nor", "zero")
+
 _TIMEZONE_MARKERS = ("time zone", "time-zone", "timezone", "core hours", "overlap")
 
 _STRONG_LANGUAGE_MARKERS = (
@@ -70,7 +76,20 @@ _STRONG_LANGUAGE_MARKERS = (
     "c1",
     "c2",
 )
-_OPTIONAL_LANGUAGE_MARKERS = ("nice to have", "preferred", "plus", "bonus", "advantage")
+_OPTIONAL_LANGUAGE_MARKERS = (
+    "nice to have",
+    "preferred",
+    "plus",
+    "bonus",
+    "advantage",
+    "optional",
+    "not required",
+    "not necessary",
+    "not essential",
+    "not mandatory",
+    "no need",
+    "not a requirement",
+)
 
 # Known non-English languages the profile is not assumed to speak. A market's
 # own `allowed_languages` (e.g. Israel's English/Hebrew) removes an entry
@@ -209,18 +228,30 @@ def _phrase_in(phrase: str, text: str) -> bool:
     return re.search(rf"\b{re.escape(phrase)}\b", text) is not None
 
 
+def _clauses(sentence: str) -> list[str]:
+    """Split an already-normalized sentence into comma-delimited clauses.
+
+    A requirement marker only governs the clause it sits in: in "Fluent
+    English required, German not necessary" the ``required`` belongs to
+    English, and German is explicitly waived. Scoping to the clause keeps the
+    marker attached to the language it actually qualifies.
+    """
+    return [clause.strip() for clause in sentence.split(",") if clause.strip()]
+
+
 def _required_disallowed_language(job: Job, market: MarketPolicy) -> str | None:
     allowed = {normalize_text(lang) for lang in market.allowed_languages}
     for sentence in _sentences(f"{job.title} {job.description}"):
-        if any(_phrase_in(marker, sentence) for marker in _OPTIONAL_LANGUAGE_MARKERS):
-            continue
-        if not any(_phrase_in(marker, sentence) for marker in _STRONG_LANGUAGE_MARKERS):
-            continue
-        for keyword, canonical in _KNOWN_LANGUAGE_KEYWORDS.items():
-            if normalize_text(canonical) in allowed:
+        for clause in _clauses(sentence):
+            if any(_phrase_in(marker, clause) for marker in _OPTIONAL_LANGUAGE_MARKERS):
                 continue
-            if _phrase_in(keyword, sentence):
-                return canonical
+            if not any(_phrase_in(marker, clause) for marker in _STRONG_LANGUAGE_MARKERS):
+                continue
+            for keyword, canonical in _KNOWN_LANGUAGE_KEYWORDS.items():
+                if normalize_text(canonical) in allowed:
+                    continue
+                if _phrase_in(keyword, clause):
+                    return canonical
     return None
 
 
@@ -241,6 +272,27 @@ def _sponsorship_status(job: Job) -> tuple[str, bool, str]:
     return "unknown", False, ""
 
 
+def _asserts_onsite_or_hybrid(text: str) -> bool:
+    """Return True only when a clause *asserts* an onsite/hybrid work mode.
+
+    The check is sentence- and clause-scoped (never a whole-description
+    substring scan) and negation-aware, so "we are fully remote, not a hybrid
+    company" or "no onsite requirement" is not read as an onsite requirement.
+    Ambiguity fails open: a negated-looking clause keeps the job.
+    """
+    for sentence in _sentences(text):
+        for clause in _clauses(sentence):
+            for marker in _ONSITE_OR_HYBRID_MARKERS:
+                index = clause.find(marker)
+                if index == -1:
+                    continue
+                before = clause[:index]
+                if any(_phrase_in(cue, before) for cue in _WORK_MODE_NEGATION_CUES):
+                    continue
+                return True
+    return False
+
+
 def _remote_required_work_mode(job: Job, market: MarketPolicy) -> tuple[bool, str]:
     location_text = normalize_text(job.location or "")
     description_text = normalize_text(job.description or "")
@@ -249,8 +301,8 @@ def _remote_required_work_mode(job: Job, market: MarketPolicy) -> tuple[bool, st
     must_be_based_phrases = [f"must be based in {normalize_text(loc)}" for loc in market.locations]
     explicit_location_bound = any(_phrase_in(phrase, combined) for phrase in must_be_based_phrases)
 
-    explicit_onsite_or_hybrid = job.remote is False or any(
-        marker in location_text or marker in description_text for marker in _ONSITE_OR_HYBRID_MARKERS
+    explicit_onsite_or_hybrid = job.remote is False or _asserts_onsite_or_hybrid(
+        f"{job.location or ''}\n{job.description or ''}"
     )
 
     if explicit_location_bound or explicit_onsite_or_hybrid:
@@ -270,6 +322,25 @@ def _timezone_warnings(job: Job) -> tuple[str, ...]:
     return tuple(warnings)
 
 
+def _has_currency_adjacent_range(sentence: str, currency_markers: tuple[str, ...]) -> bool:
+    """Return True when a `number-number` range is directly money-marked.
+
+    A bare numeric range is *not* salary evidence: perks prose such as "a
+    $1,000 learning budget and 25-30 days of vacation" carries both a currency
+    symbol and a numeric range without disclosing any pay. Only a range whose
+    own edges touch a currency marker ("$150,000-180,000", "100k-120k EUR")
+    counts, so an undisclosed salary can never become a false blocker.
+    """
+    for match in _SALARY_RANGE_RE.finditer(sentence):
+        before = sentence[max(0, match.start() - 8) : match.start()].rstrip()
+        after = sentence[match.end() : match.end() + 8].lstrip()
+        if any(before.endswith(marker) for marker in currency_markers):
+            return True
+        if any(after.startswith(marker) for marker in currency_markers):
+            return True
+    return False
+
+
 def _disclosed_salary_max(job: Job, market: MarketPolicy) -> int | None:
     currency_markers = _CURRENCY_MARKERS.get(market.salary.currency, ())
     if not currency_markers:
@@ -277,11 +348,10 @@ def _disclosed_salary_max(job: Job, market: MarketPolicy) -> int | None:
 
     best: float | None = None
     for sentence in _sentences(f"{job.title} {job.description}"):
-        has_base_marker = any(_phrase_in(marker, sentence) for marker in _SALARY_BASE_MARKERS)
-        has_range = _SALARY_RANGE_RE.search(sentence) is not None
-        if not (has_base_marker or has_range):
-            continue
         if not any(marker in sentence for marker in currency_markers):
+            continue
+        has_base_marker = any(_phrase_in(marker, sentence) for marker in _SALARY_BASE_MARKERS)
+        if not (has_base_marker or _has_currency_adjacent_range(sentence, currency_markers)):
             continue
 
         amounts = []
