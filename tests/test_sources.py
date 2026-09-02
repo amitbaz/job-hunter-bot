@@ -7,6 +7,7 @@ from job_hunter.models import GeminiQuotaSettings, SearchPolicy, Settings
 from job_hunter.sources import (
     ArbeitnowSource,
     AshbySource,
+    DevJobsSource,
     DuckDuckGoSource,
     GreenhouseSource,
     HimalayasSource,
@@ -16,6 +17,7 @@ from job_hunter.sources import (
     build_sources,
 )
 from job_hunter.store import JobStore
+from tests.market_fixtures import make_market
 
 
 _DUCKDUCKGO_HTML = """
@@ -435,6 +437,99 @@ def test_build_sources_skips_learned_ats_source_when_limit_is_zero(
 
     kinds = [type(s).__name__ for s in sources]
     assert "LearnedAtsSource" not in kinds
+
+
+def test_build_sources_skips_devjobs_when_no_market_lists_it(fake_http, policy):
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "DevJobsSource" not in kinds
+    assert not any(isinstance(s, DevJobsSource) for s in sources)
+
+
+def test_build_sources_adds_devjobs_once_when_a_market_lists_it(fake_http, policy):
+    policy_with_devjobs = dataclasses.replace(
+        policy,
+        markets=[
+            make_market("israel_remote", 1.0, direct_sources=["devjobs"]),
+        ],
+    )
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_devjobs,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert kinds.count("DevJobsSource") == 1
+
+
+def test_build_sources_adds_devjobs_once_even_with_multiple_markets_listing_it(
+    fake_http, policy
+):
+    policy_with_devjobs = dataclasses.replace(
+        policy,
+        markets=[
+            make_market("israel_remote", 0.5, direct_sources=["devjobs"]),
+            make_market("secondary_eu_relocation", 0.5, direct_sources=["devjobs"]),
+        ],
+    )
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_devjobs,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert kinds.count("DevJobsSource") == 1
+
+
+def test_build_sources_skips_devjobs_when_only_disabled_market_lists_it(
+    fake_http, policy
+):
+    policy_with_disabled_devjobs = dataclasses.replace(
+        policy,
+        markets=[
+            make_market("israel_remote", 1.0, direct_sources=["devjobs"]),
+        ],
+    )
+    policy_with_disabled_devjobs.markets[0].enabled = False
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_disabled_devjobs,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "DevJobsSource" not in kinds
 
 
 def test_duckduckgo_opens_circuit_after_consecutive_failures():

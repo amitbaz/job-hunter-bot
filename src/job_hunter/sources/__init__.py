@@ -19,6 +19,7 @@ from .arbeitnow import ArbeitnowSource
 from .ashby import AshbySource
 from .base import JobSource
 from .company_watch import CompanyWatchSource
+from .devjobs import DevJobsSource
 from .duckduckgo import DuckDuckGoSource
 from .greenhouse import GreenhouseSource
 from .gmail_staged import GmailStagedSource
@@ -49,6 +50,7 @@ __all__ = [
     "AshbySource",
     "LeverSource",
     "GreenhouseSource",
+    "DevJobsSource",
     "RemoteOKSource",
     "WeWorkRemotelySource",
     "HackerNewsHiringSource",
@@ -159,6 +161,13 @@ def build_sources(
     ]
     if settings.policy.yc_job_pages:
         sources.append(YCSource(http, settings.policy.yc_job_pages))
+
+    if any(
+        "devjobs" in (market.direct_sources or [])
+        for market in settings.policy.markets
+        if market.enabled
+    ):
+        sources.append(DevJobsSource(http))
 
     ats = settings.policy.ats or {}
     for board in ats.get("ashby", []) or []:
