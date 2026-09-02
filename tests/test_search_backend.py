@@ -1,3 +1,4 @@
+import pytest
 import requests
 
 from job_hunter.search_backend import (
