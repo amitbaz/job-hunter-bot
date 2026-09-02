@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import secrets
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
@@ -36,12 +37,12 @@ from job_hunter.navigation_store import (
     prune_navigation_sessions,
 )
 from job_hunter.pdf import render_cover_letter_pdf
-from job_hunter.preferences import preferences_source
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
+from job_hunter.search_backend import build_search_backend
 from job_hunter.sources import (
     CompanyWatchSource,
-    DuckDuckGoSource,
     GmailStagedSource,
+    TargetedSearchSource,
     build_sources,
 )
 from job_hunter.store import JobStore
@@ -79,7 +80,8 @@ def _targeted_canonical_candidates(
         return []
 
     query = f'"{company}" "{title}" ({_CANONICAL_SEARCH_SITES})'
-    candidates = DuckDuckGoSource(http, [query], breaker=breaker).discover()
+    backend = build_search_backend(http, os.environ.get("BRAVE_SEARCH_API_KEY"))
+    candidates = TargetedSearchSource(backend, [query], breaker=breaker).discover()
     for candidate in candidates:
         ats = parse_supported_ats_url(candidate.url)
         if ats is not None and (
@@ -149,6 +151,12 @@ def _market_counts(items) -> dict[str, int]:
     return counts
 
 
+def _bump_market_count(counts: dict[str, int], market_id: str | None) -> None:
+    if not market_id:
+        return
+    counts[market_id] = counts.get(market_id, 0) + 1
+
+
 def _record_decision(
     decision_counts: dict[str, dict[str, int]], market_id: str | None, decision: str | None
 ) -> None:
@@ -159,15 +167,16 @@ def _record_decision(
     bucket[decision] = bucket.get(decision, 0) + 1
 
 
-def _aggregate_duckduckgo_stats(
+def _aggregate_targeted_search_stats(
     sources,
-) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
-    """Sum planned/attempted/succeeded query counts by market across all DuckDuckGo sources."""
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    """Sum targeted-search query/result counters by market after discovery."""
     planned: dict[str, int] = {}
     attempted: dict[str, int] = {}
     succeeded: dict[str, int] = {}
+    results: dict[str, int] = {}
     for source in sources:
-        if not isinstance(source, DuckDuckGoSource):
+        if not isinstance(source, TargetedSearchSource):
             continue
         for market_id, count in source.stats.planned_by_market.items():
             planned[market_id] = planned.get(market_id, 0) + count
@@ -175,42 +184,39 @@ def _aggregate_duckduckgo_stats(
             attempted[market_id] = attempted.get(market_id, 0) + count
         for market_id, count in source.stats.succeeded_by_market.items():
             succeeded[market_id] = succeeded.get(market_id, 0) + count
-    return planned, attempted, succeeded
-
-
-def _delivered_counts(digest_items: list[DigestItem]) -> dict[str, int]:
-    counts: dict[str, int] = {}
-    for item in digest_items:
-        if not item.market_id:
-            continue
-        counts[item.market_id] = counts.get(item.market_id, 0) + 1
-    return counts
+        for market_id, count in source.stats.results_by_market.items():
+            results[market_id] = results.get(market_id, 0) + count
+    return planned, attempted, succeeded, results
 
 
 def _log_market_metrics(
     settings: Settings,
     discovery,
-    ddg_planned: dict[str, int],
-    ddg_attempted: dict[str, int],
-    ddg_succeeded: dict[str, int],
+    search_planned: dict[str, int],
+    search_attempted: dict[str, int],
+    search_succeeded: dict[str, int],
+    search_results: dict[str, int],
     selected_by_market: dict[str, int],
     decision_counts: dict[str, dict[str, int]],
     delivered_by_market: dict[str, int],
 ) -> None:
-    """Log one structured line per configured market for discovery/selection/evaluation/delivery observability."""
+    """Log one structured line per configured market using completed run state."""
     for market in settings.policy.markets:
         market_id = market.id
         decisions = decision_counts.get(market_id, {})
         logger.info(
             "market=%s queries_planned=%s queries_attempted=%s queries_succeeded=%s "
-            "raw=%s unique=%s rejected=%s eligible=%s selected=%s high_priority=%s "
-            "package_match=%s possible_match=%s skip=%s blocked=%s delivered=%s",
+            "search_results=%s raw=%s unique=%s reattributed=%s rejected=%s eligible=%s "
+            "selected=%s high_priority=%s package_match=%s possible_match=%s skip=%s "
+            "blocked=%s delivered=%s",
             market_id,
-            ddg_planned.get(market_id, 0),
-            ddg_attempted.get(market_id, 0),
-            ddg_succeeded.get(market_id, 0),
+            search_planned.get(market_id, 0),
+            search_attempted.get(market_id, 0),
+            search_succeeded.get(market_id, 0),
+            search_results.get(market_id, 0),
             discovery.stats.raw_by_market.get(market_id, 0),
             discovery.stats.unique_by_market.get(market_id, 0),
+            discovery.stats.reattributed_by_market.get(market_id, 0),
             discovery.stats.rejected_by_market.get(market_id, 0),
             discovery.stats.eligible_by_market.get(market_id, 0),
             selected_by_market.get(market_id, 0),
@@ -358,12 +364,6 @@ def _evaluate_and_deliver_job(
     a generic exception before an `Evaluation` was produced, or a stale
     already-evaluated-and-delivered queue row).
     """
-    # save_evaluation and complete_ai_work are two separate transactions
-    # (below): a crash landing between them leaves a job that was already
-    # evaluated AND delivered still sitting in the `job_evaluation` queue.
-    # A retry must recognize that stale row rather than re-spend a real
-    # Gemini call and re-deliver a duplicate message/PDF for a job that's
-    # already out the door -- it just clears the leftover queue row.
     if store.get_evaluation(job_id) is not None and store.has_delivery(job_id, "telegram_message"):
         store.complete_ai_work("job_evaluation", job_id)
         return False, False, None
@@ -523,7 +523,7 @@ def _format_gemini_usage_log(summary: GeminiUsageSummary) -> str:
         if purpose in summary.purpose_counts
     )
     return (
-        f"gemini_usage run_calls={summary.requests_today} "
+        f"gemini_usage day_calls={summary.requests_today} "
         f"rpd_pct={summary.rpd_percent:.1f} "
         f"rpm_peak_pct={summary.rpm_peak_percent:.1f} "
         f"tpm_peak_pct={summary.tpm_peak_percent:.1f} "
@@ -582,7 +582,6 @@ def run_pipeline(
             settings, http, search_breaker=search_breaker, query_date=query_date
         )
     )
-    ddg_planned, ddg_attempted, ddg_succeeded = _aggregate_duckduckgo_stats(base_sources)
     sources = [
         *base_sources,
         GmailStagedSource(store),
@@ -610,6 +609,9 @@ def run_pipeline(
         settings.policy,
         resolver=resolver,
     )
+    search_planned, search_attempted, search_succeeded, search_results = (
+        _aggregate_targeted_search_stats(base_sources)
+    )
     watch_checks, watch_paused = _watch_check_outcomes(store, due_watches)
     try:
         candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
@@ -620,7 +622,11 @@ def run_pipeline(
             "will be deferred this run"
         )
     else:
-        logger.info("profile extraction: source=%s", preferences_source(candidate_context.preferences))
+        logger.info(
+            "profile extraction: source=%s error=%s",
+            candidate_context.source,
+            candidate_context.load_error or "none",
+        )
     preferences = candidate_context.preferences if candidate_context is not None else None
     summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy, preferences)
@@ -644,10 +650,6 @@ def run_pipeline(
     logger.info("eligible sources: %s", _format_source_counts(eligible_source_counts))
     logger.info("selected sources: %s", _format_source_counts(selected_source_counts))
 
-    # Pending retries from earlier quota-blocked runs take priority over this
-    # run's fresh candidates: yesterday's deferred jobs beat today's fresh
-    # discoveries for the shared Gemini budget. Snapshot both categories now
-    # so membership stays stable while rows are completed/re-enqueued below.
     pending_evaluation_ids = [row["job_id"] for row in store.list_pending_ai_work("job_evaluation")]
     pending_cover_letter_ids = [row["job_id"] for row in store.list_pending_ai_work("cover_letter")]
     pending_evaluation_id_set = set(pending_evaluation_ids)
@@ -662,10 +664,6 @@ def run_pipeline(
     for job_id in discovery.rediscovered_job_ids:
         _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
 
-    # A missing candidate_context means loading it was itself quota-blocked
-    # (see above): there is nothing to evaluate with, so every pending and
-    # fresh candidate below must defer rather than be misclassified as an
-    # error.
     quota_blocked = candidate_context is None
     if quota_blocked and pending_evaluation_ids:
         logger.warning(
@@ -715,37 +713,23 @@ def run_pipeline(
                 job_id, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
             )
 
-    _log_market_metrics(
-        settings,
-        discovery,
-        ddg_planned,
-        ddg_attempted,
-        ddg_succeeded,
-        selected_by_market,
-        decision_counts,
-        _delivered_counts(digest_items),
-    )
-
-    # A tracker-less client is a test affordance only (see GeminiClient's docstring);
-    # production code always supplies one. Snapshotting once here, regardless of
-    # dry_run, gives every run (including local dry runs) the same structured log
-    # line for observability even when nothing is sent to Telegram.
     tracker = getattr(gemini, "_tracker", None)
     usage_summary = tracker.snapshot(datetime.now(timezone.utc)) if tracker is not None else None
     if usage_summary is not None:
         logger.info(_format_gemini_usage_log(usage_summary))
 
+    delivered_by_market: dict[str, int] = {}
     if not settings.dry_run:
         deliverable_items = select_deliverable_items(digest_items)
         interactive_sender = getattr(telegram, "send_job_card", None)
         supports_navigation = callable(interactive_sender)
 
-        # Preserve legacy/injected-client behavior for existing integrations and tests.
         if deliverable_items and not supports_navigation:
             message_id = telegram.send_message(build_digest(deliverable_items))
             if message_id is not None:
                 for item in deliverable_items:
                     store.mark_delivered(item.job_id, "telegram_message", message_id)
+                    _bump_market_count(delivered_by_market, item.market_id)
 
         pdf_deliveries.sort(
             key=lambda entry: (
@@ -782,10 +766,6 @@ def run_pipeline(
                     break
                 store.mark_review_delivered(event_ids, review_message_id)
 
-        # Usage status (and, if this run was paused/budget-blocked, a warning
-        # immediately before it) goes out once per run, after the digest/PDFs/Gmail
-        # review messages above but before the navigator so the navigator stays the
-        # most recent message. A Telegram outage here must not fail the pipeline.
         if usage_summary is not None:
             warning = build_gemini_pause_warning(usage_summary)
             if warning is not None:
@@ -798,8 +778,6 @@ def run_pipeline(
             except Exception:
                 logger.exception("failed to send Gemini usage status to Telegram")
 
-        # Real TelegramClient supports interactive cards. Send the navigator last so it
-        # remains the most recent message after PDFs and Gmail review notifications.
         if deliverable_items and supports_navigation:
             now = datetime.now(timezone.utc)
             prune_navigation_sessions(store, now.isoformat())
@@ -816,6 +794,19 @@ def run_pipeline(
                 attach_navigation_message_id(store, session.session_id, str(message_id))
                 for card in session.cards:
                     store.mark_delivered(card.job_id, "telegram_message", str(message_id))
+                    _bump_market_count(delivered_by_market, card.market_id)
+
+    _log_market_metrics(
+        settings,
+        discovery,
+        search_planned,
+        search_attempted,
+        search_succeeded,
+        search_results,
+        selected_by_market,
+        decision_counts,
+        delivered_by_market,
+    )
 
     logger.info(
         "company watch outcomes: companies_promoted=%s watch_checks=%s watch_paused=%s",
