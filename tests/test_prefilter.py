@@ -1,6 +1,8 @@
 import pytest
+from job_hunter.market_policy import market_by_id
 from job_hunter.models import Job, SearchPolicy
 from job_hunter.prefilter import prefilter_job
+from tests.market_fixtures import make_market_policy
 
 
 @pytest.fixture
@@ -126,6 +128,64 @@ def test_prefilter_blocked_title_wins_before_profession_acceptance(policy):
     result = prefilter_job(
         Job(source="x", title="Junior Frontend Engineer", description="React TypeScript", remote=True),
         policy,
+    )
+    assert result.should_evaluate is False
+    assert result.reason_code == "blocked_title"
+
+
+def test_prefilter_without_market_still_blocks_non_remote(policy):
+    result = prefilter_job(
+        Job(source="x", title="Senior Frontend Engineer", location="Berlin - onsite", remote=False),
+        policy,
+        market=None,
+    )
+    assert result.hard_blocker is True
+    assert result.reason_code == "not_remote"
+
+
+def test_prefilter_with_market_delegates_incompatibility_to_market_eligibility():
+    market_policy = make_market_policy()
+    market = market_by_id(market_policy, "london")
+    result = prefilter_job(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="London",
+            description="We are unable to sponsor a visa for this role.",
+        ),
+        market_policy,
+        market=market,
+    )
+    assert result.should_evaluate is False
+    assert result.hard_blocker is True
+    assert result.reason_code == "sponsorship_unavailable"
+
+
+def test_prefilter_with_market_no_longer_hard_blocks_onsite_for_a_market_that_allows_it():
+    market_policy = make_market_policy()
+    market = market_by_id(market_policy, "london")
+    result = prefilter_job(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="London - onsite",
+            description="React TypeScript product ownership",
+            remote=False,
+        ),
+        market_policy,
+        market=market,
+    )
+    assert result.should_evaluate is True
+    assert result.reason_code == "passed"
+
+
+def test_prefilter_with_market_still_applies_blocked_title_and_relevance_checks():
+    market_policy = make_market_policy()
+    market = market_by_id(market_policy, "germany_eu")
+    result = prefilter_job(
+        Job(source="x", title="Junior Frontend Engineer", location="Berlin", description="React TypeScript"),
+        market_policy,
+        market=market,
     )
     assert result.should_evaluate is False
     assert result.reason_code == "blocked_title"

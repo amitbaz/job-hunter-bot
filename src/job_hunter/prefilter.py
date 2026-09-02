@@ -1,5 +1,6 @@
 from __future__ import annotations
-from .models import Job, SearchPolicy, PrefilterResult
+from .market_eligibility import evaluate_market_eligibility
+from .models import Job, MarketPolicy, SearchPolicy, PrefilterResult
 from .normalize import normalize_text
 
 
@@ -17,26 +18,40 @@ def is_software_engineering_title(title: str, policy: SearchPolicy) -> bool:
     return any(normalize_text(keyword) in normalized for keyword in policy.engineering_title_keywords)
 
 
-def prefilter_job(job: Job, policy: SearchPolicy) -> PrefilterResult:
+def prefilter_job(job: Job, policy: SearchPolicy, market: MarketPolicy | None = None) -> PrefilterResult:
     title_lower = normalize_text(job.title)
     desc_lower = normalize_text(job.description)
     location_lower = normalize_text(job.location)
 
-    # Hard block: explicitly not remote
-    if job.remote is False:
-        return PrefilterResult(
-            should_evaluate=False,
-            hard_blocker=True,
-            reason="not remote",
-            reason_code="not_remote",
-        )
-    if "onsite" in location_lower or "on-site" in location_lower or "in-office" in location_lower:
-        if job.remote is not True:
+    if market is None:
+        # Legacy global policy (no markets configured): a single remote-only
+        # hard blocker applies to every job.
+        if job.remote is False:
             return PrefilterResult(
                 should_evaluate=False,
                 hard_blocker=True,
-                reason="location indicates not remote",
+                reason="not remote",
                 reason_code="not_remote",
+            )
+        if "onsite" in location_lower or "on-site" in location_lower or "in-office" in location_lower:
+            if job.remote is not True:
+                return PrefilterResult(
+                    should_evaluate=False,
+                    hard_blocker=True,
+                    reason="location indicates not remote",
+                    reason_code="not_remote",
+                )
+    else:
+        # Market-driven policy: the global remote-only blocker is replaced by
+        # the attributed market's own conservative eligibility rules (work
+        # mode, language, salary, sponsorship, employment type).
+        eligibility = evaluate_market_eligibility(job, market)
+        if not eligibility.allowed:
+            return PrefilterResult(
+                should_evaluate=False,
+                hard_blocker=True,
+                reason=eligibility.reason,
+                reason_code=eligibility.reason_code,
             )
 
     # Hard block: blocked title keyword
