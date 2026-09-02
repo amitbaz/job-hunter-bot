@@ -232,6 +232,8 @@ def _requeue_pending_delivery(
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
         location=job.location,
+        market_id=evaluation.market_id or job.market_id or "",
+        market_note=evaluation.location_note or "",
     )
 
     if not store.has_delivery(job_id, "telegram_message"):
@@ -317,6 +319,8 @@ def _evaluate_and_deliver_job(
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
         location=job.location,
+        market_id=evaluation.market_id or job.market_id or "",
+        market_note=evaluation.location_note or "",
     )
     digest_items.append(item)
 
@@ -387,6 +391,8 @@ def _retry_pending_cover_letter(
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
         location=job.location,
+        market_id=evaluation.market_id or job.market_id or "",
+        market_note=evaluation.location_note or "",
     )
     if not store.has_delivery(job_id, "telegram_message"):
         digest_items.append(item)
@@ -452,6 +458,8 @@ def _build_navigation_session(items: list[DigestItem], now: datetime) -> Navigat
                 location=item.location,
                 score=item.score,
                 url=item.url,
+                market_id=item.market_id,
+                market_note=item.market_note,
             )
             for item in ordered
         ],

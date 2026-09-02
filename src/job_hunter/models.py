@@ -308,6 +308,8 @@ class DigestItem:
     url: str
     hard_blockers: list
     location: str = ""
+    market_id: str = ""
+    market_note: str = ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -318,6 +320,8 @@ class NavigationCard:
     location: str
     score: int
     url: str
+    market_id: str = ""
+    market_note: str = ""
 
 
 @dataclass(slots=True, frozen=True)

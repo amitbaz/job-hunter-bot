@@ -1,7 +1,10 @@
+import json
+
 from job_hunter.models import NavigationCard, NavigationSession
 from job_hunter.navigation_store import (
     attach_navigation_message_id,
     create_navigation_session,
+    ensure_navigation_schema,
     get_navigation_session,
     prune_navigation_sessions,
 )
@@ -53,3 +56,36 @@ def test_prune_navigation_sessions_deletes_expired_only(tmp_path):
 def test_missing_navigation_table_reads_as_no_session(tmp_path):
     with JobStore(tmp_path / "state.sqlite3") as store:
         assert get_navigation_session(store, "missing") is None
+
+
+def test_legacy_cards_json_without_market_fields_loads_with_empty_defaults(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    ensure_navigation_schema(store)
+    legacy_card = {
+        "job_id": 1,
+        "title": "Senior FE",
+        "company": "Acme",
+        "location": "Berlin",
+        "score": 91,
+        "url": "https://example.test/1",
+    }
+    store._conn.execute(
+        """
+        INSERT INTO telegram_navigation_sessions
+            (session_id, cards_json, telegram_message_id, created_at, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            "legacy",
+            json.dumps([legacy_card]),
+            None,
+            "2026-08-31T12:00:00+00:00",
+            "2026-09-30T12:00:00+00:00",
+        ),
+    )
+    store._conn.commit()
+
+    loaded = get_navigation_session(store, "legacy")
+    assert loaded is not None
+    assert loaded.cards[0].market_id == ""
+    assert loaded.cards[0].market_note == ""

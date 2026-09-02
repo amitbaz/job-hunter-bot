@@ -60,6 +60,22 @@ def test_build_navigation_card_fallbacks_and_missing_url():
     assert keyboard[0] == [{"text": "Apply", "callback_data": "a|s|0"}]
 
 
+def test_navigation_card_surfaces_market_note():
+    card = NavigationCard(
+        job_id=1,
+        title="Senior Frontend Engineer",
+        company="Acme",
+        location="London",
+        score=91,
+        url="https://example.test/job",
+        market_id="london",
+        market_note="Visa sponsorship: unknown. Requires 4 hours overlap with EST.",
+    )
+    text, _ = build_navigation_card(card, "session", 0, 1)
+    assert "Visa sponsorship: unknown" in text
+    assert "4 hours overlap with EST" in text
+
+
 def test_callback_round_trip_and_size_limit():
     payload = encode_callback("n", "abc123", 11)
     assert parse_callback(payload) == ("n", "abc123", 11)

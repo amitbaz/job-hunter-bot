@@ -61,11 +61,13 @@ def build_navigation_card(
     if total <= 0 or index < 0 or index >= total:
         raise ValueError("invalid navigation position")
 
+    note_line = f"\nNote: {card.market_note}" if card.market_note else ""
     text = (
         f"{card.title}\n\n"
         f"Company: {card.company or 'Not specified'}\n"
         f"Location: {card.location or 'Not specified'}\n"
         f"Match: {card.score}%"
+        f"{note_line}"
     )
 
     actions: list[dict[str, str]] = []

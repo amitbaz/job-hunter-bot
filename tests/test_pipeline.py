@@ -1676,6 +1676,19 @@ def test_pipeline_sends_gemini_usage_status_after_digest_before_navigator(settin
     assert gemini._tracker.snapshot_calls == 1
 
 
+def test_pipeline_surfaces_evaluation_location_note_in_navigator_card(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = OrderedNavigatorTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    card_events = [payload for kind, payload in telegram.events if kind == "card"]
+    assert card_events
+    assert "Note: Remote EU friendly" in card_events[-1]
+
+
 def test_pipeline_sends_gemini_pause_warning_immediately_before_usage_status(settings):
     job = _job()
     store = JobStore(settings.db_path)
