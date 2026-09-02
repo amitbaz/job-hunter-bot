@@ -32,6 +32,49 @@ class SearchBackend(Protocol):
     def search(self, query: str) -> SearchResponse: ...
 
 
+def _safe_provider_text(value: object, *, max_length: int = 180) -> str:
+    """Compact provider-owned diagnostic text without ever including raw bodies."""
+    text = " ".join(str(value or "").split())
+    return text[:max_length]
+
+
+def _brave_error_summary(response) -> tuple[str, str, str]:
+    """Extract only Brave's structured validation metadata for safe logging."""
+    try:
+        data = response.json()
+    except (TypeError, ValueError):
+        return "", "", ""
+    if not isinstance(data, dict):
+        return "", "", ""
+
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return "", "", ""
+
+    code = _safe_provider_text(error.get("code"))
+    detail = _safe_provider_text(error.get("detail"))
+    validation_parts: list[str] = []
+    meta = error.get("meta")
+    if isinstance(meta, dict):
+        errors = meta.get("errors")
+        if isinstance(errors, list):
+            for item in errors[:3]:
+                if not isinstance(item, dict):
+                    continue
+                loc = item.get("loc")
+                if isinstance(loc, list):
+                    location = ".".join(_safe_provider_text(part, max_length=60) for part in loc)
+                else:
+                    location = ""
+                message = _safe_provider_text(item.get("msg"))
+                if location and message:
+                    validation_parts.append(f"{location}: {message}")
+                elif message:
+                    validation_parts.append(message)
+
+    return code, detail, "; ".join(validation_parts)
+
+
 class BraveSearchBackend:
     name = "brave"
 
@@ -59,10 +102,21 @@ class BraveSearchBackend:
             params={"q": query, "count": 20, "safesearch": "moderate"},
             headers={
                 "Accept": "application/json",
+                "Accept-Encoding": "gzip",
+                "Cache-Control": "no-cache",
                 "X-Subscription-Token": self._api_key,
             },
             retry=False,
         )
+        if response.status_code >= 400:
+            code, detail, validation = _brave_error_summary(response)
+            logger.warning(
+                "Brave Search request failed: status=%s code=%s detail=%s validation=%s",
+                response.status_code,
+                code or "unknown",
+                detail or "unknown",
+                validation or "unknown",
+            )
         response.raise_for_status()
         data = response.json()
         web = data.get("web") if isinstance(data, dict) else None
