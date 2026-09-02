@@ -1,3 +1,5 @@
+import dataclasses
+
 import pytest
 
 from job_hunter.circuit_breaker import CircuitBreaker
@@ -13,6 +15,7 @@ from job_hunter.sources import (
     RemotiveSource,
     build_sources,
 )
+from job_hunter.store import JobStore
 
 
 _DUCKDUCKGO_HTML = """
@@ -387,6 +390,51 @@ def test_build_sources_includes_always_on_and_configured_ats(fake_http, policy):
     assert "AshbySource" in kinds
     assert "LeverSource" in kinds
     assert "GreenhouseSource" in kinds
+    assert "LearnedAtsSource" not in kinds
+
+
+def test_build_sources_appends_learned_ats_source_when_store_is_given(
+    fake_http, policy
+):
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+    store = JobStore(":memory:")
+
+    sources = build_sources(settings, fake_http, store=store)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert kinds.count("LearnedAtsSource") == 1
+    assert "AshbySource" in kinds
+    assert "LeverSource" in kinds
+    assert "GreenhouseSource" in kinds
+
+
+def test_build_sources_skips_learned_ats_source_when_limit_is_zero(
+    fake_http, policy
+):
+    disabled_policy = dataclasses.replace(policy, max_learned_ats_boards_per_run=0)
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=disabled_policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+    store = JobStore(":memory:")
+
+    sources = build_sources(settings, fake_http, store=store)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "LearnedAtsSource" not in kinds
 
 
 def test_duckduckgo_opens_circuit_after_consecutive_failures():

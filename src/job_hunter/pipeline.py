@@ -563,7 +563,11 @@ def run_pipeline(
         sources
         if sources is not None
         else build_sources(
-            settings, http, search_breaker=search_breaker, query_date=query_date
+            settings,
+            http,
+            store=store,
+            search_breaker=search_breaker,
+            query_date=query_date,
         )
     )
     sources = [

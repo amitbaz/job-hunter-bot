@@ -1907,3 +1907,24 @@ def test_pipeline_without_gemini_tracker_sends_no_usage_status(settings):
 
     # Only the digest message was sent -- no usage status, no crash.
     assert len(telegram.messages) == 1
+
+
+def test_run_pipeline_forwards_store_to_build_sources_when_sources_not_given(
+    settings, monkeypatch
+):
+    import job_hunter.pipeline as pipeline_module
+
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+    captured = {}
+
+    def fake_build_sources(passed_settings, http, *, store=None, search_breaker=None, query_date=None):
+        captured["store"] = store
+        return []
+
+    monkeypatch.setattr(pipeline_module, "build_sources", fake_build_sources)
+
+    run_pipeline(settings, store=store, gemini=gemini, telegram=telegram)
+
+    assert captured["store"] is store

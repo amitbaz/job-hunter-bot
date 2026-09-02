@@ -13,6 +13,7 @@ from job_hunter.search_budget import (
     brave_queries_available_today,
     split_queries_for_brave,
 )
+from job_hunter.store import JobStore
 
 from .arbeitnow import ArbeitnowSource
 from .ashby import AshbySource
@@ -24,6 +25,7 @@ from .gmail_staged import GmailStagedSource
 from .hackernews import HackerNewsHiringSource
 from .himalayas import HimalayasSource
 from .jobicy import JobicySource
+from .learned_ats import LearnedAtsSource
 from .lever import LeverSource
 from .remotive import RemotiveSource
 from .remoteok import RemoteOKSource
@@ -51,6 +53,7 @@ __all__ = [
     "WeWorkRemotelySource",
     "HackerNewsHiringSource",
     "YCSource",
+    "LearnedAtsSource",
     "build_sources",
 ]
 
@@ -80,6 +83,8 @@ def _brave_monthly_query_limit() -> int:
 def build_sources(
     settings: Settings,
     http,
+    *,
+    store: JobStore | None = None,
     search_breaker: CircuitBreaker | None = None,
     query_date: date | None = None,
 ) -> list[JobSource]:
@@ -162,5 +167,18 @@ def build_sources(
         sources.append(LeverSource(site, http))
     for token in ats.get("greenhouse", []) or []:
         sources.append(GreenhouseSource(token, http))
+
+    if store is not None and settings.policy.max_learned_ats_boards_per_run > 0:
+        market_order = [
+            market.id for market in settings.policy.markets if market.enabled
+        ]
+        sources.append(
+            LearnedAtsSource(
+                store,
+                http,
+                limit=settings.policy.max_learned_ats_boards_per_run,
+                market_order=market_order,
+            )
+        )
 
     return sources
