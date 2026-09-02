@@ -25,6 +25,40 @@ def test_berlin_german_required_is_blocked():
     assert result.reason_code == "required_language"
 
 
+def test_semicolon_joined_clauses_are_isolated_for_language_detection():
+    """A strong marker attached to one clause must not leak into a language
+    mention in a different clause joined by a semicolon (no `.!?` boundary)."""
+    policy = make_market_policy()
+    market = market_by_id(policy, "germany_eu")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="Berlin",
+            description="React and TypeScript are required; German is spoken in the office.",
+        ),
+        market,
+    )
+    assert result.allowed is True
+
+
+def test_bullet_list_language_mention_on_separate_line_is_not_required():
+    """A strong marker on one bullet line must not leak into a language
+    mention on a different (period-less) bullet line."""
+    policy = make_market_policy()
+    market = market_by_id(policy, "germany_eu")
+    result = evaluate_market_eligibility(
+        Job(
+            source="x",
+            title="Senior Frontend Engineer",
+            location="Berlin",
+            description="- Strong React and TypeScript experience required\n- German language proficiency",
+        ),
+        market,
+    )
+    assert result.allowed is True
+
+
 def test_berlin_german_nice_to_have_survives():
     policy = make_market_policy()
     market = market_by_id(policy, "germany_eu")

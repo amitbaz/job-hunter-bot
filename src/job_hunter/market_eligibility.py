@@ -110,7 +110,7 @@ _CURRENCY_MARKERS = {
     "USD": ("$", "usd", "us$"),
 }
 
-_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+")
+_SENTENCE_SPLIT_RE = re.compile(r"[.!?;\n]+")
 
 
 def evaluate_market_eligibility(job: Job, market: MarketPolicy) -> MarketEligibilityResult:
@@ -189,10 +189,18 @@ def evaluate_market_eligibility(job: Job, market: MarketPolicy) -> MarketEligibi
 
 
 def _sentences(text: str) -> list[str]:
-    normalized = normalize_text(text)
-    if not normalized:
+    """Split raw text into clauses on `.!?;` and newlines, each normalized.
+
+    Splitting happens on the raw text *before* normalization, because
+    `normalize_text` collapses newlines into plain spaces -- doing the split
+    afterward would silently merge separate bullet-list lines (or
+    period-less lines) into one "sentence", letting a strong marker on one
+    line falsely attach to an unrelated language mention on another.
+    """
+    if not text:
         return []
-    return [part for part in _SENTENCE_SPLIT_RE.split(normalized) if part]
+    fragments = (normalize_text(part) for part in _SENTENCE_SPLIT_RE.split(text))
+    return [fragment for fragment in fragments if fragment]
 
 
 def _phrase_in(phrase: str, text: str) -> bool:
