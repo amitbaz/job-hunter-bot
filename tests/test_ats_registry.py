@@ -188,6 +188,33 @@ def test_select_ats_boards_applies_documented_priority_order():
     ]
 
 
+def test_select_ats_boards_orders_by_oldest_checked_first_when_earlier_levels_tie():
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
+    # Both tie on level 1 (no last_eligible_at), level 2 (same market), and
+    # level 3 (both previously checked). Lexical order (level 5) would put
+    # "board-a" before "board-b" -- the opposite of the correct level-4
+    # order -- so this only passes if last_checked_at is applied first.
+    checked_recently = _entry(
+        "lever",
+        "board-a",
+        market_hint="berlin",
+        last_checked_at=(now - timedelta(days=1)).isoformat(),
+    )
+    checked_long_ago = _entry(
+        "lever",
+        "board-b",
+        market_hint="berlin",
+        last_checked_at=(now - timedelta(days=10)).isoformat(),
+    )
+
+    selected = select_ats_boards([checked_recently, checked_long_ago], ["berlin"], 2, now)
+
+    assert [(entry.provider, entry.board_identifier) for entry in selected] == [
+        ("lever", "board-b"),
+        ("lever", "board-a"),
+    ]
+
+
 def test_select_ats_boards_tie_breaks_lexically_on_provider_and_board():
     now = datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc)
     a = _entry("ashby", "zzz", market_hint="berlin")
