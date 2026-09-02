@@ -227,6 +227,9 @@ markets:
       - '"{role}" Amsterdam English'
       - '"{role}" Paris English'
       - '"{role}" Barcelona English'
+yc_job_pages:
+  - https://www.ycombinator.com/jobs/role
+  - https://www.ycombinator.com/jobs/location/berlin
 manual_company_watch: []
 search_queries: []
 ats:
