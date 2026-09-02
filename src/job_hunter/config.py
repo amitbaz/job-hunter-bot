@@ -16,7 +16,14 @@ from .models import (
     GeminiQuotaSettings,
     SearchPolicy,
     Settings,
+    MarketPolicy,
+    SalaryPolicy,
 )
+
+
+_REMOTE_POLICIES = {"preferred", "required", "allowed"}
+_RELOCATION_POLICIES = {"none", "selective", "allowed"}
+_SPONSORSHIP_POLICIES = {"not_required", "required"}
 
 
 @dataclass(slots=True, frozen=True)
@@ -97,6 +104,7 @@ def load_settings(config_path: Path) -> Settings:
                 DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES,
             )
         ),
+        markets=_parse_markets(data.get("markets", [])),
     )
 
     return Settings(
@@ -150,6 +158,88 @@ def _require_positive_int_env(name: str) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
     return value
+
+
+def _parse_markets(entries: object) -> list[MarketPolicy]:
+    if not isinstance(entries, list):
+        raise ValueError("markets must be a list")
+
+    markets: list[MarketPolicy] = []
+    seen_ids = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"markets[{index}] must be a mapping")
+
+        market_id = entry.get("id")
+        if not isinstance(market_id, str) or not market_id:
+            raise ValueError(f"markets[{index}].id must be a non-empty string")
+
+        if market_id in seen_ids:
+            raise ValueError(f"duplicate market id: {market_id}")
+        seen_ids.add(market_id)
+
+        query_share = entry.get("query_share", 0.0)
+        if not isinstance(query_share, (int, float)) or query_share < 0:
+            raise ValueError(f"markets[{index}].query_share cannot be negative")
+
+        salary_dict = entry.get("salary", {})
+        if not isinstance(salary_dict, dict):
+            raise ValueError(f"markets[{index}].salary must be a mapping")
+
+        currency = salary_dict.get("currency", "")
+        if not currency:
+            raise ValueError(f"markets[{index}].salary.currency cannot be empty")
+
+        gross_base_floor = salary_dict.get("gross_base_floor", 0)
+        if not isinstance(gross_base_floor, int) or gross_base_floor <= 0:
+            raise ValueError(f"markets[{index}].salary.gross_base_floor must be positive")
+
+        location_floors = salary_dict.get("location_floors", {})
+        for k, v in location_floors.items():
+            if not isinstance(v, int) or v <= 0:
+                raise ValueError(f"markets[{index}].salary.location_floors.{k} must be positive")
+
+        remote_policy = entry.get("remote_policy", "allowed")
+        if remote_policy not in _REMOTE_POLICIES:
+            raise ValueError(f"markets[{index}] invalid remote_policy: {remote_policy}")
+
+        relocation_policy = entry.get("relocation_policy", "allowed")
+        if relocation_policy not in _RELOCATION_POLICIES:
+            raise ValueError(f"markets[{index}] invalid relocation_policy: {relocation_policy}")
+
+        sponsorship_policy = entry.get("sponsorship_policy", "not_required")
+        if sponsorship_policy not in _SPONSORSHIP_POLICIES:
+            raise ValueError(f"markets[{index}] invalid sponsorship_policy: {sponsorship_policy}")
+
+        allowed_fields = {
+            "id", "query_share", "locations", "allowed_languages", "salary",
+            "remote_policy", "relocation_policy", "sponsorship_policy",
+            "source_domains", "query_templates", "role_families", "enabled"
+        }
+        unknown_fields = sorted(set(entry) - allowed_fields, key=str)
+        if unknown_fields:
+            raise ValueError(f"markets[{index}].{unknown_fields[0]} is not allowed")
+
+        markets.append(MarketPolicy(
+            id=market_id,
+            query_share=float(query_share),
+            locations=entry.get("locations", []),
+            allowed_languages=entry.get("allowed_languages", []),
+            salary=SalaryPolicy(
+                currency=currency,
+                gross_base_floor=gross_base_floor,
+                location_floors=location_floors,
+            ),
+            remote_policy=remote_policy,
+            relocation_policy=relocation_policy,
+            sponsorship_policy=sponsorship_policy,
+            source_domains=entry.get("source_domains", []),
+            query_templates=entry.get("query_templates", []),
+            role_families=entry.get("role_families", []),
+            enabled=entry.get("enabled", True),
+        ))
+
+    return markets
 
 
 def _parse_manual_company_watch(entries: object) -> list[CompanyWatchSeed]:

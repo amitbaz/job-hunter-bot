@@ -47,6 +47,35 @@ DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES = [
 
 
 @dataclass(slots=True)
+class SalaryPolicy:
+    currency: str
+    gross_base_floor: int
+    location_floors: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MarketPolicy:
+    id: str
+    query_share: float
+    locations: list[str]
+    allowed_languages: list[str]
+    salary: SalaryPolicy
+    remote_policy: str
+    relocation_policy: str
+    sponsorship_policy: str
+    source_domains: list[str] = field(default_factory=list)
+    query_templates: list[str] = field(default_factory=list)
+    role_families: list[str] = field(default_factory=list)
+    enabled: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class SearchQuery:
+    text: str
+    market_id: str | None = None
+
+
+@dataclass(slots=True)
 class Job:
     source: str
     title: str
@@ -146,6 +175,7 @@ class SearchPolicy:
     blocked_profession_title_phrases: list[str] = field(
         default_factory=lambda: list(DEFAULT_BLOCKED_PROFESSION_TITLE_PHRASES)
     )
+    markets: list[MarketPolicy] = field(default_factory=list)
 
 
 @dataclass(slots=True)
