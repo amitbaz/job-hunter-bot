@@ -206,17 +206,15 @@ def _log_market_metrics(
         decisions = decision_counts.get(market_id, {})
         logger.info(
             "market=%s queries_planned=%s queries_attempted=%s queries_succeeded=%s "
-            "search_results=%s raw=%s unique=%s reattributed=%s rejected=%s eligible=%s "
-            "selected=%s high_priority=%s package_match=%s possible_match=%s skip=%s "
-            "blocked=%s delivered=%s",
+            "raw=%s unique=%s rejected=%s eligible=%s selected=%s high_priority=%s "
+            "package_match=%s possible_match=%s skip=%s blocked=%s delivered=%s "
+            "search_results=%s reattributed=%s",
             market_id,
             search_planned.get(market_id, 0),
             search_attempted.get(market_id, 0),
             search_succeeded.get(market_id, 0),
-            search_results.get(market_id, 0),
             discovery.stats.raw_by_market.get(market_id, 0),
             discovery.stats.unique_by_market.get(market_id, 0),
-            discovery.stats.reattributed_by_market.get(market_id, 0),
             discovery.stats.rejected_by_market.get(market_id, 0),
             discovery.stats.eligible_by_market.get(market_id, 0),
             selected_by_market.get(market_id, 0),
@@ -226,6 +224,8 @@ def _log_market_metrics(
             decisions.get("skip", 0),
             decisions.get("blocked", 0),
             delivered_by_market.get(market_id, 0),
+            search_results.get(market_id, 0),
+            discovery.stats.reattributed_by_market.get(market_id, 0),
         )
 
 
@@ -352,18 +352,7 @@ def _evaluate_and_deliver_job(
     pdf_deliveries: list[tuple[int, Path, DigestItem]],
     summary: RunSummary,
 ) -> tuple[bool, bool, str | None]:
-    """Evaluate one job and, if ready, generate its cover letter/PDF.
-
-    Returns `(promoted, quota_blocked, decision)`. `quota_blocked` is True
-    when a Gemini quota exception deferred this job's evaluation — the job
-    has already been re-enqueued as pending `job_evaluation` work, and the
-    caller should stop attempting further jobs this run (they would hit the
-    same exhausted ceiling or persisted pause) and defer those too.
-    `decision` is the freshly produced `Evaluation.decision` for this call,
-    or `None` when no new evaluation was produced this call (quota-blocked,
-    a generic exception before an `Evaluation` was produced, or a stale
-    already-evaluated-and-delivered queue row).
-    """
+    """Evaluate one job and, if ready, generate its cover letter/PDF."""
     if store.get_evaluation(job_id) is not None and store.has_delivery(job_id, "telegram_message"):
         store.complete_ai_work("job_evaluation", job_id)
         return False, False, None
@@ -458,12 +447,7 @@ def _retry_pending_cover_letter(
     pdf_deliveries: list[tuple[int, Path, DigestItem]],
     summary: RunSummary,
 ) -> bool:
-    """Regenerate a previously quota-blocked cover letter for an already-evaluated job.
-
-    Uses the saved job + evaluation + cached CandidateContext; never repeats
-    job evaluation. Returns True when generation is quota-blocked again, so
-    the caller can stop attempting further pending cover letters this run.
-    """
+    """Regenerate a previously quota-blocked cover letter for an already-evaluated job."""
     evaluation = store.get_evaluation(job_id)
     job = store.get_job(job_id)
     if evaluation is None or job is None:
@@ -523,7 +507,7 @@ def _format_gemini_usage_log(summary: GeminiUsageSummary) -> str:
         if purpose in summary.purpose_counts
     )
     return (
-        f"gemini_usage day_calls={summary.requests_today} "
+        f"gemini_usage run_calls={summary.requests_today} "
         f"rpd_pct={summary.rpd_percent:.1f} "
         f"rpm_peak_pct={summary.rpm_peak_percent:.1f} "
         f"tpm_peak_pct={summary.tpm_peak_percent:.1f} "
