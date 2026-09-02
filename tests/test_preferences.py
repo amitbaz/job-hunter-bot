@@ -1,14 +1,18 @@
 import json
 
+import pytest
+
+from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.models import CandidatePreferences, SearchPolicy
 from job_hunter.preferences import extract_candidate_preferences
 from job_hunter.store import JobStore
 
 
 class FakeGemini:
-    def __init__(self, response):
+    def __init__(self, response=None, exception=None):
         self.model = "gemini-test"
         self.response = response
+        self.exception = exception
         self.calls = []
 
     def generate_text(
@@ -31,6 +35,8 @@ class FakeGemini:
                 "json_schema": json_schema,
             }
         )
+        if self.exception is not None:
+            raise self.exception
         return self.response
 
 
@@ -140,3 +146,23 @@ def test_extract_candidate_preferences_caches_across_calls():
 
     assert first == second
     assert len(gemini.calls) == 1
+
+
+def test_extract_candidate_preferences_propagates_gemini_budget_exceeded():
+    store = JobStore(":memory:")
+    policy = make_policy()
+    gemini = FakeGemini(exception=GeminiBudgetExceeded("over budget"))
+
+    with pytest.raises(GeminiBudgetExceeded):
+        extract_candidate_preferences("candidate profile text", gemini, policy, store)
+
+
+def test_extract_candidate_preferences_propagates_gemini_quota_paused():
+    store = JobStore(":memory:")
+    policy = make_policy()
+    gemini = FakeGemini(
+        exception=GeminiQuotaPaused("paused", paused_until="2026-01-01T00:00:00+00:00", reason="daily_quota")
+    )
+
+    with pytest.raises(GeminiQuotaPaused):
+        extract_candidate_preferences("candidate profile text", gemini, policy, store)
