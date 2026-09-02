@@ -37,10 +37,19 @@ GeminiPauseKind = Literal["daily_quota", "rate_limit", "unknown"]
 
 _PACIFIC = ZoneInfo("America/Los_Angeles")
 _ROLLING_WINDOW = timedelta(seconds=60)
+_ROLLING_SAFETY_SECONDS = 0.05
 
 
 class GeminiBudgetExceeded(RuntimeError):
-    """Our own internal ceiling or core reserve refused this call."""
+    """Our own internal daily ceiling or core reserve refused this call."""
+
+
+class GeminiTemporaryCapacity(GeminiBudgetExceeded):
+    """Rolling RPM/TPM capacity is temporarily full but will free shortly."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
 
 
 class GeminiQuotaPaused(RuntimeError):
@@ -118,6 +127,47 @@ def _peak_rolling(rows: list[sqlite3.Row], window: timedelta) -> tuple[int, int]
     return peak_requests, peak_tokens
 
 
+def _retry_after_for_rolling_capacity(
+    rows: list[sqlite3.Row],
+    *,
+    now: datetime,
+    rpm_ceiling: int,
+    tpm_ceiling: int,
+    proposed_input_tokens: int,
+) -> float:
+    """Return the earliest safe retry delay for current rolling RPM/TPM pressure."""
+    release_times: list[datetime] = []
+
+    if len(rows) + 1 > rpm_ceiling:
+        rows_to_expire = len(rows) + 1 - rpm_ceiling
+        limiting_row = rows[rows_to_expire - 1]
+        release_times.append(
+            datetime.fromisoformat(limiting_row["occurred_at"])
+            + _ROLLING_WINDOW
+            + timedelta(seconds=_ROLLING_SAFETY_SECONDS)
+        )
+
+    rolling_tokens = sum(_row_input_tokens(row) for row in rows)
+    if rolling_tokens + proposed_input_tokens > tpm_ceiling:
+        remaining_tokens = rolling_tokens
+        for row in rows:
+            remaining_tokens -= _row_input_tokens(row)
+            if remaining_tokens + proposed_input_tokens <= tpm_ceiling:
+                release_times.append(
+                    datetime.fromisoformat(row["occurred_at"])
+                    + _ROLLING_WINDOW
+                    + timedelta(seconds=_ROLLING_SAFETY_SECONDS)
+                )
+                break
+
+    if not release_times:
+        return _ROLLING_SAFETY_SECONDS
+    return max(
+        _ROLLING_SAFETY_SECONDS,
+        max((release - now).total_seconds() for release in release_times),
+    )
+
+
 class GeminiUsageTracker:
     """Preflight budget checks and usage recording for one Gemini model."""
 
@@ -137,11 +187,10 @@ class GeminiUsageTracker:
     def preflight(self, purpose: GeminiPurpose, prompt: str, now: datetime) -> None:
         """Raise before any HTTP call if this attempt would exceed a budget.
 
-        Checks a persisted provider pause first (no ledger row is written for
-        that case; the pause itself is the record). Then checks our internal
-        80%-of-provider ceilings for RPD (with a reserve for `job_evaluation`),
-        rolling RPM, and estimated rolling TPM, recording exactly one
-        `blocked_budget` row if any of those trip.
+        Persisted provider pauses and daily/internal reserve exhaustion remain
+        hard blockers. Rolling RPM/TPM pressure is temporary: callers receive
+        `GeminiTemporaryCapacity` with the earliest safe retry delay and no
+        blocked-budget ledger row is written merely for waiting.
         """
         if purpose not in GEMINI_PURPOSES:
             raise ValueError(f"unknown Gemini purpose: {purpose!r}")
@@ -168,21 +217,38 @@ class GeminiUsageTracker:
 
         day_start, day_end = _pacific_day_bounds(now)
         day_rows = self._provider_rows(day_start, day_end)
+        if len(day_rows) + 1 > daily_limit:
+            self._record_blocked(purpose, prompt, now)
+            raise GeminiBudgetExceeded(
+                f"Gemini {self._model} daily budget exceeded for purpose {purpose!r}"
+            )
+
+        proposed_input_tokens = estimate_input_tokens(prompt)
+        if proposed_input_tokens > tpm_ceiling:
+            self._record_blocked(purpose, prompt, now)
+            raise GeminiBudgetExceeded(
+                f"Gemini {self._model} prompt exceeds internal TPM ceiling for purpose {purpose!r}"
+            )
 
         minute_start = now - _ROLLING_WINDOW
         minute_rows = self._provider_rows(minute_start, now)
         rolling_requests = len(minute_rows)
         rolling_input_tokens = sum(_row_input_tokens(row) for row in minute_rows)
-        proposed_tokens = rolling_input_tokens + estimate_input_tokens(prompt)
 
         if (
-            len(day_rows) + 1 > daily_limit
-            or rolling_requests + 1 > rpm_ceiling
-            or proposed_tokens > tpm_ceiling
+            rolling_requests + 1 > rpm_ceiling
+            or rolling_input_tokens + proposed_input_tokens > tpm_ceiling
         ):
-            self._record_blocked(purpose, prompt, now)
-            raise GeminiBudgetExceeded(
-                f"Gemini {self._model} budget exceeded for purpose {purpose!r}"
+            retry_after = _retry_after_for_rolling_capacity(
+                minute_rows,
+                now=now,
+                rpm_ceiling=rpm_ceiling,
+                tpm_ceiling=tpm_ceiling,
+                proposed_input_tokens=proposed_input_tokens,
+            )
+            raise GeminiTemporaryCapacity(
+                f"Gemini {self._model} rolling capacity temporarily full for purpose {purpose!r}",
+                retry_after_seconds=retry_after,
             )
 
     def record_success(
