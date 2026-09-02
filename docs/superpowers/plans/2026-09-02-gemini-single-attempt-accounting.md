@@ -4,7 +4,7 @@
 
 **Goal:** Ensure each logical Gemini call makes at most one provider HTTP attempt and that HTTP/network failures are counted once in Gemini usage accounting.
 
-**Architecture:** Keep the generic `HttpClient` retry defaults for the rest of the bot, but add an explicit per-request switch to disable exception retries. `GeminiClient` will opt out of both status-code retries and exception retries, and will record request exceptions as failed Gemini attempts before re-raising them.
+**Architecture:** Keep the generic `HttpClient` retry defaults for the rest of the bot, but add one per-request `retry` switch. `GeminiClient` passes `retry=False`, keeps the existing retryable-status metadata for compatibility, and records request exceptions as failed Gemini attempts before re-raising them.
 
 **Tech Stack:** Python 3.12, requests, pytest
 
@@ -24,50 +24,36 @@
 **Files:**
 - Modify: `src/job_hunter/http.py`
 - Modify: `src/job_hunter/gemini.py`
-- Test: `tests/test_gemini.py`
+- Test: `tests/test_gemini_single_attempt_accounting.py`
 - Test: `tests/test_http.py`
 
 **Interfaces:**
-- `HttpClient.post(..., retry_exceptions: bool = True, retry_status_codes: set[int] | None = None)` preserves current behavior by default.
-- `GeminiClient.generate_text(...)` calls `HttpClient.post` with `retry_status_codes=set()` and `retry_exceptions=False`.
+- `HttpClient.post(..., retry: bool = True, retry_status_codes: set[int] | None = None)` preserves current behavior by default.
+- `GeminiClient.generate_text(...)` calls `HttpClient.post` with the existing Gemini retryable-status set plus `retry=False`.
 - `GeminiUsageTracker.record_error(...)` remains the usage-ledger entry point for non-429 failed attempts.
 
-- [ ] **Step 1: Write failing Gemini regression tests**
+- [x] **Step 1: Write failing Gemini regression tests**
 
-Add tests proving a Gemini request opts out of status retries and exception retries, and that a request exception is recorded once before being re-raised.
+Tests prove a Gemini request opts out of automatic retries and that a request exception is recorded once before being re-raised.
 
-- [ ] **Step 2: Run targeted Gemini tests and verify RED**
+- [x] **Step 2: Run tests and verify RED**
 
-Run: `pytest tests/test_gemini.py -q`
+CI run `33622638585`: `3 failed, 611 passed`; failures were exactly the missing retry opt-out and missing network-error accounting.
 
-Expected: FAIL because `retry_exceptions` is not supported/passed yet and request exceptions are not recorded by `GeminiClient`.
+- [x] **Step 3: Add an HttpClient regression test**
 
-- [ ] **Step 3: Add an HttpClient regression test**
+The regression test proves `retry=False` performs one request attempt while the default path still retries request exceptions.
 
-Add a test proving the new `retry_exceptions=False` option performs one request attempt while the default path still retries request exceptions.
+- [x] **Step 4: Implement the minimal retry opt-out**
 
-- [ ] **Step 4: Run targeted HTTP tests and verify RED**
+`HttpClient.get/post/_request` accepts `retry: bool = True`. When false, status and exception retries are skipped. `GeminiClient` passes `retry=False`, records request exceptions through `record_error`, and re-raises them.
 
-Run: `pytest tests/test_http.py -q`
-
-Expected: FAIL because `HttpClient` does not yet expose the `retry_exceptions` option.
-
-- [ ] **Step 5: Implement the minimal retry opt-out**
-
-Update `HttpClient.get/post/_request` to accept `retry_exceptions: bool = True`; when false, immediately re-raise a `requests.RequestException` instead of entering another attempt. In `GeminiClient`, pass an empty retry-status set and `retry_exceptions=False`; wrap the post call so request exceptions are recorded through `record_error` once and then re-raised.
-
-- [ ] **Step 6: Run targeted tests and verify GREEN**
-
-Run: `pytest tests/test_gemini.py tests/test_http.py -q`
-
-Expected: PASS.
-
-- [ ] **Step 7: Run full suite**
+- [ ] **Step 5: Run full suite and verify GREEN**
 
 Run: `pytest -q`
 
 Expected: all tests pass.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 6: Finish branch**
 
-Commit the regression tests and minimal implementation on `fix/gemini-single-attempt-accounting`.
+Verify the branch diff is limited to the spec, plan, regression tests, and the two production files, then prepare it for merge.
