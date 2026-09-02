@@ -8,7 +8,9 @@ must never override stronger, directly observed location evidence:
     300  explicit remote country/region scope in location/description
     200  explicit sponsorship/relocation language tied to a market
     100  Job.market_hint
-      0  no evidence -> fallback to the first enabled market in configured order
+      0  no evidence -> fallback to the first enabled market in configured
+         order, unless the job is explicitly non-remote (then no configured
+         market is compatible and the job is left unattributed)
 """
 
 from __future__ import annotations
@@ -55,8 +57,10 @@ def attribute_market(job: Job, markets: list[MarketPolicy]) -> str | None:
     Every enabled market is scored on the evidence tiers described in this
     module's docstring; the highest-scoring market wins, ties broken by
     configured order. When no market has any evidence at all, the job falls
-    back to the first enabled market in configured order rather than being
-    left unattributed.
+    back to the first *compatible* enabled market in configured order: a job
+    that is explicitly non-remote and matches no configured market's
+    locations is compatible with none of them, so it stays unattributed and
+    the caller applies the legacy non-remote blocker instead.
     """
     enabled_markets = [market for market in markets if market.enabled]
     if not enabled_markets:
@@ -72,6 +76,17 @@ def attribute_market(job: Job, markets: list[MarketPolicy]) -> str | None:
 
     if best_score > 0:
         return best_market_id
+
+    # No market has any evidence, so no configured market's locations were
+    # named anywhere (a location match would have scored). An explicitly
+    # non-remote job in an unnamed place is not plausibly compatible with any
+    # market, and silently attributing it to the first enabled one would let
+    # it skip both the market work-mode rules (which only run for
+    # remote-required markets) and the legacy non-remote hard blocker.
+    # Ambiguous jobs (remote, or remote unknown) still fall back, so market
+    # uncertainty alone never drops a job.
+    if job.remote is False:
+        return None
 
     return enabled_markets[0].id
 

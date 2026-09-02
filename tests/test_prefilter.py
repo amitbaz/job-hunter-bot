@@ -1,5 +1,5 @@
 import pytest
-from job_hunter.market_policy import market_by_id
+from job_hunter.market_policy import attribute_market, market_by_id
 from job_hunter.models import Job, SearchPolicy
 from job_hunter.prefilter import prefilter_job
 from tests.market_fixtures import make_market_policy
@@ -189,3 +189,31 @@ def test_prefilter_with_market_still_applies_blocked_title_and_relevance_checks(
     )
     assert result.should_evaluate is False
     assert result.reason_code == "blocked_title"
+
+
+@pytest.mark.parametrize(
+    ("location", "description"),
+    [
+        ("Bangalore, India (Onsite)", "React TypeScript"),
+        ("Austin, TX", "Onsite 5 days a week. React TypeScript"),
+    ],
+)
+def test_unattributable_non_remote_job_is_hard_blocked_as_not_remote(location, description):
+    """A non-remote job that no configured market claims stays unattributed
+    and must fall through to the legacy non-remote hard blocker instead of
+    being silently passed through on a first-enabled-market fallback."""
+    market_policy = make_market_policy()
+    job = Job(
+        source="x",
+        title="Senior Frontend Engineer",
+        location=location,
+        description=description,
+        remote=False,
+    )
+    market_id = attribute_market(job, market_policy.markets)
+    assert market_id is None
+
+    result = prefilter_job(job, market_policy, market=None)
+    assert result.should_evaluate is False
+    assert result.hard_blocker is True
+    assert result.reason_code == "not_remote"

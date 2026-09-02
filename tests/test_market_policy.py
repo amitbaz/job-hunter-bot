@@ -1,3 +1,4 @@
+import pytest
 from dataclasses import replace
 
 from job_hunter.market_policy import attribute_market, market_by_id, salary_floor_for_job
@@ -79,6 +80,49 @@ def test_market_hint_used_only_when_no_stronger_evidence_exists():
 def test_no_evidence_falls_back_to_first_enabled_market_in_configured_order():
     policy = make_market_policy()
     job = Job(source="x", title="Senior Frontend Engineer", location="")
+    assert attribute_market(job, policy.markets) == "germany_eu"
+
+
+@pytest.mark.parametrize(
+    ("location", "description"),
+    [
+        ("Bangalore, India (Onsite)", "React and TypeScript."),
+        ("Austin, TX", "Onsite 5 days a week. React and TypeScript."),
+    ],
+)
+def test_explicitly_non_remote_job_with_no_market_evidence_is_unattributed(location, description):
+    """A non-remote job in a place no market names is compatible with no
+    market; forcing it into the first enabled one would drop the non-remote
+    hard blocker entirely."""
+    policy = make_market_policy()
+    job = Job(
+        source="x",
+        title="Senior Frontend Engineer",
+        location=location,
+        remote=False,
+        description=description,
+    )
+    assert attribute_market(job, policy.markets) is None
+
+
+def test_non_remote_job_still_uses_its_market_hint_when_no_location_evidence():
+    """Only *zero* evidence triggers the unattributed path; a query hint is
+    still evidence."""
+    policy = make_market_policy()
+    job = Job(
+        source="x",
+        title="Senior Frontend Engineer",
+        location="Bangalore, India",
+        remote=False,
+        market_hint="singapore",
+    )
+    assert attribute_market(job, policy.markets) == "singapore"
+
+
+def test_remote_unknown_job_with_no_evidence_still_falls_back():
+    """Market uncertainty alone must not drop a job."""
+    policy = make_market_policy()
+    job = Job(source="x", title="Senior Frontend Engineer", location="Bangalore, India")
     assert attribute_market(job, policy.markets) == "germany_eu"
 
 
