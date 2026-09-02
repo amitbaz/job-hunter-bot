@@ -375,3 +375,103 @@ def test_load_settings_rejects_unknown_manual_watch_mapping_key(
             tmp_path,
             "[{company_name: Acme, ats_identifer: acme}]",
         )
+
+
+def test_load_settings_parses_markets_in_declared_order(monkeypatch, tmp_path):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds: {package: 75, possible: 65}\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "markets:\n"
+        "  - id: germany_eu\n"
+        "    query_share: 0.35\n"
+        "    locations: [Berlin, Germany, Europe]\n"
+        "    allowed_languages: [English]\n"
+        "    salary: {currency: EUR, gross_base_floor: 90000}\n"
+        "    remote_policy: preferred\n"
+        "    relocation_policy: selective\n"
+        "    sponsorship_policy: not_required\n"
+        "  - id: israel_remote\n"
+        "    query_share: 0.25\n"
+        "    locations: [Israel, Tel Aviv]\n"
+        "    allowed_languages: [English, Hebrew]\n"
+        "    salary: {currency: ILS, gross_base_floor: 420000}\n"
+        "    remote_policy: required\n"
+        "    relocation_policy: none\n"
+        "    sponsorship_policy: not_required\n"
+    )
+
+    settings = load_settings(cfg)
+
+    assert [market.id for market in settings.policy.markets] == [
+        "germany_eu",
+        "israel_remote",
+    ]
+    assert settings.policy.markets[1].allowed_languages == ["English", "Hebrew"]
+    assert settings.policy.markets[1].salary.gross_base_floor == 420000
+
+
+def test_load_settings_rejects_duplicate_market_ids(monkeypatch, tmp_path):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds: {package: 75, possible: 65}\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "markets:\n"
+        "  - {id: london, query_share: 0.5, locations: [London], allowed_languages: [English], salary: {currency: GBP, gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: required}\n"
+        "  - {id: london, query_share: 0.5, locations: [London], allowed_languages: [English], salary: {currency: GBP, gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: required}\n"
+    )
+
+    with pytest.raises(ValueError, match="duplicate market id: london"):
+        load_settings(cfg)
+
+
+@pytest.mark.parametrize(
+    "bad_market_yaml,expected_error",
+    [
+        (
+            "{id: a, query_share: -0.1, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: not_required}",
+            "query_share cannot be negative",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: '', gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: not_required}",
+            "currency cannot be empty",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 0}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: not_required}",
+            "salary.gross_base_floor must be positive",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 90000, location_floors: {Berlin: 0}}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: not_required}",
+            "location_floors.*must be positive",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: not_required, unknown_field: 1}",
+            "unknown_field is not allowed",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 90000}, remote_policy: invalid, relocation_policy: allowed, sponsorship_policy: not_required}",
+            "invalid remote_policy: invalid",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: invalid, sponsorship_policy: not_required}",
+            "invalid relocation_policy: invalid",
+        ),
+        (
+            "{id: a, query_share: 0.5, locations: [A], allowed_languages: [English], salary: {currency: EUR, gross_base_floor: 90000}, remote_policy: allowed, relocation_policy: allowed, sponsorship_policy: invalid}",
+            "invalid sponsorship_policy: invalid",
+        ),
+    ],
+)
+def test_load_settings_rejects_invalid_market(monkeypatch, tmp_path, bad_market_yaml, expected_error):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds: {package: 75, possible: 65}\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "markets:\n"
+        f"  - {bad_market_yaml}\n"
+    )
+    with pytest.raises(ValueError, match=expected_error):
+        load_settings(cfg)

@@ -1,11 +1,13 @@
 from job_hunter.models import CandidatePreferences, Job, SearchPolicy
 from job_hunter.ranking import (
+    market_priority_bonus,
     priority_score,
     profile_priority_score,
     rank_jobs,
     select_diverse_candidates,
     source_quality,
 )
+from tests.market_fixtures import make_market_policy
 
 
 def make_policy() -> SearchPolicy:
@@ -204,3 +206,77 @@ def test_select_diverse_candidates_fills_budget_when_share_cap_blocks_remaining_
     for _job_id, job, _score in selected:
         counts[job.source] = counts.get(job.source, 0) + 1
     assert counts == {"ashby": 18, "remotive": 17}
+
+
+def test_frontend_heavy_full_stack_beats_backend_heavy_full_stack():
+    policy = make_market_policy()
+    preferences = make_preferences()
+    frontend_heavy = Job(source="wellfound", title="Full-Stack Engineer", market_id="germany_eu", description="React Next.js TypeScript frontend, Node.js REST APIs and PostgreSQL")
+    backend_heavy = Job(source="wellfound", title="Full-Stack Engineer", market_id="germany_eu", description="Go Java Kubernetes distributed systems event-driven backend architecture")
+    assert profile_priority_score(frontend_heavy, preferences, policy) > profile_priority_score(backend_heavy, preferences, policy)
+
+
+def test_london_hybrid_gets_nonzero_location_fit():
+    policy = make_market_policy()
+    job = Job(source="x", title="Senior Frontend Engineer", location="London - Hybrid", remote=False, market_id="london", description="React TypeScript")
+    assert profile_priority_score(job, make_preferences(), policy) > 0
+
+
+def test_small_quality_edge_survives_max_market_bonus_swing():
+    # market_priority_bonus ranges from len(policy.markets) (index 0, germany_eu
+    # = 6) down to 1 (index 5, secondary_eu_relocation): the largest possible
+    # bonus delta between two configured markets in this policy is 6 - 1 = 5.
+    # This test pits a *lower*-bonus candidate (secondary_eu_relocation, bonus
+    # 1) with only a small, deliberate quality edge on the non-bonus axes
+    # against a *higher*-bonus candidate (germany_eu, bonus 6) that is
+    # otherwise slightly stronger on location fit. The quality edge here is 8
+    # points (extra signal-coverage matches) against germany's 2-point location
+    # advantage, netting a 6-point non-bonus edge for the weaker-bonus
+    # candidate -- just enough to clear the 5-point max bonus swing. If
+    # market_priority_bonus were miscalibrated to be larger than a handful of
+    # points, this assertion would flip and fail, proving the bonus stays a
+    # modest nudge rather than an absolute partition.
+    policy = make_market_policy()
+    preferences = make_preferences()
+
+    higher_bonus_lower_quality = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
+        company="A",
+        location="Berlin",
+        remote=False,
+        market_id="germany_eu",  # bonus 6 (index 0)
+        description="React TypeScript backend services",  # must-have signals only
+    )
+    lower_bonus_higher_quality = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
+        company="B",
+        location="Amsterdam",
+        remote=False,
+        market_id="secondary_eu_relocation",  # bonus 1 (index 5)
+        description="React TypeScript design system mentorship growth",  # must-have + both nice-to-have signals
+    )
+
+    assert market_priority_bonus(higher_bonus_lower_quality, policy) - market_priority_bonus(lower_bonus_higher_quality, policy) == 5
+    assert profile_priority_score(lower_bonus_higher_quality, preferences, policy) > profile_priority_score(higher_bonus_lower_quality, preferences, policy)
+
+
+def test_market_priority_bonus_rewards_higher_priority_market():
+    policy = make_market_policy()
+
+    germany_job = Job(source="ashby", title="x", market_id="germany_eu")
+    london_job = Job(source="ashby", title="x", market_id="london")
+    no_market_job = Job(source="ashby", title="x")
+    unknown_market_job = Job(source="ashby", title="x", market_id="nowhere")
+
+    assert market_priority_bonus(germany_job, policy) > market_priority_bonus(london_job, policy) > 0
+    assert market_priority_bonus(no_market_job, policy) == 0
+    assert market_priority_bonus(unknown_market_job, policy) == 0
+
+
+def test_specialist_board_url_source_quality_between_ats_and_generic_web():
+    ats = Job(source="ashby", title="x", url="https://jobs.ashbyhq.com/acme/1")
+    specialist = Job(source="duckduckgo", title="x", url="https://wellfound.com/jobs/123")
+    generic = Job(source="duckduckgo", title="x", url="https://example.com/jobs/123")
+    assert source_quality(ats) > source_quality(specialist) > source_quality(generic)

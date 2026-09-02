@@ -139,6 +139,90 @@ def _format_source_counts(counts: dict[str, int]) -> str:
     return " ".join(f"{source}={count}" for source, count in counts.items())
 
 
+def _market_counts(items) -> dict[str, int]:
+    """Count `(job_id, job, score)` items by `job.market_id`, ignoring unattributed ones."""
+    counts: dict[str, int] = {}
+    for _job_id, job, _score in items:
+        if not job.market_id:
+            continue
+        counts[job.market_id] = counts.get(job.market_id, 0) + 1
+    return counts
+
+
+def _record_decision(
+    decision_counts: dict[str, dict[str, int]], market_id: str | None, decision: str | None
+) -> None:
+    """Tally one fresh evaluation outcome under its market for per-market logging."""
+    if not market_id or not decision:
+        return
+    bucket = decision_counts.setdefault(market_id, {})
+    bucket[decision] = bucket.get(decision, 0) + 1
+
+
+def _aggregate_duckduckgo_stats(
+    sources,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """Sum planned/attempted/succeeded query counts by market across all DuckDuckGo sources."""
+    planned: dict[str, int] = {}
+    attempted: dict[str, int] = {}
+    succeeded: dict[str, int] = {}
+    for source in sources:
+        if not isinstance(source, DuckDuckGoSource):
+            continue
+        for market_id, count in source.stats.planned_by_market.items():
+            planned[market_id] = planned.get(market_id, 0) + count
+        for market_id, count in source.stats.attempted_by_market.items():
+            attempted[market_id] = attempted.get(market_id, 0) + count
+        for market_id, count in source.stats.succeeded_by_market.items():
+            succeeded[market_id] = succeeded.get(market_id, 0) + count
+    return planned, attempted, succeeded
+
+
+def _delivered_counts(digest_items: list[DigestItem]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for item in digest_items:
+        if not item.market_id:
+            continue
+        counts[item.market_id] = counts.get(item.market_id, 0) + 1
+    return counts
+
+
+def _log_market_metrics(
+    settings: Settings,
+    discovery,
+    ddg_planned: dict[str, int],
+    ddg_attempted: dict[str, int],
+    ddg_succeeded: dict[str, int],
+    selected_by_market: dict[str, int],
+    decision_counts: dict[str, dict[str, int]],
+    delivered_by_market: dict[str, int],
+) -> None:
+    """Log one structured line per configured market for discovery/selection/evaluation/delivery observability."""
+    for market in settings.policy.markets:
+        market_id = market.id
+        decisions = decision_counts.get(market_id, {})
+        logger.info(
+            "market=%s queries_planned=%s queries_attempted=%s queries_succeeded=%s "
+            "raw=%s unique=%s rejected=%s eligible=%s selected=%s high_priority=%s "
+            "package_match=%s possible_match=%s skip=%s blocked=%s delivered=%s",
+            market_id,
+            ddg_planned.get(market_id, 0),
+            ddg_attempted.get(market_id, 0),
+            ddg_succeeded.get(market_id, 0),
+            discovery.stats.raw_by_market.get(market_id, 0),
+            discovery.stats.unique_by_market.get(market_id, 0),
+            discovery.stats.rejected_by_market.get(market_id, 0),
+            discovery.stats.eligible_by_market.get(market_id, 0),
+            selected_by_market.get(market_id, 0),
+            decisions.get("high_priority", 0),
+            decisions.get("package_match", 0),
+            decisions.get("possible_match", 0),
+            decisions.get("skip", 0),
+            decisions.get("blocked", 0),
+            delivered_by_market.get(market_id, 0),
+        )
+
+
 def _due_watch_state(
     store: JobStore,
 ) -> dict[int, tuple[str, str | None, int, str | None]]:
@@ -232,6 +316,8 @@ def _requeue_pending_delivery(
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
         location=job.location,
+        market_id=evaluation.market_id or job.market_id or "",
+        market_note=evaluation.location_note or "",
     )
 
     if not store.has_delivery(job_id, "telegram_message"):
@@ -259,14 +345,18 @@ def _evaluate_and_deliver_job(
     digest_items: list[DigestItem],
     pdf_deliveries: list[tuple[int, Path, DigestItem]],
     summary: RunSummary,
-) -> tuple[bool, bool]:
+) -> tuple[bool, bool, str | None]:
     """Evaluate one job and, if ready, generate its cover letter/PDF.
 
-    Returns `(promoted, quota_blocked)`. `quota_blocked` is True when a
-    Gemini quota exception deferred this job's evaluation — the job has
-    already been re-enqueued as pending `job_evaluation` work, and the
+    Returns `(promoted, quota_blocked, decision)`. `quota_blocked` is True
+    when a Gemini quota exception deferred this job's evaluation — the job
+    has already been re-enqueued as pending `job_evaluation` work, and the
     caller should stop attempting further jobs this run (they would hit the
     same exhausted ceiling or persisted pause) and defer those too.
+    `decision` is the freshly produced `Evaluation.decision` for this call,
+    or `None` when no new evaluation was produced this call (quota-blocked,
+    a generic exception before an `Evaluation` was produced, or a stale
+    already-evaluated-and-delivered queue row).
     """
     # save_evaluation and complete_ai_work are two separate transactions
     # (below): a crash landing between them leaves a job that was already
@@ -276,18 +366,18 @@ def _evaluate_and_deliver_job(
     # already out the door -- it just clears the leftover queue row.
     if store.get_evaluation(job_id) is not None and store.has_delivery(job_id, "telegram_message"):
         store.complete_ai_work("job_evaluation", job_id)
-        return False, False
+        return False, False, None
 
     try:
         evaluation = evaluate_job(job, candidate_context, settings.policy, gemini)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
         logger.warning("job evaluation deferred by Gemini quota for job_id=%s", job_id)
         store.enqueue_ai_work("job_evaluation", job_id)
-        return False, True
+        return False, True, None
     except Exception:
         logger.exception("evaluation failed for job_id=%s", job_id)
         summary.errors += 1
-        return False, False
+        return False, False, None
 
     store.save_evaluation(job_id, evaluation)
     store.complete_ai_work("job_evaluation", job_id)
@@ -317,6 +407,8 @@ def _evaluate_and_deliver_job(
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
         location=job.location,
+        market_id=evaluation.market_id or job.market_id or "",
+        market_note=evaluation.location_note or "",
     )
     digest_items.append(item)
 
@@ -352,7 +444,7 @@ def _evaluate_and_deliver_job(
                 logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
                 summary.errors += 1
 
-    return promoted, False
+    return promoted, False, evaluation.decision
 
 
 def _retry_pending_cover_letter(
@@ -387,6 +479,8 @@ def _retry_pending_cover_letter(
         url=job.url,
         hard_blockers=evaluation.hard_blockers,
         location=job.location,
+        market_id=evaluation.market_id or job.market_id or "",
+        market_note=evaluation.location_note or "",
     )
     if not store.has_delivery(job_id, "telegram_message"):
         digest_items.append(item)
@@ -452,6 +546,8 @@ def _build_navigation_session(items: list[DigestItem], now: datetime) -> Navigat
                 location=item.location,
                 score=item.score,
                 url=item.url,
+                market_id=item.market_id,
+                market_note=item.market_note,
             )
             for item in ordered
         ],
@@ -478,11 +574,15 @@ def run_pipeline(
         logger.exception("manual company watch sync failed")
 
     search_breaker = CircuitBreaker(_SEARCH_FAILURE_THRESHOLD)
+    query_date = datetime.now(ZoneInfo(settings.timezone)).date()
     base_sources = (
         sources
         if sources is not None
-        else build_sources(settings, http, search_breaker=search_breaker)
+        else build_sources(
+            settings, http, search_breaker=search_breaker, query_date=query_date
+        )
     )
+    ddg_planned, ddg_attempted, ddg_succeeded = _aggregate_duckduckgo_stats(base_sources)
     sources = [
         *base_sources,
         GmailStagedSource(store),
@@ -527,6 +627,8 @@ def run_pipeline(
     selected = _select_candidates(ranked, settings.policy, preferences)
     eligible_source_counts = _source_counts(ranked)
     selected_source_counts = _source_counts(selected)
+    selected_by_market = _market_counts(selected)
+    decision_counts: dict[str, dict[str, int]] = {}
     deferred_by_budget = max(0, len(ranked) - len(selected))
     logger.info(
         "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s sources=%s",
@@ -579,9 +681,10 @@ def run_pipeline(
         if job is None:
             store.complete_ai_work("job_evaluation", job_id)
             continue
-        promoted, blocked = _evaluate_and_deliver_job(
+        promoted, blocked, decision = _evaluate_and_deliver_job(
             job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
         )
+        _record_decision(decision_counts, job.market_id, decision)
         if promoted:
             companies_promoted += 1
         quota_blocked = quota_blocked or blocked
@@ -592,9 +695,10 @@ def run_pipeline(
         if quota_blocked:
             store.enqueue_ai_work("job_evaluation", job_id)
             continue
-        promoted, blocked = _evaluate_and_deliver_job(
+        promoted, blocked, decision = _evaluate_and_deliver_job(
             job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
         )
+        _record_decision(decision_counts, job.market_id, decision)
         if promoted:
             companies_promoted += 1
         quota_blocked = quota_blocked or blocked
@@ -610,6 +714,17 @@ def run_pipeline(
             cover_letter_blocked = _retry_pending_cover_letter(
                 job_id, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
             )
+
+    _log_market_metrics(
+        settings,
+        discovery,
+        ddg_planned,
+        ddg_attempted,
+        ddg_succeeded,
+        selected_by_market,
+        decision_counts,
+        _delivered_counts(digest_items),
+    )
 
     # A tracker-less client is a test affordance only (see GeminiClient's docstring);
     # production code always supplies one. Snapshotting once here, regardless of

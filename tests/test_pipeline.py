@@ -25,6 +25,7 @@ from job_hunter.sources.company_watch import CompanyWatchSource
 from job_hunter.store import JobStore
 from job_hunter.telegram import build_gemini_pause_warning, build_gemini_usage_status
 from job_hunter.watchlist import promote_company as persist_promoted_company
+from tests.market_fixtures import make_market_policy
 
 
 class FakeGemini:
@@ -1620,6 +1621,48 @@ def test_pipeline_logs_profile_fallback_without_private_content(settings, caplog
     assert job.description not in caplog.text
 
 
+def test_pipeline_logs_per_market_metrics_and_bounds_fresh_gemini_calls(settings, caplog):
+    market_policy = make_market_policy()
+    market_policy.max_jobs_per_run = 5
+    settings.policy = market_policy
+    store = JobStore(settings.db_path)
+    jobs = [
+        _job(
+            source_job_id=f"london-{index}",
+            company=f"London Co {index}",
+            location="London",
+            remote=False,
+            description="React TypeScript. Visa sponsorship available.",
+        )
+        for index in range(10)
+    ]
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(
+            settings,
+            sources=[FakeSource(jobs)],
+            store=store,
+            gemini=gemini,
+            telegram=telegram,
+        )
+
+    # More eligible jobs than the configured budget: fresh Gemini spend stays
+    # bounded by max_jobs_per_run rather than evaluating every eligible job.
+    assert gemini.eval_calls == 5
+    assert gemini.eval_calls <= market_policy.max_jobs_per_run
+
+    assert (
+        "market=london queries_planned=0 queries_attempted=0 queries_succeeded=0 "
+        "raw=10 unique=10 rejected=0 eligible=10 selected=5 high_priority=5 "
+        "package_match=0 possible_match=0 skip=0 blocked=0 delivered=5"
+    ) in caplog.text
+    # One line per configured market, even markets with no activity this run.
+    assert "market=israel_remote" in caplog.text
+    assert "market=singapore" in caplog.text
+
+
 def test_should_run_scheduled_matches_local_hour():
     now = datetime(2026, 8, 30, 7, 0, tzinfo=timezone.utc)  # 09:00 in Europe/Berlin (CEST, UTC+2)
     assert should_run_scheduled(now, "Europe/Berlin", 9) is True
@@ -1674,6 +1717,19 @@ def test_pipeline_sends_gemini_usage_status_after_digest_before_navigator(settin
     assert telegram.events[-2][1] == build_gemini_usage_status(summary)
     assert kinds.index("message") < kinds.index("card")
     assert gemini._tracker.snapshot_calls == 1
+
+
+def test_pipeline_surfaces_evaluation_location_note_in_navigator_card(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = OrderedNavigatorTelegram()
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    card_events = [payload for kind, payload in telegram.events if kind == "card"]
+    assert card_events
+    assert "Note: Remote EU friendly" in card_events[-1]
 
 
 def test_pipeline_sends_gemini_pause_warning_immediately_before_usage_status(settings):
