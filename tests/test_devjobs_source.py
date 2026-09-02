@@ -52,7 +52,12 @@ class FakeHttp:
 
 @pytest.mark.parametrize(
     "work_mode,expected_remote",
-    [("Remote", True), ("On-site", False), ("Hybrid", False)],
+    [
+        ("Remote", True),
+        ("On-site", False),
+        ("Hybrid", False),
+        ("Freelance", None),
+    ],
 )
 def test_devjobs_parses_listing_and_detail(work_mode, expected_remote):
     http = FakeHttp(detail_html_by_id={"4458634930": _detail_html(work_mode)})
@@ -83,16 +88,29 @@ def test_devjobs_listing_failure_returns_empty_list():
 
 
 def test_devjobs_detail_failure_skips_only_that_posting():
+    listing_html = """
+    <html><body>
+        <a href="/job-details/1">Job One</a>
+        <a href="/job-details/2">Job Two</a>
+    </body></html>
+    """
+
     class PartiallyFailingHttp(FakeHttp):
         def get(self, url, **kwargs):
             self.calls.append((url, kwargs))
-            if "job-details" in url:
+            if url.endswith("/job-details/1"):
                 raise RuntimeError("detail fetch failed")
+            if "job-details" in url:
+                return FakeResponse(_detail_html("Remote"))
             return FakeResponse(self.listing_html)
 
-    jobs = DevJobsSource(PartiallyFailingHttp()).discover()
+    http = PartiallyFailingHttp(listing_html=listing_html)
+    jobs = DevJobsSource(http).discover()
 
-    assert jobs == []
+    # 2 categories share the same listing/detail fixtures: job 1 fails in both,
+    # job 2 succeeds in both, so exactly the successful posting comes back twice.
+    assert len(jobs) == 2
+    assert all(job.source_job_id == "2" for job in jobs)
 
 
 def test_devjobs_malformed_detail_title_is_skipped():
