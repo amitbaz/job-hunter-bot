@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument(
         "--force-backfill",
         action="store_true",
-        help="Repeat the 12-month backfill idempotently",
+        help="Repeat the 120-day backfill idempotently",
     )
 
     return parser

@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -218,15 +219,26 @@ class FakeGemini:
     def __init__(self, response: str) -> None:
         self.response = response
         self.calls: list[tuple[str, bool, dict | None]] = []
+        self.kwargs: list[dict] = []
 
     def generate_text(
         self,
         prompt: str,
         *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
         json_mode: bool = False,
         json_schema: dict | None = None,
     ) -> str:
         self.calls.append((prompt, json_mode, json_schema))
+        self.kwargs.append(
+            {
+                "purpose": purpose,
+                "thinking_level": thinking_level,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
         return self.response
 
 
@@ -235,6 +247,9 @@ class FailingGemini:
         self,
         prompt: str,
         *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
         json_mode: bool = False,
         json_schema: dict | None = None,
     ) -> str:
@@ -301,6 +316,39 @@ def test_semantic_classification_requests_response_schema():
     assert schema["type"] == "OBJECT"
     assert "JOB_ALERT" in schema["properties"]["kind"]["enum"]
     assert schema["properties"]["jobs"]["type"] == "ARRAY"
+
+
+def test_semantic_gmail_call_uses_bounded_resource_controls():
+    gemini = FakeGemini(semantic_response(job_urls=[], jobs=[]))
+
+    classify_email(
+        message("Hiring conversation", "Can we discuss a frontend role?"),
+        gemini,
+    )
+
+    call_kwargs = gemini.kwargs[0]
+    assert call_kwargs["purpose"] == "gmail_semantic"
+    assert call_kwargs["thinking_level"] == "minimal"
+    assert call_kwargs["max_output_tokens"] == 800
+    _, json_mode, schema = gemini.calls[0]
+    assert json_mode is True
+    assert schema is not None
+
+
+def test_semantic_prompt_caps_body_and_link_count():
+    long_body = "x" * 20_000
+    links = [f"https://example.com/jobs/{index}" for index in range(25)]
+    gemini = FakeGemini(semantic_response(job_urls=[], jobs=[]))
+
+    classify_email(
+        message("Hiring conversation", long_body, links=links),
+        gemini,
+    )
+
+    prompt = gemini.calls[0][0]
+    email_data = json.loads(prompt.split("Email data:\n", 1)[1])
+    assert len(email_data["body"]) <= 6_000
+    assert len(email_data["links"]) <= 20
 
 
 def test_semantic_job_optional_text_may_be_null():

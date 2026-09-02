@@ -18,6 +18,9 @@ class FakeGemini:
         self,
         prompt: str,
         *,
+        purpose: str | None = None,
+        thinking_level: str | None = None,
+        max_output_tokens: int | None = None,
         json_mode: bool = False,
         json_schema: dict | None = None,
     ) -> str:

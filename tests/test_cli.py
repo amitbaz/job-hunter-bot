@@ -118,6 +118,23 @@ def test_parser_accepts_sync_gmail_force_backfill():
     assert args.force_backfill is True
 
 
+def test_force_backfill_help_mentions_120_day_window():
+    parser = cli.build_parser()
+    sync_gmail_parser = next(
+        action.choices["sync-gmail"]
+        for action in parser._subparsers._group_actions
+        if action.dest == "command"
+    )
+    force_backfill_action = next(
+        action
+        for action in sync_gmail_parser._actions
+        if action.dest == "force_backfill"
+    )
+
+    assert "120-day" in force_backfill_action.help
+    assert "12-month" not in force_backfill_action.help
+
+
 def _gmail_settings(tmp_path):
     return GmailSettings(
         client_id="client",

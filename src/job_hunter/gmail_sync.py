@@ -9,12 +9,14 @@ from job_hunter.gmail_classifier import (
     classify_email,
     source_candidate_key,
 )
+from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.gmail_client import GmailHistoryExpired
 from job_hunter.gmail_linkedin_cleanup import release_legacy_blank_linkedin_jobs
 from job_hunter.gmail_matching import match_job
 from job_hunter.gmail_models import (
     AUTO_CONFIDENCE_THRESHOLD,
     DISCOVERY_FRESHNESS_DAYS,
+    MATCH_RECENCY_DAYS,
     GmailClassification,
     GmailMessage,
     GmailSyncSummary,
@@ -38,9 +40,8 @@ def _query_after(year: int, month: int, day: int) -> str:
 
 
 def build_backfill_query(now: datetime) -> str:
-    year = now.year - 1
-    day = min(now.day, 28) if now.month == 2 else now.day
-    return _query_after(year, now.month, day)
+    start = now - timedelta(days=MATCH_RECENCY_DAYS)
+    return _query_after(start.year, start.month, start.day)
 
 
 class GmailSyncService:
@@ -105,11 +106,13 @@ class GmailSyncService:
             message_ids = self._search_message_ids(build_backfill_query(now))
             self._backfill_now = now
             try:
-                had_hard_errors, deferred_unprocessed = self._process_message_ids(
-                    message_ids,
-                    summary=summary,
-                    dry_run=dry_run,
-                    max_unprocessed=self.backfill_batch_size,
+                had_hard_errors, deferred_unprocessed, quota_paused = (
+                    self._process_message_ids(
+                        message_ids,
+                        summary=summary,
+                        dry_run=dry_run,
+                        max_unprocessed=self.backfill_batch_size,
+                    )
                 )
                 _LOGGER.info(
                     "gmail_backfill_batch candidates=%s batch_size=%s deferred=%s",
@@ -119,7 +122,12 @@ class GmailSyncService:
                 )
             finally:
                 self._backfill_now = None
-            if not dry_run and not had_hard_errors and deferred_unprocessed == 0:
+            if (
+                not dry_run
+                and not had_hard_errors
+                and not quota_paused
+                and deferred_unprocessed == 0
+            ):
                 self.store.save_gmail_sync_state(
                     account_id=account_id,
                     history_id=checkpoint_history_id,
@@ -166,13 +174,13 @@ class GmailSyncService:
             )
             next_history_id = checkpoint_history_id
 
-        had_hard_errors, deferred_unprocessed = self._process_message_ids(
+        had_hard_errors, deferred_unprocessed, quota_paused = self._process_message_ids(
             message_ids,
             summary=summary,
             dry_run=dry_run,
         )
         assert deferred_unprocessed == 0
-        if dry_run or had_hard_errors:
+        if dry_run or had_hard_errors or quota_paused:
             return
 
         self.store.save_gmail_sync_state(
@@ -185,7 +193,11 @@ class GmailSyncService:
     def process_message(
         self, message: GmailMessage, dry_run: bool
     ) -> GmailClassification:
-        classification = classify_email(message, self.gemini)
+        # Freshness must be computed before classify_email decides whether to
+        # request job-alert extraction: a gate applied only afterwards would
+        # still have spent the Gemini call it's supposed to avoid.
+        is_fresh = self._alert_is_fresh(message)
+        classification = classify_email(message, self.gemini, is_fresh=is_fresh)
         effective = classification
 
         if dry_run:
@@ -200,7 +212,7 @@ class GmailSyncService:
             return effective
 
         should_stage_jobs = classification.kind == "RECRUITER_CONTACT" or (
-            classification.kind == "JOB_ALERT" and self._alert_is_fresh(message)
+            classification.kind == "JOB_ALERT" and is_fresh
         )
         if should_stage_jobs:
             for job in classification.jobs:
@@ -305,8 +317,9 @@ class GmailSyncService:
         summary: GmailSyncSummary,
         dry_run: bool,
         max_unprocessed: int | None = None,
-    ) -> tuple[bool, int]:
+    ) -> tuple[bool, int, bool]:
         had_hard_errors = False
+        quota_paused = False
         attempted_unprocessed = 0
         deferred_unprocessed = 0
         for message_id in message_ids:
@@ -336,6 +349,20 @@ class GmailSyncService:
                     self.gmail.get_message(message_id),
                     dry_run=dry_run,
                 )
+            except (GeminiQuotaPaused, GeminiBudgetExceeded) as exc:
+                # The circuit breaker is open (or our own ceiling is): stop
+                # attempting further messages rather than hammering a paused
+                # API. This message was never recorded, so it stays
+                # unprocessed and will be retried on the next sync; the
+                # cursor/backfill-completion gate below must not advance
+                # past it either.
+                _LOGGER.warning(
+                    "gmail_quota_paused_stopping_batch message_id=%s reason=%s",
+                    message_id,
+                    exc,
+                )
+                quota_paused = True
+                break
             except SemanticClassificationError as exc:
                 _LOGGER.warning(
                     "gmail_semantic_classification_failed message_id=%s reason=%s detail=%s",
@@ -361,7 +388,7 @@ class GmailSyncService:
                 summary.irrelevant += 1
             elif classification.kind in _LIFECYCLE_KINDS:
                 summary.application_events += 1
-        return had_hard_errors, deferred_unprocessed
+        return had_hard_errors, deferred_unprocessed, quota_paused
 
     @staticmethod
     def _log_summary(summary: GmailSyncSummary) -> None:
