@@ -103,6 +103,7 @@ def test_r2_schema_upgrades_legacy_jobs_table(tmp_path):
     assert "ats_provider" in columns
     assert "ats_board" in columns
     assert "ats_job_id" in columns
+    assert "market_id" in columns
     assert store.count_jobs() == 1
     tables = {
         row["name"]
@@ -110,6 +111,12 @@ def test_r2_schema_upgrades_legacy_jobs_table(tmp_path):
     }
     assert "job_sources" in tables
     assert "company_watch" in tables
+
+
+def test_evaluations_table_has_market_id_column():
+    store = JobStore(":memory:")
+    columns = {row["name"] for row in store._conn.execute("PRAGMA table_info(evaluations)")}
+    assert "market_id" in columns
 
 
 def test_gemini_usage_rows_persist_success_without_prompt_or_response_content():
@@ -660,6 +667,40 @@ def test_get_evaluation_and_material_roundtrip(tmp_path):
     fetched_job = store.get_job(job_id)
     assert fetched_job is not None
     assert fetched_job.company == "Acme"
+
+
+def test_job_market_round_trip(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_logical_job(
+        Job(source="x", title="Senior Frontend Engineer", location="London")
+    )
+
+    assert store.get_job(job_id).market_id is None
+
+    store.set_job_market(job_id, "london")
+    assert store.get_job(job_id).market_id == "london"
+
+
+def test_set_job_market_treats_none_as_unset(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_logical_job(
+        Job(source="x", title="Senior Frontend Engineer", location="London")
+    )
+    store.set_job_market(job_id, "london")
+
+    store.set_job_market(job_id, None)
+    assert store.get_job(job_id).market_id is None
+
+
+def test_evaluation_market_id_round_trip(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer", company="Acme")
+    job_id, _, _ = store.upsert_job(job)
+
+    store.save_evaluation(job_id, _evaluation(job_id, market_id="london"))
+    evaluation = store.get_evaluation(job_id)
+    assert evaluation is not None
+    assert evaluation.market_id == "london"
 
 
 def test_gmail_persistence_schema_minimizes_private_email_data(tmp_path):

@@ -131,6 +131,7 @@ class Evaluation:
     rationale: str
     model: str
     status: str = "ok"
+    market_id: str = ""
 
 
 @dataclass(slots=True)

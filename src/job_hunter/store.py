@@ -47,6 +47,7 @@ _R2_JOB_COLUMNS = {
     "ats_provider": "TEXT",
     "ats_board": "TEXT",
     "ats_job_id": "TEXT",
+    "market_id": "TEXT NOT NULL DEFAULT ''",
 }
 
 _CREATE_JOB_SOURCES = """
@@ -104,6 +105,8 @@ CREATE TABLE IF NOT EXISTS evaluations (
     evaluated_at           TEXT    NOT NULL
 )
 """
+
+_MARKET_EVALUATION_COLUMNS = {"market_id": "TEXT NOT NULL DEFAULT ''"}
 
 _CREATE_MATERIALS = """
 CREATE TABLE IF NOT EXISTS materials (
@@ -292,6 +295,7 @@ class JobStore:
             self._conn.execute(_CREATE_JOB_SOURCES)
             self._conn.execute(_CREATE_COMPANY_WATCH)
             self._conn.execute(_CREATE_EVALUATIONS)
+            self._add_missing_columns("evaluations", _MARKET_EVALUATION_COLUMNS)
             self._conn.execute(_CREATE_MATERIALS)
             self._conn.execute(_CREATE_DELIVERIES)
             self._conn.execute(_CREATE_GEMINI_USAGE)
@@ -305,12 +309,15 @@ class JobStore:
             self._conn.execute(_CREATE_REVIEW_DELIVERIES)
 
     def _migrate_jobs_to_r2_schema(self) -> None:
-        columns = {
-            row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")
+        self._add_missing_columns("jobs", _R2_JOB_COLUMNS)
+
+    def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
+        existing = {
+            row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")
         }
-        for name, definition in _R2_JOB_COLUMNS.items():
-            if name not in columns:
-                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        for name, definition in columns.items():
+            if name not in existing:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     # ------------------------------------------------------------------
     # Gemini persistence
@@ -1053,6 +1060,14 @@ class JobStore:
         matching_ids = self._find_job_ids(query, parameters)
         return matching_ids[0] if len(matching_ids) == 1 else None
 
+    def set_job_market(self, job_id: int, market_id: str | None) -> None:
+        """Persist the primary market a job has been attributed to."""
+        with self._conn:
+            self._conn.execute(
+                "UPDATE jobs SET market_id = ? WHERE id = ?",
+                (market_id or "", job_id),
+            )
+
     # ------------------------------------------------------------------
     # Company watch operations
     # ------------------------------------------------------------------
@@ -1611,8 +1626,8 @@ class JobStore:
                     (job_id, total_score, scores_json, decision,
                      hard_blockers_json, strengths_json, gaps_json,
                      salary_note, location_note, rationale, model, status,
-                     description_hash_at_eval, evaluated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     market_id, description_hash_at_eval, evaluated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1627,6 +1642,7 @@ class JobStore:
                     evaluation.rationale,
                     evaluation.model,
                     evaluation.status,
+                    evaluation.market_id,
                     description_hash,
                     _now_iso(),
                 ),
@@ -1709,7 +1725,7 @@ class JobStore:
         row = self._conn.execute(
             """
             SELECT source, title, company, location, url, description,
-                   source_job_id, remote
+                   source_job_id, remote, market_id
             FROM jobs WHERE id = ?
             """,
             (job_id,),
@@ -1725,6 +1741,7 @@ class JobStore:
             description=row["description"],
             source_job_id=row["source_job_id"],
             remote=None if row["remote"] is None else bool(row["remote"]),
+            market_id=row["market_id"] or None,
         )
 
     def get_evaluation(self, job_id: int) -> Evaluation | None:
@@ -1732,7 +1749,7 @@ class JobStore:
             """
             SELECT total_score, scores_json, decision, hard_blockers_json,
                    strengths_json, gaps_json, salary_note, location_note,
-                   rationale, model, status
+                   rationale, model, status, market_id
             FROM evaluations
             WHERE job_id = ?
             ORDER BY id DESC
@@ -1755,6 +1772,7 @@ class JobStore:
             rationale=row["rationale"],
             model=row["model"],
             status=row["status"],
+            market_id=row["market_id"],
         )
 
     def get_material(self, job_id: int) -> Material | None:
