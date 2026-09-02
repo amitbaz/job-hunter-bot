@@ -67,6 +67,26 @@ def test_request_raises_after_exhausting_retries_on_connection_error(monkeypatch
         pass
 
 
+def test_request_exception_retry_can_be_disabled(monkeypatch):
+    monkeypatch.setattr("job_hunter.http.time.sleep", lambda _: None)
+    attempts = {"n": 0}
+
+    def fake_request(method, url, **kwargs):
+        attempts["n"] += 1
+        raise requests.ConnectionError("boom")
+
+    client = HttpClient()
+    monkeypatch.setattr(client._session, "request", fake_request)
+
+    try:
+        client.get("https://example.com/thing", retry_exceptions=False)
+        assert False, "expected ConnectionError to propagate"
+    except requests.ConnectionError:
+        pass
+
+    assert attempts["n"] == 1
+
+
 def test_retry_status_codes_override_excludes_429_from_retry(monkeypatch):
     monkeypatch.setattr("job_hunter.http.time.sleep", lambda _: None)
 
