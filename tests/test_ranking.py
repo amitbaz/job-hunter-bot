@@ -1,5 +1,6 @@
 from job_hunter.models import CandidatePreferences, Job, SearchPolicy
 from job_hunter.ranking import (
+    market_priority_bonus,
     priority_score,
     profile_priority_score,
     rank_jobs,
@@ -221,37 +222,48 @@ def test_london_hybrid_gets_nonzero_location_fit():
     assert profile_priority_score(job, make_preferences(), policy) > 0
 
 
-def test_strong_london_role_can_outrank_weak_germany_role():
-    # Germany is the highest-priority market (first in policy.markets), so its
-    # market_priority_bonus outweighs London's. A much stronger overall London
-    # candidate should still outrank a weak Germany candidate: the market
-    # bonus must be a modest nudge, not an absolute partition.
+def test_small_quality_edge_survives_max_market_bonus_swing():
+    # market_priority_bonus ranges from len(policy.markets) (index 0, germany_eu
+    # = 6) down to 1 (index 5, secondary_eu_relocation): the largest possible
+    # bonus delta between two configured markets in this policy is 6 - 1 = 5.
+    # This test pits a *lower*-bonus candidate (secondary_eu_relocation, bonus
+    # 1) with only a small, deliberate quality edge on the non-bonus axes
+    # against a *higher*-bonus candidate (germany_eu, bonus 6) that is
+    # otherwise slightly stronger on location fit. The quality edge here is 8
+    # points (extra signal-coverage matches) against germany's 2-point location
+    # advantage, netting a 6-point non-bonus edge for the weaker-bonus
+    # candidate -- just enough to clear the 5-point max bonus swing. If
+    # market_priority_bonus were miscalibrated to be larger than a handful of
+    # points, this assertion would flip and fail, proving the bonus stays a
+    # modest nudge rather than an absolute partition.
     policy = make_market_policy()
     preferences = make_preferences()
-    strong_london = Job(
+
+    higher_bonus_lower_quality = Job(
         source="ashby",
         title="Senior Frontend Engineer",
         company="A",
-        location="London",
+        location="Berlin",
         remote=False,
-        market_id="london",
-        description="React TypeScript design system mentorship architecture",
+        market_id="germany_eu",  # bonus 6 (index 0)
+        description="React TypeScript backend services",  # must-have signals only
     )
-    weak_germany = Job(
-        source="duckduckgo",
-        title="Backend Developer",
+    lower_bonus_higher_quality = Job(
+        source="ashby",
+        title="Senior Frontend Engineer",
         company="B",
-        location="",
+        location="Amsterdam",
         remote=False,
-        market_id="germany_eu",
-        description="Some role at a startup.",
+        market_id="secondary_eu_relocation",  # bonus 1 (index 5)
+        description="React TypeScript design system mentorship growth",  # must-have + both nice-to-have signals
     )
-    assert profile_priority_score(strong_london, preferences, policy) > profile_priority_score(weak_germany, preferences, policy)
+
+    assert market_priority_bonus(higher_bonus_lower_quality, policy) - market_priority_bonus(lower_bonus_higher_quality, policy) == 5
+    assert profile_priority_score(lower_bonus_higher_quality, preferences, policy) > profile_priority_score(higher_bonus_lower_quality, preferences, policy)
 
 
 def test_market_priority_bonus_rewards_higher_priority_market():
     policy = make_market_policy()
-    from job_hunter.ranking import market_priority_bonus
 
     germany_job = Job(source="ashby", title="x", market_id="germany_eu")
     london_job = Job(source="ashby", title="x", market_id="london")
