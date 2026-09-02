@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import logging
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.discovery_queries import generate_search_queries
 from job_hunter.models import Settings
 from job_hunter.search_backend import build_search_backend
+from job_hunter.search_budget import (
+    SearchUsageLedger,
+    brave_queries_available_today,
+    split_queries_for_brave,
+)
 
 from .arbeitnow import ArbeitnowSource
 from .ashby import AshbySource
@@ -24,6 +30,9 @@ from .remoteok import RemoteOKSource
 from .targeted_search import TargetedSearchSource
 from .weworkremotely import WeWorkRemotelySource
 from .yc import YCSource
+
+logger = logging.getLogger(__name__)
+_DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT = 250
 
 __all__ = [
     "JobSource",
@@ -46,6 +55,28 @@ __all__ = [
 ]
 
 
+def _brave_monthly_query_limit() -> int:
+    raw = os.environ.get(
+        "BRAVE_MONTHLY_QUERY_LIMIT",
+        str(_DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT),
+    ).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "invalid BRAVE_MONTHLY_QUERY_LIMIT=%r; disabling Brave to fail safe",
+            raw,
+        )
+        return 0
+    if value <= 0:
+        logger.warning(
+            "non-positive BRAVE_MONTHLY_QUERY_LIMIT=%r; disabling Brave to fail safe",
+            raw,
+        )
+        return 0
+    return value
+
+
 def build_sources(
     settings: Settings,
     http,
@@ -54,18 +85,61 @@ def build_sources(
 ) -> list[JobSource]:
     queries = generate_search_queries(settings.policy, query_date)
     brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
-    targeted_source: JobSource
+    targeted_sources: list[JobSource] = []
+
     if brave_api_key:
-        targeted_source = TargetedSearchSource(
-            build_search_backend(http, brave_api_key),
-            queries,
-            breaker=search_breaker,
+        ledger = SearchUsageLedger(settings.db_path)
+        now = datetime.now(timezone.utc)
+        monthly_limit = _brave_monthly_query_limit()
+        brave_limit = brave_queries_available_today(
+            ledger,
+            monthly_limit=monthly_limit,
+            now=now,
         )
-    else:
-        targeted_source = DuckDuckGoSource(
-            http,
+        brave_queries, fallback_queries = split_queries_for_brave(
             queries,
-            breaker=search_breaker,
+            limit=brave_limit,
+        )
+
+        logger.info(
+            "Brave search budget: monthly_limit=%s available_today=%s selected=%s fallback=%s",
+            monthly_limit,
+            brave_limit,
+            len(brave_queries),
+            len(fallback_queries),
+        )
+
+        if brave_queries:
+            targeted_sources.append(
+                TargetedSearchSource(
+                    build_search_backend(
+                        http,
+                        brave_api_key,
+                        enable_brave=True,
+                        on_brave_attempt=lambda: ledger.record(
+                            provider="brave",
+                            occurred_at=datetime.now(timezone.utc),
+                        ),
+                    ),
+                    brave_queries,
+                    breaker=search_breaker,
+                )
+            )
+        if fallback_queries:
+            targeted_sources.append(
+                DuckDuckGoSource(
+                    http,
+                    fallback_queries,
+                    breaker=search_breaker,
+                )
+            )
+    else:
+        targeted_sources.append(
+            DuckDuckGoSource(
+                http,
+                queries,
+                breaker=search_breaker,
+            )
         )
 
     sources: list[JobSource] = [
@@ -76,7 +150,7 @@ def build_sources(
         RemoteOKSource(http),
         WeWorkRemotelySource(http),
         HackerNewsHiringSource(http),
-        targeted_source,
+        *targeted_sources,
     ]
     if settings.policy.yc_job_pages:
         sources.append(YCSource(http, settings.policy.yc_job_pages))
