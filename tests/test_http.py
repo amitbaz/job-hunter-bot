@@ -67,7 +67,7 @@ def test_request_raises_after_exhausting_retries_on_connection_error(monkeypatch
         pass
 
 
-def test_request_exception_retry_can_be_disabled(monkeypatch):
+def test_request_retries_can_be_disabled(monkeypatch):
     monkeypatch.setattr("job_hunter.http.time.sleep", lambda _: None)
     attempts = {"n": 0}
 
@@ -79,7 +79,7 @@ def test_request_exception_retry_can_be_disabled(monkeypatch):
     monkeypatch.setattr(client._session, "request", fake_request)
 
     try:
-        client.get("https://example.com/thing", retry_exceptions=False)
+        client.get("https://example.com/thing", retry=False)
         assert False, "expected ConnectionError to propagate"
     except requests.ConnectionError:
         pass
