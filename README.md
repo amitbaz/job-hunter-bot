@@ -90,6 +90,32 @@ manual_company_watch:
 
 Manual entries are synchronized idempotently and preserved: automatic promotion cannot replace a manual ownership marker or downgrade its stronger ATS endpoint. Company-watch checks use only the configured public ATS endpoint or public careers URL. Each check records either a success or a failure. After exactly three consecutive failures, the watch pauses for 24 hours; it is retried when that pause expires. A failed retry starts another 24-hour pause, while a successful retry clears the failure count and removes the pause. A failure for one watch does not stop the remaining discovery sources.
 
+### Market-driven search
+
+When `markets:` exists in `config/search.yml`, it is authoritative.
+List order is priority order. `query_share` divides the bounded
+`max_search_queries_per_run` budget, while every enabled market receives
+at least one slot when the budget permits it.
+
+Each market owns locations, required languages, gross base salary floor,
+remote/relocation behavior, sponsorship policy, source domains, and query templates.
+Unknown salary/sponsorship is not rejection; explicit incompatibility is.
+
+A job is attributed to exactly one market: the highest-scoring enabled market wins, scored from strongest to weakest evidence (an explicit `job.location` match, then explicit remote country/region scope in the location/description, then sponsorship/relocation language tied to a market, then the query-time market hint), with ties broken by configured order and no-evidence jobs falling back to the first enabled market. A city listed under a market's `salary.location_floors` (for example San Francisco under `us_nyc_sf`) overrides that market's overall `gross_base_floor` for jobs attributed there.
+
+The six configured markets, in priority (list) order, with their approved gross base salary floors:
+
+| Market | `query_share` | Locations | Salary floor | Sponsorship |
+| --- | --- | --- | --- | --- |
+| `germany_eu` | 0.35 | Berlin, Germany, Europe | EUR 90,000 | not required |
+| `israel_remote` | 0.25 | Israel, Tel Aviv | ILS 420,000 | not required |
+| `london` | 0.17 | London, UK, United Kingdom | GBP 90,000 | required |
+| `singapore` | 0.10 | Singapore | SGD 120,000 | required |
+| `us_nyc_sf` | 0.10 | New York, NYC, San Francisco, Bay Area | USD 180,000 (San Francisco/Bay Area: 200,000) | required |
+| `secondary_eu_relocation` | 0.03 | Amsterdam, Paris, Barcelona | EUR 70,000 (Amsterdam: 90,000; Paris: 80,000) | not required |
+
+Normal tuning — shifting how much search volume a market gets, which job boards are preferred first within a market, or which query phrasing is tried first — should change `query_share`, the order of `source_domains`, or the order of `query_templates` for the relevant market in `config/search.yml`. It should not require code changes.
+
 ## Required GitHub secrets
 
 Set these under **Settings -> Secrets and variables -> Actions** on your fork/repo:
