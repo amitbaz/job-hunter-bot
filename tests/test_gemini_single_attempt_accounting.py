@@ -39,7 +39,7 @@ class FakeTracker:
         self.error_calls.append((purpose, prompt, now, kwargs))
 
 
-def test_gemini_disables_status_and_exception_retries():
+def test_gemini_disables_automatic_retries():
     http = CapturingHttp(FakeResponse(503, None, "high demand"))
     tracker = FakeTracker()
     client = GeminiClient("key", "gemini-3.6-flash", http, tracker)
@@ -49,8 +49,8 @@ def test_gemini_disables_status_and_exception_retries():
 
     assert len(http.calls) == 1
     _, kwargs = http.calls[0]
-    assert kwargs["retry_status_codes"] == set()
-    assert kwargs["retry_exceptions"] is False
+    assert kwargs["retry_status_codes"] == {500, 502, 503, 504}
+    assert kwargs["retry"] is False
     assert len(tracker.error_calls) == 1
     assert tracker.error_calls[0][3] == {"http_status": 503}
 
