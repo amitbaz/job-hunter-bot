@@ -52,10 +52,22 @@ def build_sources(
     search_breaker: CircuitBreaker | None = None,
     query_date: date | None = None,
 ) -> list[JobSource]:
-    targeted_backend = build_search_backend(
-        http,
-        os.environ.get("BRAVE_SEARCH_API_KEY"),
-    )
+    queries = generate_search_queries(settings.policy, query_date)
+    brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+    targeted_source: JobSource
+    if brave_api_key:
+        targeted_source = TargetedSearchSource(
+            build_search_backend(http, brave_api_key),
+            queries,
+            breaker=search_breaker,
+        )
+    else:
+        targeted_source = DuckDuckGoSource(
+            http,
+            queries,
+            breaker=search_breaker,
+        )
+
     sources: list[JobSource] = [
         RemotiveSource(http),
         ArbeitnowSource(http),
@@ -64,11 +76,7 @@ def build_sources(
         RemoteOKSource(http),
         WeWorkRemotelySource(http),
         HackerNewsHiringSource(http),
-        TargetedSearchSource(
-            targeted_backend,
-            generate_search_queries(settings.policy, query_date),
-            breaker=search_breaker,
-        ),
+        targeted_source,
     ]
     if settings.policy.yc_job_pages:
         sources.append(YCSource(http, settings.policy.yc_job_pages))
