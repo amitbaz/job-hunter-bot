@@ -18,7 +18,7 @@ from job_hunter.sources import (
     build_sources,
 )
 from job_hunter.store import JobStore
-from tests.market_fixtures import make_market
+from tests.market_fixtures import make_market, make_market_policy
 
 
 _DUCKDUCKGO_HTML = """
@@ -389,11 +389,64 @@ def test_build_sources_includes_always_on_and_configured_ats(fake_http, policy):
     assert "ArbeitnowSource" in kinds
     assert "JobicySource" in kinds
     assert "HimalayasSource" in kinds
-    assert "DuckDuckGoSource" in kinds
+    assert "DuckDuckGoSource" not in kinds
     assert "AshbySource" in kinds
     assert "LeverSource" in kinds
     assert "GreenhouseSource" in kinds
     assert "LearnedAtsSource" not in kinds
+
+
+def test_build_sources_uses_only_brave_for_metered_market_discovery(
+    fake_http, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "brave-key")
+    monkeypatch.setattr(
+        "job_hunter.sources.brave_queries_available_today",
+        lambda *args, **kwargs: 2,
+    )
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=make_market_policy(),
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+        db_path=str(tmp_path / "state.sqlite3"),
+    )
+
+    sources = build_sources(settings, fake_http)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert kinds.count("TargetedSearchSource") == 1
+    assert "DuckDuckGoSource" not in kinds
+
+
+def test_build_sources_skips_market_discovery_sources_without_brave_key(
+    fake_http, policy, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+        db_path=str(tmp_path / "state.sqlite3"),
+    )
+    store = JobStore(str(tmp_path / "store.sqlite3"))
+
+    sources = build_sources(settings, fake_http, store=store)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "TargetedSearchSource" not in kinds
+    assert "DuckDuckGoSource" not in kinds
+    assert "AshbySource" in kinds
+    assert "LeverSource" in kinds
+    assert "GreenhouseSource" in kinds
+    assert "LearnedAtsSource" in kinds
 
 
 def test_build_sources_appends_learned_ats_source_when_store_is_given(

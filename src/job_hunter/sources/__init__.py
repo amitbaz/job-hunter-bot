@@ -7,7 +7,7 @@ from datetime import date, datetime, timezone
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.discovery_queries import generate_search_queries
 from job_hunter.models import Settings
-from job_hunter.search_backend import build_search_backend
+from job_hunter.search_backend import BraveSearchBackend
 from job_hunter.search_budget import (
     SearchUsageLedger,
     brave_queries_available_today,
@@ -106,27 +106,26 @@ def build_sources(
             monthly_limit=monthly_limit,
             now=now,
         )
-        brave_queries, fallback_queries = split_queries_for_brave(
+        brave_queries, deferred_queries = split_queries_for_brave(
             queries,
             limit=brave_limit,
         )
 
         logger.info(
-            "Brave search budget: monthly_limit=%s available_today=%s selected=%s fallback=%s",
+            "Brave source-discovery budget: monthly_limit=%s available_today=%s selected=%s deferred=%s",
             monthly_limit,
             brave_limit,
             len(brave_queries),
-            len(fallback_queries),
+            len(deferred_queries),
         )
 
         if brave_queries:
             targeted_sources.append(
                 TargetedSearchSource(
-                    build_search_backend(
+                    BraveSearchBackend(
                         http,
                         brave_api_key,
-                        enable_brave=True,
-                        on_brave_attempt=lambda: ledger.record(
+                        on_attempt=lambda: ledger.record(
                             provider="brave",
                             occurred_at=datetime.now(timezone.utc),
                         ),
@@ -135,22 +134,6 @@ def build_sources(
                     breaker=search_breaker,
                 )
             )
-        if fallback_queries:
-            targeted_sources.append(
-                DuckDuckGoSource(
-                    http,
-                    fallback_queries,
-                    breaker=search_breaker,
-                )
-            )
-    else:
-        targeted_sources.append(
-            DuckDuckGoSource(
-                http,
-                queries,
-                breaker=search_breaker,
-            )
-        )
 
     sources: list[JobSource] = [
         RemotiveSource(http),
