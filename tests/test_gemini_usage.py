@@ -65,6 +65,25 @@ def _record_attempts(
 
 
 # ---------------------------------------------------------------------------
+# Step 0: GeminiQuotaSettings validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field_name", ["rpm", "tpm", "rpd", "rate_pause_seconds"])
+@pytest.mark.parametrize("bad_value", [0, -1])
+def test_gemini_quota_settings_rejects_non_positive_fields(field_name, bad_value):
+    kwargs = dict(rpm=10, tpm=1000, rpd=100, rate_pause_seconds=90)
+    kwargs[field_name] = bad_value
+    with pytest.raises(ValueError, match=field_name):
+        GeminiQuotaSettings(**kwargs)
+
+
+def test_gemini_quota_settings_accepts_all_positive_fields():
+    # Regression guard: a valid construction must not raise.
+    GeminiQuotaSettings(rpm=10, tpm=1000, rpd=100, rate_pause_seconds=1)
+
+
+# ---------------------------------------------------------------------------
 # Step 1: token estimation and Pacific-day tests
 # ---------------------------------------------------------------------------
 
@@ -297,6 +316,59 @@ def test_pause_blocks_before_any_budget_check_and_records_no_ledger_row(store, t
         "2026-09-01T00:00:00+00:00", "2026-09-02T00:00:00+00:00", model=MODEL
     )
     assert len(rows_after) == count_before
+
+
+def test_record_429_returns_the_persisted_pause_pair(store, tracker):
+    """A caller must be able to raise GeminiQuotaPaused directly from this
+    return value instead of re-querying store state via a second preflight()
+    call (see gemini.py's 429 handling)."""
+    paused_until, reason = tracker.record_429("job_evaluation", "job", NOW, kind="daily_quota")
+
+    pause = store.get_gemini_pause(MODEL)
+    assert (paused_until, reason) == (pause["paused_until"], pause["reason"])
+
+
+def test_record_429_return_value_survives_a_later_expired_or_overwritten_pause(
+    store, tracker
+):
+    """Regression: record_429's return must reflect what it itself computed
+    and wrote at call time, not whatever the store happens to hold later.
+
+    This used to matter because the old call site re-ran preflight() right
+    after record_429() using the *same* `now`; with `rate_pause_seconds=0`
+    (now rejected by GeminiQuotaSettings.__post_init__) that made the freshly
+    persisted pause already look expired, and the exception surfaced as a
+    bare GeminiError instead of GeminiQuotaPaused. `rate_pause_seconds=0` is
+    no longer constructible, so this test proves the same failure mode is
+    closed by construction: tampering with the store after the fact cannot
+    change what record_429 already returned.
+    """
+    paused_until, reason = tracker.record_429("job_evaluation", "job", NOW, kind="rate_limit")
+
+    store.set_gemini_pause(MODEL, (NOW - timedelta(seconds=1)).isoformat(), "rate_limit")
+
+    assert reason == "rate_limit"
+    assert datetime.fromisoformat(paused_until) > NOW
+
+
+def test_record_429_writes_exactly_one_row_regardless_of_daily_ceiling(store):
+    """Regression: record_429 must never trip the daily budget check on the
+    quota_429 row it is about to write. Previously, calling preflight() again
+    right after record_429() counted that just-written row and, with a tight
+    rpd ceiling, raised GeminiBudgetExceeded plus a spurious extra
+    blocked_budget row for a call that indisputably reached Google. record_429
+    itself never calls preflight, so this must hold no matter how full the
+    ceiling is.
+    """
+    tight_quota = _quota(rpd=2)
+    tracker = GeminiUsageTracker(store, tight_quota, MODEL, run_id="run-1")
+
+    tracker.record_429("job_evaluation", "job", NOW, kind="unknown")
+
+    rows = store.gemini_usage_rows(
+        "2026-09-01T00:00:00+00:00", "2026-09-02T00:00:00+00:00", model=MODEL
+    )
+    assert [row["status"] for row in rows] == ["quota_429"]
 
 
 def test_preflight_rejects_naive_datetime(tracker):

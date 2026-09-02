@@ -180,6 +180,22 @@ class GeminiQuotaSettings:
     core_reserve_ratio: float = 0.25
     rate_pause_seconds: int = 90
 
+    def __post_init__(self) -> None:
+        # config.py's _require_positive_int_env already rejects a non-positive
+        # rpm/tpm/rpd from the environment; this guard closes the same gap for
+        # any other construction path (tests, future callers) so it can never
+        # contradict that validation, only extend it. rate_pause_seconds has
+        # no env-level guard at all today, and a non-positive value is the
+        # root cause of a real correctness bug: a zero-length rate-limit pause
+        # (`paused_until == now`) makes GeminiUsageTracker.record_429's caller
+        # look paused-and-already-expired in the same instant, so a 429 could
+        # surface as the wrong exception type. See gemini.py's 429 handling.
+        for field_name in ("rpm", "tpm", "rpd", "rate_pause_seconds"):
+            if getattr(self, field_name) <= 0:
+                raise ValueError(
+                    f"GeminiQuotaSettings.{field_name} must be a positive integer"
+                )
+
 
 @dataclass(frozen=True, slots=True)
 class GeminiUsageSummary:

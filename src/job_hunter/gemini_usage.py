@@ -228,13 +228,20 @@ class GeminiUsageTracker:
         *,
         kind: GeminiPauseKind,
         error_code: str | None = None,
-    ) -> None:
+    ) -> tuple[str, str]:
         """Log a 429 and trip the persisted pause matching what Google reported.
 
         `kind` is the caller's classification of the 429 body: `daily_quota`
         pauses until the next Pacific-day reset, `rate_limit` pauses for
         `rate_pause_seconds`, and `unknown` pauses the same conservative
         `rate_pause_seconds` rather than assuming the shorter or longer case.
+
+        Returns the exact `(paused_until_iso, reason)` pair just persisted, so
+        a caller can raise `GeminiQuotaPaused` directly from these values.
+        Do not re-derive the pause by calling `preflight` again afterward: that
+        re-runs the daily budget check, which counts the `quota_429` row this
+        method just wrote and can trip `GeminiBudgetExceeded` instead — the
+        wrong exception type for a call that indisputably reached Google.
         """
         now = _normalize_utc(now)
         if kind == "daily_quota":
@@ -242,7 +249,8 @@ class GeminiUsageTracker:
         else:
             paused_until = now + timedelta(seconds=self._quota.rate_pause_seconds)
 
-        self._store.set_gemini_pause(self._model, paused_until.isoformat(), kind)
+        paused_until_iso = paused_until.isoformat()
+        self._store.set_gemini_pause(self._model, paused_until_iso, kind)
         self._store.record_gemini_usage(
             occurred_at=now.isoformat(),
             run_id=self._run_id,
@@ -253,6 +261,7 @@ class GeminiUsageTracker:
             http_status=429,
             error_code=error_code,
         )
+        return paused_until_iso, kind
 
     def snapshot(
         self, now: datetime, run_id: str | None = None

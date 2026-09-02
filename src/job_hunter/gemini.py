@@ -4,6 +4,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
+from job_hunter.gemini_usage import GeminiQuotaPaused
+
 if TYPE_CHECKING:
     import requests
 
@@ -27,10 +29,17 @@ def _now() -> datetime:
 def _classify_429(response: requests.Response) -> tuple[GeminiPauseKind, str | None]:
     """Classify a Gemini 429 body into one of the design spec's three pause kinds.
 
-    Looks for daily-quota indicators (`quota_exceeded`, a `PerDay` quota id) versus
-    minute-rate indicators (`rate_limit_exceeded`, `too_many_requests`, a `PerMinute`
-    quota id) across the error's status/message/details. An unparsable body or one
-    matching neither classifies as `unknown`, which is paused just as conservatively.
+    The real signal is the structured `quotaId`/`quotaMetric` substring match on
+    `PerDay` vs `PerMinute`: those are realistic against Google's actual
+    free-tier quota IDs (e.g.
+    `GenerateRequestsPerDayPerProjectPerModel-FreeTier`). The snake_case
+    message-text markers (`quota_exceeded`, `rate_limit_exceeded`,
+    `too_many_requests`) are a cheap extra signal but are unlikely to appear
+    verbatim in Google's actual prose error text — they are effectively
+    fixture-shaped, matching this module's own test bodies more than anything
+    Google is documented to return. Kept anyway because it's harmless and
+    costs nothing when it doesn't match. An unparsable body or one matching
+    neither classifies as `unknown`, which is paused just as conservatively.
     """
     try:
         body = response.json()
@@ -127,11 +136,24 @@ class GeminiClient:
         if response.status_code == 429:
             kind, error_code = _classify_429(response)
             if self._tracker is not None:
-                self._tracker.record_429(purpose, prompt, now, kind=kind, error_code=error_code)
-                # Re-running preflight surfaces the pause we just persisted as a
-                # GeminiQuotaPaused with the exact paused_until/reason the tracker
-                # computed, instead of duplicating that policy here.
-                self._tracker.preflight(purpose, prompt, now)
+                # INVARIANT: every 429, of every kind, raises GeminiQuotaPaused
+                # directly from what record_429 just persisted, writes exactly
+                # one `quota_429` row, and writes zero `blocked_budget` rows —
+                # regardless of rate_pause_seconds or how full the daily
+                # budget is. Never re-derive the pause via a second
+                # preflight() call: that re-runs the daily budget check, which
+                # counts the quota_429 row just written and can trip
+                # GeminiBudgetExceeded instead — the wrong exception type for
+                # a call that indisputably reached Google. Tasks 5-8 branch on
+                # GeminiQuotaPaused specifically.
+                paused_until, reason = self._tracker.record_429(
+                    purpose, prompt, now, kind=kind, error_code=error_code
+                )
+                raise GeminiQuotaPaused(
+                    f"Gemini {self.model} is paused until {paused_until} ({reason})",
+                    paused_until=paused_until,
+                    reason=reason,
+                )
             raise GeminiError(f"Gemini API error 429: {response.text}")
 
         if response.status_code >= 400:

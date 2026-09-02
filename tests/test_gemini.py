@@ -360,3 +360,54 @@ def test_generate_text_pause_blocks_subsequent_call_without_new_http_request(mon
     # The second call was refused locally by the tracker's preflight; no
     # second HTTP request was ever sent.
     assert len(http.calls) == 1
+
+
+def test_generate_text_429_does_not_reinvoke_preflight_after_record_429(monkeypatch):
+    """Regression: the exception must come directly from record_429's return
+    value, never from re-running preflight() afterward. A second preflight()
+    call re-derives the pause from persisted store state and re-runs the
+    daily budget check against the row record_429 just wrote — which used to
+    let a bare GeminiError or the wrong exception type (GeminiBudgetExceeded)
+    slip through depending on rate_pause_seconds or how full the ceiling was.
+    """
+    tracker = FakeTracker()
+    tracker.record_429 = lambda *a, **k: ("2026-09-01T20:01:30+00:00", "rate_limit")
+    http = FakeHttp(FakeResponse(429, None, "rate limited"))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+
+    with pytest.raises(GeminiQuotaPaused) as excinfo:
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    assert excinfo.value.paused_until == "2026-09-01T20:01:30+00:00"
+    assert excinfo.value.reason == "rate_limit"
+    # Only the single pre-HTTP preflight() call happened; none was re-invoked
+    # after the 429 to re-derive the pause.
+    assert len(tracker.preflight_calls) == 1
+
+
+def test_generate_text_429_raises_quota_paused_despite_tight_daily_ceiling(monkeypatch):
+    """Regression: the exception type must not depend on how full the daily
+    budget is. With a tight rpd ceiling, the old re-preflight-after-record_429
+    mechanism counted the just-written quota_429 row, tripped the budget
+    check, and raised GeminiBudgetExceeded plus a second, spurious
+    blocked_budget row for a call that indisputably reached Google. It must
+    now raise GeminiQuotaPaused and write exactly one quota_429 row.
+    """
+    store = JobStore(":memory:")
+    quota = GeminiQuotaSettings(rpm=10, tpm=1000, rpd=2, rate_pause_seconds=1)
+    tracker = GeminiUsageTracker(store, quota, "gemini-2.5-flash-lite", run_id="run-1")
+    http = FakeHttp(_quota_error_response("Something went wrong."))
+    client = GeminiClient("secret-key", "gemini-2.5-flash-lite", http, tracker)
+    now = datetime(2026, 9, 1, 20, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr("job_hunter.gemini._now", lambda: now)
+
+    with pytest.raises(GeminiQuotaPaused) as excinfo:
+        client.generate_text("say hi", purpose="job_evaluation")
+
+    assert excinfo.value.reason == "unknown"
+    rows = store.gemini_usage_rows(
+        "2026-09-01T00:00:00+00:00",
+        "2026-09-02T00:00:00+00:00",
+        model="gemini-2.5-flash-lite",
+    )
+    assert [row["status"] for row in rows] == ["quota_429"]
