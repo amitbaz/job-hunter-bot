@@ -23,25 +23,20 @@ class GeminiError(RuntimeError):
     pass
 
 
+class GeminiIncompleteResponse(GeminiError):
+    """Gemini stopped generation before completing the requested response."""
+
+    def __init__(self, finish_reason: str) -> None:
+        super().__init__(f"Gemini response incomplete: finish_reason={finish_reason}")
+        self.finish_reason = finish_reason
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
 def _classify_429(response: requests.Response) -> tuple[GeminiPauseKind, str | None]:
-    """Classify a Gemini 429 body into one of the design spec's three pause kinds.
-
-    The real signal is the structured `quotaId`/`quotaMetric` substring match on
-    `PerDay` vs `PerMinute`: those are realistic against Google's actual
-    free-tier quota IDs (e.g.
-    `GenerateRequestsPerDayPerProjectPerModel-FreeTier`). The snake_case
-    message-text markers (`quota_exceeded`, `rate_limit_exceeded`,
-    `too_many_requests`) are a cheap extra signal but are unlikely to appear
-    verbatim in Google's actual prose error text — they are effectively
-    fixture-shaped, matching this module's own test bodies more than anything
-    Google is documented to return. Kept anyway because it's harmless and
-    costs nothing when it doesn't match. An unparsable body or one matching
-    neither classifies as `unknown`, which is paused just as conservatively.
-    """
+    """Classify a Gemini 429 body into one of the design spec's three pause kinds."""
     try:
         body = response.json()
     except ValueError:
@@ -128,11 +123,6 @@ class GeminiClient:
         json_mode: bool = False,
         json_schema: dict | None = None,
     ) -> str:
-        # A tracker-less client is a test affordance only (see class docstring);
-        # production code always supplies one. The tracker's own purpose
-        # validation remains the single guard for a missing/invalid purpose.
-        # Temporary rolling RPM/TPM pressure waits locally once and re-runs
-        # preflight before any provider request is made.
         now = self._preflight_with_pacing(purpose, prompt)
 
         url = f"{_BASE_URL}/{self.model}:generateContent"
@@ -174,9 +164,6 @@ class GeminiClient:
         if response.status_code == 429:
             kind, error_code = _classify_429(response)
             if self._tracker is not None:
-                # INVARIANT: every 429, of every kind, raises GeminiQuotaPaused
-                # directly from what record_429 just persisted, writes exactly
-                # one `quota_429` row, and writes zero `blocked_budget` rows.
                 paused_until, reason = self._tracker.record_429(
                     purpose, prompt, now, kind=kind, error_code=error_code
                 )
@@ -194,7 +181,8 @@ class GeminiClient:
 
         try:
             data = response.json()
-            parts = data["candidates"][0]["content"]["parts"]
+            candidate = data["candidates"][0]
+            parts = candidate["content"]["parts"]
             text = "".join(part.get("text", "") for part in parts)
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise GeminiError("Gemini response missing content") from exc
@@ -222,5 +210,9 @@ class GeminiClient:
                     purpose,
                 )
                 self._tracker.record_success(purpose, prompt, now)
+
+        finish_reason = candidate.get("finishReason") if isinstance(candidate, dict) else None
+        if finish_reason == "MAX_TOKENS":
+            raise GeminiIncompleteResponse(finish_reason)
 
         return text
