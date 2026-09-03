@@ -1928,10 +1928,7 @@ class JobStore:
             if r["total_score"] > _DELIVERABLE_SCORE_FLOOR
             and (
                 (r["decision"] == "possible_match" and not r["msg"])
-                or (
-                    r["decision"] in ("high_priority", "package_match")
-                    and (not r["msg"] or not r["doc"])
-                )
+                or (r["decision"] in ("high_priority", "package_match") and not r["msg"])
             )
         ]
 
