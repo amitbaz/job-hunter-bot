@@ -1,6 +1,6 @@
 import json
 
-from job_hunter.candidate_context import get_candidate_context
+from job_hunter.candidate_context import _MAX_ITEM_LENGTH, get_candidate_context
 from job_hunter.models import SearchPolicy
 from job_hunter.store import JobStore
 
@@ -63,6 +63,37 @@ def test_candidate_context_ignores_unknown_structured_output_fields():
 
     assert context.source == "gemini"
     assert context.technical_skills == ["React", "TypeScript"]
+
+
+def test_candidate_context_accepts_evidence_string_at_max_length_boundary():
+    payload = _payload()
+    payload["agentic_ai_evidence"] = ["x" * _MAX_ITEM_LENGTH]
+
+    context = get_candidate_context(
+        "PRIVATE_PROFILE_MARKER",
+        _policy(),
+        _Gemini(payload),
+        JobStore(":memory:"),
+    )
+
+    assert context.source == "gemini"
+    assert context.agentic_ai_evidence == ["x" * _MAX_ITEM_LENGTH]
+
+
+def test_candidate_context_rejects_evidence_string_over_max_length(caplog):
+    payload = _payload()
+    payload["agentic_ai_evidence"] = ["x" * (_MAX_ITEM_LENGTH + 1)]
+
+    context = get_candidate_context(
+        "PRIVATE_PROFILE_MARKER",
+        _policy(),
+        _Gemini(payload),
+        JobStore(":memory:"),
+    )
+
+    assert context.source == "fallback_error"
+    assert context.load_error == "ValueError"
+    assert f"agentic_ai_evidence entries must be <= {_MAX_ITEM_LENGTH} characters" in caplog.text
 
 
 def test_candidate_context_logs_safe_local_validation_reason(caplog):
