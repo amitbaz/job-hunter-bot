@@ -6,6 +6,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from job_hunter import content_confidence
 from job_hunter.models import Job
 
 if TYPE_CHECKING:
@@ -132,6 +133,7 @@ def extract_job_from_html(html: str) -> dict:
         # Description — strip HTML tags
         if desc := posting.get("description"):
             result["description"] = _strip_html(desc)
+            result["description_confidence"] = content_confidence.CANONICAL_EMPLOYER_PAGE
 
         # Location
         location = posting.get("jobLocation", {})
@@ -169,6 +171,7 @@ def extract_job_from_html(html: str) -> dict:
     body_text = _strip_html(str(soup.body)) if soup.body else _strip_html(html)
     if body_text:
         result["description"] = body_text
+        result["description_confidence"] = content_confidence.SOURCE_DETAIL_PAGE
 
     return result
 
@@ -198,6 +201,9 @@ def enrich_job(job: Job, http: HttpClient) -> Job:
         job.remote = data["remote"]
     if not job.description and (desc := data.get("description")):
         job.description = desc
+        job.content_confidence = data.get(
+            "description_confidence", content_confidence.SOURCE_DETAIL_PAGE
+        )
     if not job.location and (loc := data.get("location")):
         job.location = loc
 
