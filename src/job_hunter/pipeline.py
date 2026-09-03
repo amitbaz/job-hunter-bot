@@ -39,11 +39,13 @@ from job_hunter.navigation_store import (
 from job_hunter.pdf import render_cover_letter_pdf
 from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.search_backend import build_search_backend
+from job_hunter.search_budget import BraveRequestBudget
 from job_hunter.sources import (
     CompanyWatchSource,
     GmailStagedSource,
     LearnedAtsSource,
     TargetedSearchSource,
+    build_brave_budget,
     build_sources,
 )
 from job_hunter.sources.learned_ats import LearnedAtsStats
@@ -73,7 +75,10 @@ _CANONICAL_SEARCH_SITES = (
 
 
 def _targeted_canonical_candidates(
-    http: HttpClient, job: Job, breaker: CircuitBreaker
+    http: HttpClient,
+    job: Job,
+    breaker: CircuitBreaker,
+    brave_budget: BraveRequestBudget | None = None,
 ) -> list[Job]:
     """Run one bounded public search for the employer's original posting."""
     company = " ".join(job.company.replace('"', " ").split())
@@ -82,7 +87,13 @@ def _targeted_canonical_candidates(
         return []
 
     query = f'"{company}" "{title}" ({_CANONICAL_SEARCH_SITES})'
-    backend = build_search_backend(http, os.environ.get("BRAVE_SEARCH_API_KEY"))
+    brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
+    backend = build_search_backend(
+        http,
+        brave_api_key,
+        enable_brave=brave_budget is not None,
+        on_brave_attempt=brave_budget.reserve if brave_budget is not None else None,
+    )
     candidates = TargetedSearchSource(backend, [query], breaker=breaker).discover()
     for candidate in candidates:
         ats = parse_supported_ats_url(candidate.url)
@@ -632,6 +643,7 @@ def run_pipeline(
         logger.exception("manual company watch sync failed")
 
     search_breaker = CircuitBreaker(_SEARCH_FAILURE_THRESHOLD)
+    brave_budget = build_brave_budget(settings)
     query_date = datetime.now(ZoneInfo(settings.timezone)).date()
     base_sources = (
         sources
@@ -642,6 +654,7 @@ def run_pipeline(
             store=store,
             search_breaker=search_breaker,
             query_date=query_date,
+            brave_budget=brave_budget,
         )
     )
     sources = [
@@ -653,7 +666,7 @@ def run_pipeline(
     resolver = CanonicalResolver(
         http,
         search_candidates=lambda job: _targeted_canonical_candidates(
-            http, job, search_breaker
+            http, job, search_breaker, brave_budget
         ),
         watch_target=lambda company: _persisted_watch_target(store, company),
     )
