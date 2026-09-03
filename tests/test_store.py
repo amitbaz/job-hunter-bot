@@ -802,7 +802,7 @@ def test_pending_delivery_job_ids_keeps_score_sixty_one_possible_match_until_mes
     assert store.pending_delivery_job_ids() == []
 
 
-def test_pending_delivery_job_ids_keeps_score_sixty_one_ready_match_until_both_deliveries_sent(tmp_path):
+def test_pending_delivery_job_ids_keeps_score_sixty_one_ready_match_until_message_sent(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
     job_id, _, _ = store.upsert_job(job)
@@ -811,9 +811,16 @@ def test_pending_delivery_job_ids_keeps_score_sixty_one_ready_match_until_both_d
     assert store.pending_delivery_job_ids() == [job_id]
 
     store.mark_delivered(job_id, "telegram_message")
-    assert store.pending_delivery_job_ids() == [job_id]
+    assert store.pending_delivery_job_ids() == []
 
-    store.mark_delivered(job_id, "telegram_document")
+
+def test_pending_delivery_job_ids_excludes_ready_match_with_message_but_no_document(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="x", source_job_id="1", title="Senior Product Engineer")
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=61, decision="high_priority"))
+    store.mark_delivered(job_id, "telegram_message")
+
     assert store.pending_delivery_job_ids() == []
 
 

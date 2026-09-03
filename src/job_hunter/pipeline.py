@@ -375,6 +375,58 @@ def cover_letter_output_dir(settings: Settings) -> Path:
     return Path(settings.db_path).parent / "cover_letters"
 
 
+def generate_cover_letter_on_demand(
+    settings: Settings,
+    job_id: int,
+    *,
+    store: JobStore,
+    gemini: GeminiClient,
+    telegram: TelegramClient,
+) -> bool:
+    """Generate (or resend) one job's cover letter on demand and deliver it.
+
+    A repeat call for a job that already has a saved cover letter resends the
+    existing PDF for free instead of calling Gemini again.
+    """
+    job = store.get_job(job_id)
+    evaluation = store.get_evaluation(job_id)
+    if job is None or evaluation is None:
+        logger.warning("no job/evaluation found for job_id=%s; cannot generate cover letter", job_id)
+        return False
+
+    material = store.get_material(job_id)
+    if material is not None:
+        text = material.cover_letter_text
+    else:
+        try:
+            candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
+            text = generate_cover_letter(
+                job, evaluation, candidate_context, settings.cover_letter_template, gemini, date.today()
+            )
+        except (GeminiBudgetExceeded, GeminiQuotaPaused):
+            logger.warning("cover letter generation deferred by Gemini quota for job_id=%s", job_id)
+            telegram.send_message(
+                f"Couldn't generate a cover letter for {job.company} - {job.title} right now "
+                "(Gemini quota limit) - try again later."
+            )
+            return False
+        except Exception:
+            logger.exception("cover letter generation failed for job_id=%s", job_id)
+            telegram.send_message(
+                f"Couldn't generate a cover letter for {job.company} - {job.title} - something went wrong."
+            )
+            return False
+        store.save_material(job_id, Material(job_id=job_id, cover_letter_text=text))
+
+    out_dir = cover_letter_output_dir(settings)
+    pdf_path = render_cover_letter_pdf(text, job.company, job.title, out_dir)
+    caption = f"{job.company} - {job.title} - {evaluation.total_score} - {job.url}"
+    document_id = telegram.send_document(pdf_path, caption)
+    if document_id is not None:
+        store.mark_delivered(job_id, "telegram_document", document_id)
+    return document_id is not None
+
+
 def should_run_scheduled(now: datetime, timezone: str, scheduled_hour: int) -> bool:
     local_hour = now.astimezone(ZoneInfo(timezone)).hour
     return local_hour == scheduled_hour
@@ -383,12 +435,9 @@ def should_run_scheduled(now: datetime, timezone: str, scheduled_hour: int) -> b
 def _requeue_pending_delivery(
     job_id: int,
     store: JobStore,
-    out_dir: Path,
     digest_items: list[DigestItem],
-    pdf_deliveries: list[tuple[int, Path, DigestItem]],
-    summary: RunSummary,
 ) -> None:
-    """Re-queue persisted delivery work without calling Gemini again."""
+    """Re-add a rediscovered job's digest entry if it was never delivered."""
     evaluation = store.get_evaluation(job_id)
     if evaluation is None or evaluation.total_score < _MIN_DELIVERABLE_SCORE:
         return
@@ -413,16 +462,6 @@ def _requeue_pending_delivery(
     if not store.has_delivery(job_id, "telegram_message"):
         digest_items.append(item)
 
-    if evaluation.decision in _READY_DECISIONS and not store.has_delivery(job_id, "telegram_document"):
-        material = store.get_material(job_id)
-        if material is not None:
-            try:
-                pdf_path = render_cover_letter_pdf(material.cover_letter_text, job.company, job.title, out_dir)
-                pdf_deliveries.append((job_id, pdf_path, item))
-            except Exception:
-                logger.exception("cover letter PDF re-render failed for job_id=%s", job_id)
-                summary.errors += 1
-
 
 def _evaluate_and_deliver_job(
     job_id: int,
@@ -431,12 +470,10 @@ def _evaluate_and_deliver_job(
     settings: Settings,
     store: JobStore,
     gemini: GeminiClient,
-    out_dir: Path,
     digest_items: list[DigestItem],
-    pdf_deliveries: list[tuple[int, Path, DigestItem]],
     summary: RunSummary,
 ) -> tuple[bool, bool, str | None]:
-    """Evaluate one job and, if ready, generate its cover letter/PDF."""
+    """Evaluate one job and add it to the digest."""
     if store.get_evaluation(job_id) is not None and store.has_delivery(job_id, "telegram_message"):
         store.complete_ai_work("job_evaluation", job_id)
         return False, False, None
@@ -492,95 +529,7 @@ def _evaluate_and_deliver_job(
     else:
         summary.skipped += 1
 
-    if evaluation.decision in _READY_DECISIONS:
-        try:
-            text = generate_cover_letter(
-                job,
-                evaluation,
-                candidate_context,
-                settings.cover_letter_template,
-                gemini,
-                date.today(),
-            )
-        except (GeminiBudgetExceeded, GeminiQuotaPaused):
-            logger.warning("cover letter deferred by Gemini quota for job_id=%s", job_id)
-            store.enqueue_ai_work("cover_letter", job_id)
-        except Exception:
-            logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
-            summary.errors += 1
-        else:
-            try:
-                store.save_material(job_id, Material(job_id=job_id, cover_letter_text=text))
-                pdf_path = render_cover_letter_pdf(text, job.company, job.title, out_dir)
-                pdf_deliveries.append((job_id, pdf_path, item))
-            except Exception:
-                logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
-                summary.errors += 1
-
     return promoted, False, evaluation.decision
-
-
-def _retry_pending_cover_letter(
-    job_id: int,
-    candidate_context: CandidateContext,
-    settings: Settings,
-    store: JobStore,
-    gemini: GeminiClient,
-    out_dir: Path,
-    digest_items: list[DigestItem],
-    pdf_deliveries: list[tuple[int, Path, DigestItem]],
-    summary: RunSummary,
-) -> bool:
-    """Regenerate a previously quota-blocked cover letter for an already-evaluated job."""
-    evaluation = store.get_evaluation(job_id)
-    job = store.get_job(job_id)
-    if evaluation is None or job is None:
-        store.complete_ai_work("cover_letter", job_id)
-        return False
-
-    item = DigestItem(
-        job_id=job_id,
-        company=job.company,
-        title=job.title,
-        score=evaluation.total_score,
-        decision=evaluation.decision,
-        url=job.url,
-        hard_blockers=evaluation.hard_blockers,
-        location=job.location,
-        market_id=evaluation.market_id or job.market_id or "",
-        market_note=evaluation.location_note or "",
-    )
-    if not store.has_delivery(job_id, "telegram_message"):
-        digest_items.append(item)
-
-    try:
-        text = generate_cover_letter(
-            job,
-            evaluation,
-            candidate_context,
-            settings.cover_letter_template,
-            gemini,
-            date.today(),
-        )
-    except (GeminiBudgetExceeded, GeminiQuotaPaused):
-        logger.warning("cover letter retry deferred by Gemini quota for job_id=%s", job_id)
-        return True
-    except Exception:
-        logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
-        summary.errors += 1
-        return False
-
-    try:
-        store.save_material(job_id, Material(job_id=job_id, cover_letter_text=text))
-        pdf_path = render_cover_letter_pdf(text, job.company, job.title, out_dir)
-        pdf_deliveries.append((job_id, pdf_path, item))
-    except Exception:
-        logger.exception("cover letter/PDF generation failed for job_id=%s", job_id)
-        summary.errors += 1
-        return False
-
-    store.complete_ai_work("cover_letter", job_id)
-    return False
 
 
 def _format_gemini_usage_log(summary: GeminiUsageSummary) -> str:
@@ -673,8 +622,6 @@ def run_pipeline(
 
     summary = RunSummary()
     digest_items: list[DigestItem] = []
-    pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
-    out_dir = cover_letter_output_dir(settings)
     try:
         candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
@@ -727,18 +674,15 @@ def run_pipeline(
     logger.info("selected sources: %s", _format_source_counts(selected_source_counts))
 
     pending_evaluation_ids = [row["job_id"] for row in store.list_pending_ai_work("job_evaluation")]
-    pending_cover_letter_ids = [row["job_id"] for row in store.list_pending_ai_work("cover_letter")]
     pending_evaluation_id_set = set(pending_evaluation_ids)
-    pending_cover_letter_id_set = set(pending_cover_letter_ids)
 
     queued_job_ids = (
         {job_id for job_id, _job, _score in selected}
         | pending_evaluation_id_set
-        | pending_cover_letter_id_set
     )
     companies_promoted = 0
     for job_id in discovery.rediscovered_job_ids:
-        _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
+        _requeue_pending_delivery(job_id, store, digest_items)
 
     quota_blocked = candidate_context is None
     if quota_blocked and pending_evaluation_ids:
@@ -756,7 +700,7 @@ def run_pipeline(
             store.complete_ai_work("job_evaluation", job_id)
             continue
         promoted, blocked, decision = _evaluate_and_deliver_job(
-            job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
+            job_id, job, candidate_context, settings, store, gemini, digest_items, summary
         )
         _record_decision(decision_counts, job.market_id, decision)
         _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
@@ -771,7 +715,7 @@ def run_pipeline(
             store.enqueue_ai_work("job_evaluation", job_id)
             continue
         promoted, blocked, decision = _evaluate_and_deliver_job(
-            job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
+            job_id, job, candidate_context, settings, store, gemini, digest_items, summary
         )
         _record_decision(decision_counts, job.market_id, decision)
         _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
@@ -780,16 +724,7 @@ def run_pipeline(
         quota_blocked = quota_blocked or blocked
 
     for job_id in set(store.pending_delivery_job_ids()) - queued_job_ids - set(discovery.rediscovered_job_ids):
-        _requeue_pending_delivery(job_id, store, out_dir, digest_items, pdf_deliveries, summary)
-
-    if candidate_context is not None:
-        cover_letter_blocked = False
-        for job_id in pending_cover_letter_ids:
-            if cover_letter_blocked:
-                continue
-            cover_letter_blocked = _retry_pending_cover_letter(
-                job_id, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
-            )
+        _requeue_pending_delivery(job_id, store, digest_items)
 
     tracker = getattr(gemini, "_tracker", None)
     usage_summary = tracker.snapshot(datetime.now(timezone.utc)) if tracker is not None else None
@@ -814,20 +749,6 @@ def run_pipeline(
                         _bump_source_count(
                             delivered_by_source, metric_source_label(delivered_job.source)
                         )
-
-        pdf_deliveries.sort(
-            key=lambda entry: (
-                -entry[2].score,
-                (entry[2].company or "").lower(),
-                (entry[2].title or "").lower(),
-                entry[0],
-            )
-        )
-        for job_id, pdf_path, item in pdf_deliveries:
-            caption = f"{item.company} - {item.title} - {item.score} - {item.url}"
-            document_id = telegram.send_document(pdf_path, caption)
-            if document_id is not None:
-                store.mark_delivered(job_id, "telegram_document", document_id)
 
         pending_reviews = store.pending_review_events()
         if pending_reviews:

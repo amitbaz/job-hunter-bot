@@ -13,9 +13,11 @@ from job_hunter.models import (
     CandidateContext,
     CandidatePreferences,
     CompanyWatchSeed,
+    Evaluation,
     GeminiQuotaSettings,
     GeminiUsageSummary,
     Job,
+    Material,
     RunSummary,
     SearchPolicy,
     Settings,
@@ -399,7 +401,7 @@ def test_pipeline_delivers_strong_match_and_dedupes_within_run(settings):
     summary = run_pipeline(settings, sources=[source], store=store, gemini=gemini, telegram=telegram)
 
     assert summary.ready_to_apply == 1
-    assert len(telegram.documents) == 1
+    assert len(telegram.documents) == 0
     assert store.count_jobs() == 1
     job_id, _, _ = store.upsert_job(strong_job)
     assert store.has_delivery(job_id)
@@ -936,7 +938,7 @@ def test_pipeline_counts_promotion_failure_but_continues_delivery(
     assert summary.errors == 1
     assert summary.ready_to_apply == 1
     assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
+    assert len(telegram.documents) == 0
 
 
 def test_pipeline_isolates_broken_source(settings):
@@ -1097,7 +1099,7 @@ def test_pipeline_sends_gmail_reviews_after_normal_job_delivery_without_scoring_
         telegram=telegram,
     )
 
-    assert [kind for kind, _content in telegram.calls] == ["message", "document", "message"]
+    assert [kind for kind, _content in telegram.calls] == ["message", "message"]
     assert telegram.messages[0].startswith("Ready to apply\n- 90 | Acme - Senior Product Engineer")
     assert "Gmail activity I couldn't link" not in telegram.messages[0]
     assert telegram.messages[1] == (
@@ -1238,41 +1240,37 @@ def test_pipeline_retries_failed_telegram_delivery_on_next_run(settings):
     job = _job()
     store = JobStore(settings.db_path)
     gemini = FakeGemini()
-    telegram = FlakyTelegram(fail_message_times=1, fail_document_times=1)
+    telegram = FlakyTelegram(fail_message_times=1)
 
-    # Run 1: evaluation + material generation succeed, both Telegram sends fail.
+    # Run 1: evaluation succeeds, message Telegram send fails.
     run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
 
     job_id, _, _ = store.upsert_job(job)
     assert store.has_delivery(job_id, "telegram_message") is False
-    assert store.has_delivery(job_id, "telegram_document") is False
     assert len(telegram.messages) == 0
-    assert len(telegram.documents) == 0
 
     # Run 2: same job rediscovered, Telegram now works -> retry succeeds.
     run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
 
     assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
     assert store.has_delivery(job_id, "telegram_message") is True
-    assert store.has_delivery(job_id, "telegram_document") is True
 
 
 def test_pipeline_retry_does_not_call_gemini_again(settings):
     job = _job()
     store = JobStore(settings.db_path)
     gemini = FakeGemini()
-    telegram = FlakyTelegram(fail_message_times=1, fail_document_times=1)
+    telegram = FlakyTelegram(fail_message_times=1)
 
     run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
     assert gemini.eval_calls == 1
-    assert gemini.cover_letter_calls == 1
+    assert gemini.cover_letter_calls == 0
 
     run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
 
-    # Retry must reuse the persisted evaluation/cover letter, not call Gemini again.
+    # Retry must reuse the persisted evaluation, not call Gemini again.
     assert gemini.eval_calls == 1
-    assert gemini.cover_letter_calls == 1
+    assert gemini.cover_letter_calls == 0
 
 
 def test_pipeline_no_duplicate_sends_after_successful_delivery(settings):
@@ -1283,40 +1281,15 @@ def test_pipeline_no_duplicate_sends_after_successful_delivery(settings):
 
     run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
     assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
+    assert len(telegram.documents) == 0
 
     # Job rediscovered on a later run after delivery already succeeded.
     run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
 
     assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
-    assert gemini.eval_calls == 1
-    assert gemini.cover_letter_calls == 1
-
-
-def test_pipeline_retries_only_missing_pdf_when_digest_already_sent(settings):
-    job = _job()
-    store = JobStore(settings.db_path)
-    gemini = FakeGemini()
-    telegram = FlakyTelegram(fail_message_times=0, fail_document_times=1)
-
-    # Run 1: digest message succeeds, PDF document delivery fails.
-    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
-
-    job_id, _, _ = store.upsert_job(job)
-    assert len(telegram.messages) == 1
     assert len(telegram.documents) == 0
-    assert store.has_delivery(job_id, "telegram_message") is True
-    assert store.has_delivery(job_id, "telegram_document") is False
-
-    # Run 2: only the missing PDF should be retried, no duplicate digest message.
-    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
-
-    assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
-    assert store.has_delivery(job_id, "telegram_document") is True
     assert gemini.eval_calls == 1
-    assert gemini.cover_letter_calls == 1
+    assert gemini.cover_letter_calls == 0
 
 
 def test_pipeline_loads_candidate_context_once_without_logging_profile(settings, monkeypatch, caplog):
@@ -1459,7 +1432,7 @@ def test_pipeline_retries_pending_evaluation_and_delivers_it(settings):
     assert store.list_pending_ai_work("job_evaluation") == []
     assert summary.ready_to_apply == 1
     assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
+    assert len(telegram.documents) == 0
 
 
 def test_pipeline_ignores_stale_pending_evaluation_for_already_delivered_job(settings):
@@ -1479,9 +1452,9 @@ def test_pipeline_ignores_stale_pending_evaluation_for_already_delivered_job(set
     job_id, _, _ = store.upsert_job(job)
     assert store.get_evaluation(job_id) is not None
     assert store.has_delivery(job_id, "telegram_message") is True
-    assert store.has_delivery(job_id, "telegram_document") is True
+    assert store.has_delivery(job_id, "telegram_document") is False
     assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 1
+    assert len(telegram.documents) == 0
     assert gemini.eval_calls == 1
 
     # Simulate the crash window: the queue row survives even though the job
@@ -1496,68 +1469,91 @@ def test_pipeline_ignores_stale_pending_evaluation_for_already_delivered_job(set
     assert gemini.eval_calls == 1
     # ...and zero duplicate deliveries.
     assert len(telegram.messages) == 1
+    assert len(telegram.documents) == 0
+
+
+def _evaluation(job_id, *, decision="high_priority", total_score=90):
+    return Evaluation(
+        job_id=job_id,
+        total_score=total_score,
+        scores={},
+        decision=decision,
+        hard_blockers=[],
+        strengths=["React expertise"],
+        gaps=[],
+        salary_note="Not disclosed",
+        location_note="Remote EU friendly",
+        rationale="Strong fit",
+        model="gemini-test",
+    )
+
+
+def test_generate_cover_letter_on_demand_calls_gemini_when_no_material(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id))
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    delivered = job_hunter.pipeline.generate_cover_letter_on_demand(
+        settings, job_id, store=store, gemini=gemini, telegram=telegram
+    )
+
+    assert delivered is True
+    assert gemini.cover_letter_calls == 1
     assert len(telegram.documents) == 1
-
-
-def test_pipeline_defers_cover_letter_when_budget_exceeded(settings):
-    job = _job()
-    store = JobStore(settings.db_path)
-    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_budget_exceeded())
-    telegram = FakeTelegram()
-
-    summary = run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
-
-    job_id, _, _ = store.upsert_job(job)
-    assert store.get_evaluation(job_id) is not None
-    assert store.get_material(job_id) is None
-    assert [row["job_id"] for row in store.list_pending_ai_work("cover_letter")] == [job_id]
-    assert summary.errors == 0
-    assert summary.ready_to_apply == 1
-    # Still delivered to Telegram without a PDF.
-    assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 0
-
-
-def test_pipeline_defers_cover_letter_when_quota_paused(settings):
-    job = _job()
-    store = JobStore(settings.db_path)
-    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_quota_paused())
-    telegram = FakeTelegram()
-
-    summary = run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
-
-    job_id, _, _ = store.upsert_job(job)
-    assert store.get_material(job_id) is None
-    assert [row["job_id"] for row in store.list_pending_ai_work("cover_letter")] == [job_id]
-    assert summary.errors == 0
-    assert len(telegram.messages) == 1
-    assert len(telegram.documents) == 0
-
-
-def test_pipeline_retries_pending_cover_letter_without_reevaluating(settings):
-    job = _job()
-    store = JobStore(settings.db_path)
-    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_budget_exceeded())
-    telegram = FakeTelegram()
-
-    # Run 1: evaluation succeeds, cover letter is quota-blocked and deferred.
-    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
-    job_id, _, _ = store.upsert_job(job)
-    assert store.get_material(job_id) is None
-    assert gemini.eval_calls == 1
-
-    # Run 2: quota is back; the pending cover letter is generated using the
-    # saved evaluation, without a second job_evaluation call.
-    gemini2 = FakeGemini()
-    run_pipeline(settings, sources=[FakeSource([])], store=store, gemini=gemini2, telegram=telegram)
-
     assert store.get_material(job_id) is not None
-    assert store.list_pending_ai_work("cover_letter") == []
-    assert gemini2.eval_calls == 0
-    assert gemini2.cover_letter_calls == 1
+    assert store.has_delivery(job_id, "telegram_document")
+
+
+def test_generate_cover_letter_on_demand_resends_without_regenerating(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id))
+    store.save_material(job_id, Material(job_id=job_id, cover_letter_text="Existing letter text"))
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    delivered = job_hunter.pipeline.generate_cover_letter_on_demand(
+        settings, job_id, store=store, gemini=gemini, telegram=telegram
+    )
+
+    assert delivered is True
+    assert gemini.cover_letter_calls == 0
     assert len(telegram.documents) == 1
-    # The message was already delivered in run 1; retry must not resend it.
+
+
+def test_generate_cover_letter_on_demand_missing_job_returns_false(settings):
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+
+    delivered = job_hunter.pipeline.generate_cover_letter_on_demand(
+        settings, 999, store=store, gemini=gemini, telegram=telegram
+    )
+
+    assert delivered is False
+    assert len(telegram.documents) == 0
+
+
+def test_generate_cover_letter_on_demand_notifies_on_quota_block(settings):
+    job = _job()
+    store = JobStore(settings.db_path)
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id))
+    gemini = RaisingGemini(raise_on_purpose="cover_letter", exception=_budget_exceeded())
+    telegram = FakeTelegram()
+
+    delivered = job_hunter.pipeline.generate_cover_letter_on_demand(
+        settings, job_id, store=store, gemini=gemini, telegram=telegram
+    )
+
+    assert delivered is False
+    assert len(telegram.documents) == 0
     assert len(telegram.messages) == 1
+    assert "quota" in telegram.messages[0].lower()
 
 
 def test_pipeline_defers_all_evaluations_when_context_load_is_quota_blocked(settings):

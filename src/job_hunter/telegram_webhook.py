@@ -6,6 +6,7 @@ import logging
 from flask import Flask, jsonify, request
 
 from job_hunter.config import WebhookSettings, load_webhook_settings
+from job_hunter.github_dispatch import trigger_repository_dispatch
 from job_hunter.github_state import GitHubArtifactStateLoader
 from job_hunter.http import HttpClient
 from job_hunter.navigation_repository import GitHubArtifactNavigationRepository
@@ -32,6 +33,18 @@ def create_app(
         )
         navigation_repository = GitHubArtifactNavigationRepository(state_loader)
     telegram = telegram or TelegramClient(settings.telegram_bot_token, None, http)
+
+    def _trigger_cover_letter_generation(job_id: int) -> None:
+        try:
+            trigger_repository_dispatch(
+                settings.github_repository,
+                settings.github_dispatch_token,
+                "generate_cover_letter",
+                {"job_id": job_id},
+                http=http,
+            )
+        except Exception:
+            logger.exception("failed to trigger cover letter generation for job_id=%s", job_id)
 
     app = Flask(__name__)
 
@@ -87,6 +100,7 @@ def create_app(
             callback_query,
             session_loader=lambda requested_id: session if requested_id == session_id else None,
             telegram=telegram,
+            on_generate=_trigger_cover_letter_generation,
         )
         return jsonify(ok=True)
 

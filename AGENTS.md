@@ -4,7 +4,7 @@ This file provides guidance to AI coding agents (Claude Code, Codex, etc.) when 
 
 ## What this is
 
-A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It discovers public remote job postings, deduplicates them in SQLite, evaluates each against a candidate profile with Gemini, drafts tailored cover letters + PDFs for strong matches, and delivers a digest via Telegram. **It never submits applications** — see "v1 safety boundary" in README.md.
+A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It discovers public remote job postings, deduplicates them in SQLite, evaluates each against a candidate profile with Gemini, and delivers a digest via Telegram. Cover letters + PDFs are generated on demand, triggered by tapping "Gen CL" on a job's Telegram card, not automatically for strong matches. **It never submits applications** — see "v1 safety boundary" in README.md.
 
 ## Project direction and architectural constraints
 
@@ -119,9 +119,10 @@ Pipeline, in `pipeline.py::run_pipeline`:
 ```
 all sources -> enrich/dedupe -> profession gate + prefilter -> deterministic or profile-aware rank
   -> source-diverse top <=35 shortlist (stable-ranking fallback on error) -> Gemini -> decision filter -> score-sorted Telegram
-  -> cover letter generation + PDF rendering, strong matches only (cover_letter.py/pdf.py)
-  -> Telegram digest + PDF delivery (telegram.py)
+  -> Telegram digest delivery (telegram.py)
 ```
+
+Cover letter generation + PDF rendering (`cover_letter.py`/`pdf.py`) is not part of the daily pipeline above — it runs on demand, one job at a time, when "Gen CL" is tapped on that job's Telegram card. This fires a `repository_dispatch` event that runs `.github/workflows/generate-cover-letter.yml` (`python -m job_hunter generate-cover-letter --job-id <id>`).
 
 Key modules:
 - `src/job_hunter/sources/` — one adapter per job source, all implementing a common `discover()` interface (`base.py`). Built-ins now include Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work Remotely, Hacker News, and DuckDuckGo query expansion, plus optional Ashby/Lever/Greenhouse ATS boards. Each source **fails open**: an exception during discovery is caught in `run_pipeline`, logged, and that source is skipped — the rest of the run continues.
@@ -131,8 +132,8 @@ Key modules:
 - `src/job_hunter/config.py` — loads `config/search.yml` + required env vars into a `Settings`/`SearchPolicy` (see `models.py`). Candidate profile and cover letter template are base64-encoded secrets (`CANDIDATE_PROFILE_B64`, `COVER_LETTER_TEMPLATE_B64`), decoded in memory only — never write decoded plaintext to the repo or logs.
 - `src/job_hunter/cli.py` — `python -m job_hunter run` entrypoint. `--scheduled` gates execution on `should_run_scheduled` (pipeline.py), comparing current local hour in `settings.timezone` against `settings.scheduled_hour`.
 - `src/job_hunter/preferences.py` extracts a compact preference profile from the candidate profile. When that succeeds, `pipeline.py` uses `rank_jobs(..., preferences)` plus `select_diverse_candidates()` to enforce profile-aware ranking with per-source diversity (`max_jobs_per_run` default 35, `source_minimum_per_run` default 2, `source_max_share` default 0.5). If preference extraction or shortlist selection fails, the pipeline falls back to the stable deterministic global ranking and logs the fallback without exposing private profile text.
-- Per-job evaluation and cover-letter/PDF generation failures are caught individually inside the loop (not fail-open at the run level) so one bad job doesn't abort the run; each increments `summary.errors`.
-- Only jobs with decision `high_priority` or `package_match` (`pipeline.py::_READY_DECISIONS`) get a cover letter + PDF generated and a `possible_match` decision only counts toward the digest, not material generation.
+- Per-job evaluation failures are caught individually inside the loop (not fail-open at the run level) so one bad job doesn't abort the run; each increments `summary.errors`.
+- Cover letter + PDF generation is not part of the daily pipeline. It is triggered on demand, one job at a time, by tapping "Gen CL" on that job's Telegram card (`generate-cover-letter.yml` -> `python -m job_hunter generate-cover-letter --job-id <id>`), regardless of decision.
 
 ## GitHub Actions state persistence
 

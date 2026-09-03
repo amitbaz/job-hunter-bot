@@ -57,7 +57,15 @@ def test_build_navigation_card_fallbacks_and_missing_url():
     )
     assert "Company: Not specified" in text
     assert "Location: Not specified" in text
-    assert keyboard[0] == [{"text": "Apply", "callback_data": "a|s|0"}]
+    assert keyboard[0] == [
+        {"text": "Apply", "callback_data": "a|s|0"},
+        {"text": "Gen CL", "callback_data": "c|s|0"},
+    ]
+
+
+def test_build_navigation_card_includes_gen_cl_button():
+    text, keyboard = build_navigation_card(_card(), "abc123", index=2, total=12)
+    assert keyboard[0][2] == {"text": "Gen CL", "callback_data": "c|abc123|2"}
 
 
 def test_navigation_card_surfaces_market_note():
