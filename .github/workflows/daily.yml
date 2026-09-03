@@ -4,6 +4,9 @@ on:
 permissions:
   contents: read
   actions: read
+concurrency:
+  group: job-hunter-state
+  cancel-in-progress: false
 jobs:
   run:
     runs-on: ubuntu-latest
