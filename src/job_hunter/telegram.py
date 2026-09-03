@@ -14,12 +14,6 @@ logger = logging.getLogger(__name__)
 _BASE_URL = "https://api.telegram.org/bot{token}"
 _CAPTION_LIMIT = 1000
 
-_USAGE_GREEN = "🟢"
-_USAGE_YELLOW = "🟡"
-_USAGE_RED = "🔴"
-_USAGE_YELLOW_FLOOR = 60
-_USAGE_RED_FLOOR = 80
-
 _GROUP_HEADERS = {
     "high_priority": "Ready to apply",
     "package_match": "Ready to apply",
@@ -200,55 +194,6 @@ def chunk_message(text: str, limit: int = 3900) -> list[str]:
         chunks.append("\n".join(current))
 
     return chunks
-
-
-def _usage_emoji(summary: GeminiUsageSummary) -> str:
-    """Colour by the worst of the three provider-quota percentages, or red if paused.
-
-    A persisted provider pause always wins regardless of the percentages
-    (they can look low right after midnight resets a counter while the pause
-    itself is still active).
-    """
-    if summary.provider_paused:
-        return _USAGE_RED
-    max_percent = max(
-        summary.rpd_percent, summary.rpm_peak_percent, summary.tpm_peak_percent
-    )
-    if max_percent >= _USAGE_RED_FLOOR:
-        return _USAGE_RED
-    if max_percent >= _USAGE_YELLOW_FLOOR:
-        return _USAGE_YELLOW
-    return _USAGE_GREEN
-
-
-def _format_token_total(total: int) -> str:
-    """Compact token count: `500`, `142k`, `1.2M` — never a fabricated percentage."""
-    if total >= 1_000_000:
-        return f"{total / 1_000_000:.1f}M"
-    if total >= 1_000:
-        return f"{round(total / 1000)}k"
-    return str(total)
-
-
-def build_gemini_usage_status(summary: GeminiUsageSummary) -> str:
-    """One-line Telegram status: quota percentages, call count, token total.
-
-    Only the three provider-quota percentages (RPD/RPM peak/TPM peak) are
-    shown; there is no configured daily token quota to compute a percentage
-    against, so none is invented. The token total is `total_tokens_today`
-    (Google's own `totalTokenCount`, or the tracker's reconstruction where
-    that was unavailable) rather than a sum of the four component fields --
-    `cached_tokens_today` is a subset of `input_tokens_today`, not additional
-    to it, so summing all four would double-count the cached portion.
-    """
-    return (
-        f"Gemini {_usage_emoji(summary)} "
-        f"RPD {round(summary.rpd_percent)}% · "
-        f"RPM peak {round(summary.rpm_peak_percent)}% · "
-        f"TPM peak {round(summary.tpm_peak_percent)}% · "
-        f"{summary.requests_today} calls · "
-        f"{_format_token_total(summary.total_tokens_today)} tokens"
-    )
 
 
 def build_gemini_pause_warning(summary: GeminiUsageSummary) -> str | None:
