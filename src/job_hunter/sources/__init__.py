@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import date, datetime, timezone
+from datetime import date
 
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.discovery_queries import generate_search_queries
 from job_hunter.models import MarketPolicy, Settings
 from job_hunter.search_backend import BraveSearchBackend
 from job_hunter.search_budget import (
+    BraveRequestBudget,
     SearchUsageLedger,
-    brave_queries_available_today,
     split_queries_for_brave,
 )
 from job_hunter.store import JobStore
@@ -36,7 +36,7 @@ from .wellfound import _WELLFOUND_LISTINGS, WellfoundListing, WellfoundSource
 from .yc import YCSource
 
 logger = logging.getLogger(__name__)
-_DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT = 250
+_DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT = 1000
 _KNOWN_DIRECT_SOURCES = frozenset({"devjobs", "wellfound"})
 
 __all__ = [
@@ -60,6 +60,7 @@ __all__ = [
     "LearnedAtsSource",
     "WellfoundListing",
     "WellfoundSource",
+    "build_brave_budget",
     "build_sources",
 ]
 
@@ -84,6 +85,16 @@ def _brave_monthly_query_limit() -> int:
         )
         return 0
     return value
+
+
+def build_brave_budget(settings: Settings) -> BraveRequestBudget | None:
+    """Build the run's shared persisted Brave budget when Brave is configured."""
+    if not os.environ.get("BRAVE_SEARCH_API_KEY"):
+        return None
+    return BraveRequestBudget(
+        SearchUsageLedger(settings.db_path),
+        monthly_limit=_brave_monthly_query_limit(),
+    )
 
 
 def _validate_direct_sources(markets: list[MarketPolicy]) -> None:
@@ -118,6 +129,7 @@ def build_sources(
     store: JobStore | None = None,
     search_breaker: CircuitBreaker | None = None,
     query_date: date | None = None,
+    brave_budget: BraveRequestBudget | None = None,
 ) -> list[JobSource]:
     _validate_direct_sources(settings.policy.markets)
     queries = generate_search_queries(settings.policy, query_date)
@@ -125,42 +137,37 @@ def build_sources(
     targeted_sources: list[JobSource] = []
 
     if brave_api_key:
-        ledger = SearchUsageLedger(settings.db_path)
-        now = datetime.now(timezone.utc)
-        monthly_limit = _brave_monthly_query_limit()
-        brave_limit = brave_queries_available_today(
-            ledger,
-            monthly_limit=monthly_limit,
-            now=now,
-        )
-        brave_queries, deferred_queries = split_queries_for_brave(
-            queries,
-            limit=brave_limit,
-        )
-
-        logger.info(
-            "Brave source-discovery budget: monthly_limit=%s available_today=%s selected=%s deferred=%s",
-            monthly_limit,
-            brave_limit,
-            len(brave_queries),
-            len(deferred_queries),
-        )
-
-        if brave_queries:
-            targeted_sources.append(
-                TargetedSearchSource(
-                    BraveSearchBackend(
-                        http,
-                        brave_api_key,
-                        on_attempt=lambda: ledger.record(
-                            provider="brave",
-                            occurred_at=datetime.now(timezone.utc),
-                        ),
-                    ),
-                    brave_queries,
-                    breaker=search_breaker,
-                )
+        budget = brave_budget or build_brave_budget(settings)
+        if budget is not None:
+            available_today = budget.available_today()
+            discovery_allowance = budget.discovery_allowance()
+            brave_queries, deferred_queries = split_queries_for_brave(
+                queries,
+                limit=discovery_allowance,
             )
+
+            logger.info(
+                "Brave source-discovery budget: monthly_limit=%s available_today=%s "
+                "discovery_allowance=%s selected=%s deferred=%s",
+                budget.monthly_limit,
+                available_today,
+                discovery_allowance,
+                len(brave_queries),
+                len(deferred_queries),
+            )
+
+            if brave_queries:
+                targeted_sources.append(
+                    TargetedSearchSource(
+                        BraveSearchBackend(
+                            http,
+                            brave_api_key,
+                            on_attempt=budget.reserve,
+                        ),
+                        brave_queries,
+                        breaker=search_breaker,
+                    )
+                )
 
     sources: list[JobSource] = [
         RemotiveSource(http),
