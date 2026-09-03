@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from job_hunter.canonical import CanonicalResolver
-from job_hunter.discovery import collect_candidates
+from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS, PARTIAL_UNKNOWN
+from job_hunter.discovery import _dedupe, collect_candidates
 from job_hunter.models import (
     AtsReference,
     CandidatePreferences,
@@ -222,6 +223,72 @@ def test_collect_candidates_counts_jobs_by_bounded_source_label(store, policy):
     assert result.stats.unique_by_source == {"devjobs": 3}
     assert result.stats.eligible_by_source == {"devjobs": 1}
     assert result.stats.rejected_by_source == {"devjobs": 2}
+
+
+def test_raw_jobs_get_content_confidence_from_source(store, policy):
+    job = Job(
+        source="ashby",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://jobs.ashbyhq.com/acme/1",
+        description="React TypeScript",
+        remote=True,
+    )
+
+    result = collect_candidates([FakeSource([job])], store, NoOpHttp(), policy)
+
+    assert len(result.eligible) == 1
+    assert result.eligible[0][1].content_confidence == OFFICIAL_ATS
+
+
+def test_dedupe_prefers_higher_confidence_description_over_longer_weaker_one():
+    weak = Job(
+        source="hackernews",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-1",
+        description="a" * 500,  # long but low-trust
+        content_confidence=AGGREGATOR_TEXT,
+    )
+    strong = Job(
+        source="ashby",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-1",
+        description="short but authoritative JD",
+        content_confidence=OFFICIAL_ATS,
+    )
+    merged, _ = _dedupe([weak, strong])
+    assert len(merged) == 1
+    assert merged[0].description == "short but authoritative JD"
+    assert merged[0].content_confidence == OFFICIAL_ATS
+
+
+def test_dedupe_still_fills_empty_description_from_weaker_source():
+    empty = Job(
+        source="targeted_search",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-2",
+        description="",
+        content_confidence=PARTIAL_UNKNOWN,
+    )
+    weak = Job(
+        source="hackernews",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-2",
+        description="a comment about the role",
+        content_confidence=AGGREGATOR_TEXT,
+    )
+    merged, _ = _dedupe([empty, weak])
+    assert merged[0].description == "a comment about the role"
+    assert merged[0].content_confidence == AGGREGATOR_TEXT
 
 
 def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, policy):
