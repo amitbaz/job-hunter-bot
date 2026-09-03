@@ -427,6 +427,28 @@ def test_ats_registry_upsert_is_provider_board_unique():
     assert store.count_ats_boards() == 1
 
 
+def test_ats_registry_upsert_does_not_wipe_metadata_with_blank_values():
+    store = JobStore(":memory:")
+
+    store.upsert_ats_board(
+        provider="ashby",
+        board_identifier="omnea",
+        company_name="Omnea",
+        market_hint="london",
+    )
+    store.upsert_ats_board(
+        provider="ashby",
+        board_identifier="omnea",
+        company_name="",
+        market_hint="",
+    )
+
+    due = store.list_due_ats_boards(datetime.now(timezone.utc))
+    entry = next(e for e in due if e.board_identifier == "omnea")
+    assert entry.company_name == "Omnea"
+    assert entry.market_hint == "london"
+
+
 def test_ats_registry_rejects_unsupported_provider():
     store = JobStore(":memory:")
     with pytest.raises(ValueError, match="unsupported ATS provider"):

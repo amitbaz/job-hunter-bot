@@ -1309,8 +1309,8 @@ class JobStore:
             self._conn.execute(
                 """
                 UPDATE ats_registry SET
-                    company_name = ?,
-                    market_hint = ?,
+                    company_name = COALESCE(NULLIF(?, ''), company_name),
+                    market_hint = COALESCE(NULLIF(?, ''), market_hint),
                     last_seen_at = ?,
                     active = 1
                 WHERE provider = ? AND board_identifier = ?
