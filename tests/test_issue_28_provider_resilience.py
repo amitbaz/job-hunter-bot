@@ -4,6 +4,7 @@ import requests
 
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.http import HttpClient
+from job_hunter.search_backend import SearchBudgetExhausted
 from job_hunter.sources.targeted_search import TargetedSearchSource
 from job_hunter.sources.wellfound import WellfoundListing, WellfoundSource
 
@@ -162,3 +163,31 @@ def test_shared_open_search_circuit_logs_once_and_makes_no_provider_calls(caplog
         if "targeted search circuit open" in record.getMessage()
     ]
     assert len(circuit_records) == 1
+
+
+def test_brave_budget_exhaustion_does_not_trip_shared_search_circuit(caplog):
+    class BudgetExhaustedBackend:
+        name = "brave"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def search(self, query: str):
+            self.calls += 1
+            raise SearchBudgetExhausted("Brave Search budget exhausted")
+
+    backend = BudgetExhaustedBackend()
+    breaker = CircuitBreaker(failure_threshold=1)
+
+    with caplog.at_level(logging.INFO):
+        jobs = TargetedSearchSource(
+            backend,
+            ["q1", "q2"],
+            breaker=breaker,
+        ).discover()
+
+    assert jobs == []
+    assert backend.calls == 1
+    assert not breaker.is_open
+    assert "targeted search budget exhausted" in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
