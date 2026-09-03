@@ -1,6 +1,6 @@
 # Job Hunter Bot
 
-A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It reads Gmail job signals, discovers public remote job postings, deduplicates them in SQLite, evaluates each one against your candidate profile with Gemini, drafts tailored cover letters and renders them as PDFs for strong matches, and delivers a concise digest through Telegram.
+A daily, mostly hands-off job-hunting assistant that runs on GitHub Actions. It reads Gmail job signals, discovers public remote job postings, deduplicates them in SQLite, evaluates each one against your candidate profile with Gemini, and delivers a concise digest through Telegram. Tapping "Gen CL" on a job's card triggers on-demand cover letter drafting and PDF rendering for that job.
 
 The bot **never submits applications**. It prepares material for you to review and send yourself — see [v1 safety boundary](#v1-safety-boundary) below.
 
@@ -38,9 +38,10 @@ The exact shared schema and migration phases are intentionally not defined here.
 all public sources (Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work Remotely, Hacker News, DuckDuckGo, ATS boards)
   -> enrich + dedupe -> profession gate + prefilter -> deterministic ranking or profile-aware ranking
   -> diversity-constrained top-N shortlist (stable-ranking fallback on error) -> Gemini evaluation
-  -> cover letter generation + PDF rendering (strong matches only)
-  -> Telegram digest + PDF delivery
+  -> Telegram digest delivery
 ```
+
+Cover letter generation + PDF rendering happens on demand, not as part of the daily run: tapping "Gen CL" on a job's Telegram card fires a `repository_dispatch` GitHub Actions workflow that generates (or resends) that job's cover letter and PDF.
 
 - `src/job_hunter/sources/` — public job discovery adapters: Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work Remotely, Hacker News, DuckDuckGo query expansion, plus optional Ashby/Lever/Greenhouse ATS boards. Each source fails open: if one adapter errors, the run continues with the rest.
 - `config/search.yml` supports role families, query templates, ATS domains, and `max_search_queries_per_run`; DuckDuckGo queries expand each role/template pair across the configured ATS domains before deduping.
@@ -49,7 +50,7 @@ all public sources (Remotive, Arbeitnow, Jobicy, Himalayas, Remote OK, We Work R
 - `skip` evaluations are persisted but never sent to Telegram. Telegram sections are ordered by final Gemini score descending, unknown decisions are omitted, and only scores strictly greater than 60 are eligible for digest or retry delivery.
 - `src/job_hunter/prefilter.py` — cheap deterministic filtering before spending Gemini calls.
 - `src/job_hunter/evaluation.py` / `gemini.py` — Gemini-based scoring and rationale.
-- `src/job_hunter/cover_letter.py` / `pdf.py` — cover letter drafting and PDF rendering for jobs that clear the bar.
+- `src/job_hunter/cover_letter.py` / `pdf.py` — cover letter drafting and PDF rendering, triggered on demand per job via the "Gen CL" Telegram button.
 - `src/job_hunter/store.py` — SQLite persistence (dedup, evaluation cache, delivery tracking) at `var/job_hunter.sqlite3` by default.
 - `src/job_hunter/telegram.py` — outbound-only Telegram Bot API delivery (digest message + PDF documents).
 - `src/job_hunter/gmail_sync.py` — read-only Gmail intake that classifies job signals and stages discovered jobs or review-needed events in the shared SQLite state.
@@ -190,7 +191,7 @@ set -a; source .env; set +a
 python -m job_hunter run
 ```
 
-This runs discovery, profile extraction, source-diverse shortlisting, evaluation, and cover letter/PDF generation against the local SQLite database at `var/job_hunter.sqlite3` (override with `JOB_HUNTER_DB_PATH`) without sending anything to Telegram.
+This runs discovery, profile extraction, source-diverse shortlisting, and evaluation against the local SQLite database at `var/job_hunter.sqlite3` (override with `JOB_HUNTER_DB_PATH`) without sending anything to Telegram. Cover letter/PDF generation is a separate on-demand step (`python -m job_hunter generate-cover-letter --job-id <id>`), not part of this run.
 
 ## Gmail intelligence setup
 
@@ -265,7 +266,7 @@ On the very first run (or if the `job-hunter-state` artifact has expired past it
 
 ### Gemini quota / rate limits
 
-The pipeline does not implement a Gemini-quota circuit breaker. Each run uses one compact profile-extraction call, then up to `max_jobs_per_run` (default 35) independent evaluation calls; strong matches can also use a cover-letter call. If quota or rate limits interrupt the run, each affected job fails independently and can be retried on the next run without blocking the rest. If you see repeated Gemini failures in the Actions log, check your API key's quota/rate limit in Google AI Studio.
+The pipeline does not implement a Gemini-quota circuit breaker. Each daily run uses one compact profile-extraction call, then up to `max_jobs_per_run` (default 35) independent evaluation calls. A separate on-demand cover-letter call happens only when "Gen CL" is tapped for a given job. If quota or rate limits interrupt the run, each affected job fails independently and can be retried on the next run without blocking the rest. If you see repeated Gemini failures in the Actions log, check your API key's quota/rate limit in Google AI Studio.
 
 ### Telegram delivery errors
 

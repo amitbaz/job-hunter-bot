@@ -9,15 +9,30 @@ The scheduled job-search pipeline still runs in GitHub Actions and SQLite remain
 ```text
 GitHub Actions cron
         |
-        | discover / evaluate / generate PDFs
+        | discover / evaluate
         v
 SQLite: var/job_hunter.sqlite3
         |
         | uploaded after each run
         v
 GitHub Actions artifact: job-hunter-state
+        ^
+        | restored, mutated, re-uploaded
+        |
+Telegram "Gen CL" tap
+        |
+        | callback_query
+        v
+Vercel Python/Flask Function
+        |
+        | repository_dispatch (generate_cover_letter)
+        v
+GitHub Actions: generate-cover-letter.yml
+        |
+        v
+generate PDF + mark_delivered
 
-Telegram card
+Telegram card (Previous/Next/View job/Apply)
         |
         | callback_query
         v
