@@ -6,6 +6,7 @@ import logging
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
+from job_hunter.gemini import GeminiIncompleteResponse
 from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.models import CandidateContext, CandidatePreferences, SearchPolicy
 from job_hunter.normalize import normalize_text
@@ -50,6 +51,11 @@ _PREFERENCES_LIST_FIELDS = tuple(f for f in _PREFERENCES_FIELDS if f != "summary
 _PREFERENCES_MAX_LIST_ITEMS = 8
 _PREFERENCES_MAX_ITEM_LENGTH = 80
 _PREFERENCES_MAX_SUMMARY_LENGTH = 280
+
+_PRIMARY_THINKING_LEVEL = "medium"
+_PRIMARY_MAX_OUTPUT_TOKENS = 1800
+_RECOVERY_THINKING_LEVEL = "low"
+_RECOVERY_MAX_OUTPUT_TOKENS = 6000
 
 _PREFERENCES_SCHEMA = {
     "type": "OBJECT",
@@ -275,23 +281,48 @@ def _context_from_dict(data: dict) -> CandidateContext:
     )
 
 
-def _fallback_after_error(policy: SearchPolicy, exc: Exception, *, reason: str = "") -> CandidateContext:
+def _fallback_after_error(
+    policy: SearchPolicy,
+    exc: Exception,
+    *,
+    category: str,
+    reason: str = "",
+) -> CandidateContext:
     error_name = type(exc).__name__
     if reason:
         logger.warning(
-            "candidate context extraction failed; using fallback: error=%s reason=%s",
+            "candidate context extraction failed; using fallback: error=%s category=%s reason=%s",
             error_name,
+            category,
             reason,
         )
     else:
         logger.warning(
-            "candidate context extraction failed; using fallback: error=%s",
+            "candidate context extraction failed; using fallback: error=%s category=%s",
             error_name,
+            category,
         )
     return _fallback_context(
         policy,
         source="fallback_error",
         load_error=error_name,
+    )
+
+
+def _generate_candidate_context(
+    gemini: "GeminiClient",
+    prompt: str,
+    *,
+    thinking_level: str,
+    max_output_tokens: int,
+) -> str:
+    return gemini.generate_text(
+        prompt,
+        purpose="candidate_context",
+        thinking_level=thinking_level,
+        max_output_tokens=max_output_tokens,
+        json_mode=True,
+        json_schema=CANDIDATE_CONTEXT_SCHEMA,
     )
 
 
@@ -312,26 +343,51 @@ def get_candidate_context(
     if cached is not None:
         return _context_from_dict(cached.context)
 
+    prompt = _build_extraction_prompt(profile)
     try:
-        raw = gemini.generate_text(
-            _build_extraction_prompt(profile),
-            purpose="candidate_context",
-            thinking_level="medium",
-            max_output_tokens=1800,
-            json_mode=True,
-            json_schema=CANDIDATE_CONTEXT_SCHEMA,
+        raw = _generate_candidate_context(
+            gemini,
+            prompt,
+            thinking_level=_PRIMARY_THINKING_LEVEL,
+            max_output_tokens=_PRIMARY_MAX_OUTPUT_TOKENS,
         )
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
         raise
+    except GeminiIncompleteResponse as exc:
+        logger.warning(
+            "candidate context extraction incomplete; retrying once: "
+            "category=provider_truncation finish_reason=%s attempt=1 max_attempts=2",
+            exc.finish_reason,
+        )
+        try:
+            raw = _generate_candidate_context(
+                gemini,
+                prompt,
+                thinking_level=_RECOVERY_THINKING_LEVEL,
+                max_output_tokens=_RECOVERY_MAX_OUTPUT_TOKENS,
+            )
+        except (GeminiBudgetExceeded, GeminiQuotaPaused):
+            raise
+        except GeminiIncompleteResponse as retry_exc:
+            return _fallback_after_error(
+                policy,
+                retry_exc,
+                category="provider_truncation",
+                reason=f"finish_reason={retry_exc.finish_reason}",
+            )
+        except Exception as retry_exc:
+            return _fallback_after_error(policy, retry_exc, category="provider_error")
     except Exception as exc:
-        return _fallback_after_error(policy, exc)
+        return _fallback_after_error(policy, exc, category="provider_error")
 
     try:
         context = _parse_context(raw)
     except ValueError as exc:
-        return _fallback_after_error(policy, exc, reason=" ".join(str(exc).split())[:240])
+        reason = " ".join(str(exc).split())[:240]
+        category = "invalid_json" if str(exc).startswith("invalid JSON:") else "invalid_context"
+        return _fallback_after_error(policy, exc, category=category, reason=reason)
     except Exception as exc:
-        return _fallback_after_error(policy, exc)
+        return _fallback_after_error(policy, exc, category="validation_error")
 
     store.save_candidate_context(
         cache_key=cache_key,
