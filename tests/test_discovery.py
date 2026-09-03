@@ -7,6 +7,7 @@ from job_hunter.canonical import CanonicalResolver
 from job_hunter.discovery import collect_candidates
 from job_hunter.models import (
     AtsReference,
+    CandidatePreferences,
     CanonicalResolution,
     Evaluation,
     Job,
@@ -725,6 +726,89 @@ def test_collect_candidates_attributes_market_before_prefilter(store, market_pol
     assert job.market_id == "london"
     assert store.get_job(job_id).market_id == "london"
     assert result.stats.eligible_by_market == {"london": 1}
+
+
+def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_order(
+    store, policy
+):
+    policy.max_jobs_per_run = 1  # shortlist = 2
+    # All three share source/URL host, so only the profile-driven rank score
+    # (not source_quality) can explain who's shortlisted. Discovery order is
+    # poor_fit, third_job (also a poor fit), strong_fit -- the strong fit is
+    # discovered LAST, on purpose: discovery-order bounding would shortlist
+    # poor_fit and third_job (the first two seen) and exclude strong_fit;
+    # rank-based bounding must do the opposite and exclude third_job instead.
+    poor_fit = Job(
+        source="arbeitnow",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://arbeitnow.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    third_job = Job(
+        source="arbeitnow",
+        source_job_id="3",
+        title="Senior Product Engineer",
+        company="Gamma",
+        url="https://arbeitnow.test/jobs/3",
+        description="React TypeScript",
+        remote=True,
+    )
+    strong_fit = Job(
+        source="arbeitnow",
+        source_job_id="2",
+        title="Staff Frontend Engineer",
+        company="Beta",
+        url="https://arbeitnow.test/jobs/2",
+        description="React TypeScript design system ownership",
+        remote=True,
+    )
+    preferences = CandidatePreferences(
+        preferred_roles=["staff frontend engineer"],
+        preferred_seniority=["staff"],
+        must_have_signals=["design system"],
+        nice_to_have_signals=[],
+        preferred_locations=[],
+        avoid_signals=[],
+        summary="",
+    )
+
+    class JobIdCountingResolver:
+        """Records job.source_job_id per resolve() call -- distinguishes
+        which of the three same-source jobs was actually resolved, which
+        SourceCountingResolver (keyed on job.source) cannot do here."""
+
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, job):
+            self.calls.append(job.source_job_id)
+            return None
+
+    resolver = JobIdCountingResolver()
+
+    result = collect_candidates(
+        [FakeSource([poor_fit, third_job, strong_fit])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+        preferences=preferences,
+    )
+
+    # profile_priority_score gives strong_fit (exact role/seniority match
+    # plus the must-have "design system" signal) 73, and poor_fit/third_job
+    # (identical except company name) 26 each, tied but broken by company
+    # name ("Acme" < "Gamma") in poor_fit's favor. Shortlist = top 2 by
+    # score: strong_fit and poor_fit. Pass 2 then resolves in ORIGINAL
+    # discovery order among the shortlisted -- poor_fit (seen 1st), then
+    # strong_fit (seen 3rd, last) -- skipping third_job (seen 2nd) entirely.
+    assert resolver.calls == ["1", "2"]
+    assert result.stats.canonical_network_attempts == 2
+    assert result.stats.canonical_budget_exhausted == 1
+    assert len(result.eligible) == 3
 
 
 def test_collect_candidates_rejects_onsite_israel_job(store, market_policy):

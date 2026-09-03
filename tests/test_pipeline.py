@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+import job_hunter.pipeline
 from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import (
@@ -1357,6 +1358,29 @@ def test_pipeline_loads_candidate_context_once_without_logging_profile(settings,
     assert settings.candidate_profile not in caplog.text
     assert job.description not in caplog.text
     assert gemini.eval_calls == 1
+
+
+def test_pipeline_passes_loaded_preferences_into_discovery(settings, monkeypatch):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini()
+    telegram = FakeTelegram()
+    captured = {}
+
+    real_collect_candidates = job_hunter.pipeline.collect_candidates
+
+    def capturing_collect_candidates(*args, **kwargs):
+        captured["preferences"] = kwargs.get("preferences")
+        return real_collect_candidates(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "job_hunter.pipeline.collect_candidates", capturing_collect_candidates
+    )
+
+    run_pipeline(settings, sources=[FakeSource([job])], store=store, gemini=gemini, telegram=telegram)
+
+    assert captured["preferences"] is not None
+    assert captured["preferences"] == _candidate_context().preferences
 
 
 def test_pipeline_defers_evaluation_when_budget_exceeded(settings):
