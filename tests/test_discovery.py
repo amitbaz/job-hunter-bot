@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from job_hunter.canonical import CanonicalResolver
 from job_hunter.discovery import collect_candidates
 from job_hunter.models import (
     AtsReference,
@@ -567,6 +568,46 @@ def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
     assert len(resolver.calls) == 2
     assert result.stats.canonical_budget_exhausted == 3
     assert len(result.eligible) == 5
+
+
+def test_collect_candidates_does_not_charge_budget_for_already_ats_urls(
+    store, policy
+):
+    already_ats = Job(
+        source="arbeitnow",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://jobs.lever.co/acme/abc123",
+        description="React TypeScript",
+        remote=True,
+    )
+    needs_resolution = Job(
+        source="arbeitnow",
+        source_job_id="2",
+        title="Senior Product Engineer",
+        company="Beta",
+        url="https://aggregator.test/jobs/2",
+        description="React TypeScript",
+        remote=True,
+    )
+    policy.max_canonical_resolutions_per_run = 1
+    resolver = CanonicalResolver(NoOpHttp(), lambda job: [], lambda company: None)
+
+    result = collect_candidates(
+        [FakeSource([already_ats, needs_resolution])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+    )
+
+    # The already-ATS job resolves for free (method="direct", no network call),
+    # so it must not consume the single resolution slot: the second job still
+    # gets its resolution attempt instead of being counted as budget-exhausted.
+    assert result.stats.canonical_resolved == 1
+    assert result.stats.canonical_unresolved == 1
+    assert result.stats.canonical_budget_exhausted == 0
 
 
 def test_collect_candidates_still_canonicalizes_eligible_jobs(store, policy):

@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from job_hunter.ats_registry import harvest_ats_board
-from job_hunter.canonical import CanonicalResolver
+from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
 from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import job_fallback_identity
@@ -331,10 +331,18 @@ def collect_candidates(
         # runs only for jobs that survived prefiltering, and only while the
         # per-run budget lasts.
         if resolver is not None and job.url:
-            if resolutions_used >= policy.max_canonical_resolutions_per_run:
+            # An already-supported-ATS URL resolves for free inside
+            # CanonicalResolver.resolve() (method="direct", no network call),
+            # so it must not consume a budget slot.
+            already_ats_url = parse_supported_ats_url(job.url) is not None
+            if (
+                not already_ats_url
+                and resolutions_used >= policy.max_canonical_resolutions_per_run
+            ):
                 stats.canonical_budget_exhausted += 1
             else:
-                resolutions_used += 1
+                if not already_ats_url:
+                    resolutions_used += 1
                 try:
                     resolution = resolver.resolve(job)
                 except Exception:
