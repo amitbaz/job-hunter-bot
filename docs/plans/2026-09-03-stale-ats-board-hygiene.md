@@ -502,7 +502,7 @@ def test_learned_ats_source_deactivates_board_after_repeated_404s():
     base = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
     http = RoutingHttp(
         responses={
-            "lever.co/healthy-co": [
+            "healthy-co": [
                 {
                     "id": "1",
                     "text": "Engineer",
@@ -513,7 +513,7 @@ def test_learned_ats_source_deactivates_board_after_repeated_404s():
                 }
             ],
         },
-        not_found_urls={"lever.co/dead-co"},
+        not_found_urls={"dead-co"},
     )
 
     for i in range(3):
@@ -530,7 +530,7 @@ def test_learned_ats_source_deactivates_board_after_repeated_404s():
     assert due_identifiers == {"healthy-co"}
 ```
 
-Note: this last test requires `RoutingHttp` marker matching to disambiguate `lever.co/dead-co` vs `lever.co/healthy-co` — both markers are checked as substrings against the full URL (`https://api.lever.co/v0/postings/{site}?mode=json`), so `lever.co/dead-co` only matches the dead board's URL. This already works with the existing substring-based fake.
+Note: this last test requires `RoutingHttp` marker matching to disambiguate the two boards. The board identifier itself (`dead-co` / `healthy-co`) is part of the constructed URL (`https://api.lever.co/v0/postings/{site}?mode=json`) and neither identifier is a substring of the other, so using the bare identifiers as markers unambiguously routes each board's request. This already works with the existing substring-based fake.
 
 **Step 2: Run tests to verify they fail**
 
