@@ -445,3 +445,37 @@ def test_sync_gmail_dry_run_tracks_gemini_usage_without_touching_readonly_store(
     with sqlite3.connect(settings.db_path) as connection:
         rows = connection.execute("SELECT * FROM gemini_usage").fetchall()
     assert rows == []
+
+
+def test_parser_accepts_generate_cover_letter_job_id():
+    args = cli.build_parser().parse_args(["generate-cover-letter", "--job-id", "7"])
+    assert args.command == "generate-cover-letter"
+    assert args.job_id == 7
+    assert args.config == "config/search.yml"
+
+
+def test_generate_cover_letter_delegates_with_job_id(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "generate_cover_letter_on_demand",
+        lambda s, job_id, **kwargs: calls.append((s, job_id)) or True,
+    )
+
+    exit_code = cli.main(["generate-cover-letter", "--job-id", "42"])
+
+    assert exit_code == 0
+    assert calls == [(settings, 42)]
+
+
+def test_generate_cover_letter_returns_nonzero_when_not_delivered(monkeypatch, tmp_path):
+    settings = _settings(tmp_path)
+    monkeypatch.setattr(cli, "load_settings", lambda path: settings)
+    monkeypatch.setattr(cli, "generate_cover_letter_on_demand", lambda s, job_id, **kwargs: False)
+
+    exit_code = cli.main(["generate-cover-letter", "--job-id", "42"])
+
+    assert exit_code == 1

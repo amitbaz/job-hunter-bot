@@ -13,8 +13,14 @@ from job_hunter.gmail_auth import GoogleOAuthTokenProvider
 from job_hunter.gmail_client import GmailClient
 from job_hunter.gmail_sync import GmailSyncService
 from job_hunter.http import HttpClient
-from job_hunter.pipeline import cover_letter_output_dir, run_pipeline, should_run_scheduled
+from job_hunter.pipeline import (
+    cover_letter_output_dir,
+    generate_cover_letter_on_demand,
+    run_pipeline,
+    should_run_scheduled,
+)
 from job_hunter.store import JobStore
+from job_hunter.telegram import TelegramClient
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Repeat the 120-day backfill idempotently",
     )
 
+    gen_parser = subparsers.add_parser(
+        "generate-cover-letter", help="Generate (or resend) a cover letter for one job on demand"
+    )
+    gen_parser.add_argument("--job-id", type=int, required=True)
+    gen_parser.add_argument("--config", default="config/search.yml", help="Path to search.yml")
+
     return parser
 
 
@@ -54,6 +66,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "sync-gmail":
             return _sync_gmail(args)
+        if args.command == "generate-cover-letter":
+            return _generate_cover_letter(args)
         return _run(args)
     except Exception:
         logger.exception("job hunter run failed")
@@ -93,6 +107,26 @@ def _run(args: argparse.Namespace) -> int:
         summary.errors,
     )
     return 0
+
+
+def _generate_cover_letter(args: argparse.Namespace) -> int:
+    settings = load_settings(Path(args.config))
+    Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
+    cover_letter_output_dir(settings).mkdir(parents=True, exist_ok=True)
+
+    store = JobStore(settings.db_path)
+    http = HttpClient()
+    tracker = GeminiUsageTracker(
+        store, settings.gemini_quota, settings.gemini_model, run_id=os.getenv("GEMINI_RUN_ID")
+    )
+    gemini = GeminiClient(settings.gemini_api_key, settings.gemini_model, http, tracker=tracker)
+    telegram = TelegramClient(settings.telegram_bot_token, settings.telegram_chat_id, http)
+
+    delivered = generate_cover_letter_on_demand(
+        settings, args.job_id, store=store, gemini=gemini, telegram=telegram
+    )
+    logger.info("on-demand cover letter for job_id=%s: delivered=%s", args.job_id, delivered)
+    return 0 if delivered else 1
 
 
 def _sync_gmail(args: argparse.Namespace) -> int:
