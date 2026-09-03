@@ -54,7 +54,6 @@ from job_hunter.telegram import (
     TelegramClient,
     build_digest,
     build_gemini_pause_warning,
-    build_gemini_usage_status,
     build_gmail_review_digest_chunks,
     select_deliverable_items,
 )
@@ -858,10 +857,6 @@ def run_pipeline(
                     telegram.send_message(warning)
                 except Exception:
                     logger.exception("failed to send Gemini pause warning to Telegram")
-            try:
-                telegram.send_message(build_gemini_usage_status(usage_summary))
-            except Exception:
-                logger.exception("failed to send Gemini usage status to Telegram")
 
         if deliverable_items and supports_navigation:
             now = datetime.now(timezone.utc)
