@@ -211,6 +211,18 @@ def test_wellfound_global_dedup_across_listings_keeps_first_market_hint():
     assert len(detail_calls) == 1
 
 
+def test_fetch_job_sets_source_page_html_for_canonical_reuse():
+    http = FakeHttp()
+    listings = [WellfoundListing(url="https://wellfound.com/role/l/x/y", market_id="germany_eu")]
+    source = WellfoundSource(http, listings)
+
+    jobs = source.discover()
+
+    assert len(jobs) == 2
+    assert all(job.source_page_html for job in jobs)
+    assert "Frontend Engineer" in jobs[0].source_page_html
+
+
 def test_wellfound_caps_new_detail_urls_per_listing():
     listing_html = """
     <a href="/jobs/1-job-one">Job One</a>

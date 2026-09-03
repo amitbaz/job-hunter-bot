@@ -62,13 +62,22 @@ class CanonicalResolver:
 
         response_url = ""
         response_text = ""
-        try:
-            response = self._http.get(job.url)
-            response.raise_for_status()
-            response_url = response.url
-            response_text = response.text
-        except Exception:
-            pass
+        if job.source_page_html:
+            # The source adapter already fetched this exact URL during
+            # discovery (e.g. Wellfound); reuse its page content instead of
+            # refetching. Redirect-based ATS detection doesn't apply here
+            # since no HTTP round trip happened, but embedded-link detection
+            # still works against the cached HTML below.
+            response_url = job.url
+            response_text = job.source_page_html
+        else:
+            try:
+                response = self._http.get(job.url)
+                response.raise_for_status()
+                response_url = response.url
+                response_text = response.text
+            except Exception:
+                pass
 
         redirected_ats = parse_supported_ats_url(response_url)
         if redirected_ats is not None:

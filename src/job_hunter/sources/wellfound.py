@@ -174,6 +174,7 @@ def _parse_detail(html: str, job_id: str, detail_url: str, market_id: str) -> Jo
         description=description,
         remote=_parse_work_mode(description),
         market_hint=market_id,
+        source_page_html=html,
     )
 
 
