@@ -308,7 +308,7 @@ def get_candidate_context(
         return _fallback_after_error(
             policy,
             exc,
-            reason=f"category=malformed_structured_output {' '.join(str(exc).split())[:180]}",
+            reason=f"{' '.join(str(exc).split())[:180]} category=malformed_structured_output",
         )
     except Exception as exc:
         return _fallback_after_error(policy, exc)
