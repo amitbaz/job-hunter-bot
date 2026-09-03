@@ -11,6 +11,7 @@ from job_hunter.search_backend import BraveSearchBackend
 from job_hunter.search_budget import (
     BraveRequestBudget,
     SearchUsageLedger,
+    brave_queries_available_today,
     split_queries_for_brave,
 )
 from job_hunter.store import JobStore
