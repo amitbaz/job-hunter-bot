@@ -36,6 +36,7 @@ def _settings():
         telegram_webhook_secret="webhook-secret",
         github_repository="amitbaz/job-hunter-bot",
         github_state_token="github-token",
+        github_dispatch_token="dispatch-token",
         github_state_artifact_name="job-hunter-state",
         github_state_cache_dir="/tmp/job-hunter-state",
     )
@@ -185,3 +186,51 @@ def test_webhook_ignores_non_callback_updates():
 
     assert response.status_code == 200
     assert repository.calls == []
+
+
+class FakeDispatcher:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, repo, token, event_type, client_payload, *, http=None):
+        self.calls.append((repo, token, event_type, client_payload))
+
+
+def test_gen_cl_callback_triggers_repository_dispatch(monkeypatch):
+    dispatcher = FakeDispatcher()
+    monkeypatch.setattr("job_hunter.telegram_webhook.trigger_repository_dispatch", dispatcher)
+
+    repository = FakeNavigationRepository(_session())
+    telegram = FakeTelegram()
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
+
+    response = app.test_client().post(
+        "/telegram/webhook",
+        json=_callback_update("c|session1|1"),
+        headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+    )
+
+    assert response.status_code == 200
+    assert dispatcher.calls == [
+        ("amitbaz/job-hunter-bot", "dispatch-token", "generate_cover_letter", {"job_id": 2})
+    ]
+    assert "cover letter" in telegram.answers[-1][1].lower()
+
+
+def test_gen_cl_dispatch_failure_still_acknowledges_callback(monkeypatch):
+    def _boom(*args, **kwargs):
+        raise RuntimeError("github unavailable")
+
+    monkeypatch.setattr("job_hunter.telegram_webhook.trigger_repository_dispatch", _boom)
+
+    repository = FakeNavigationRepository(_session())
+    telegram = FakeTelegram()
+    app = create_app(settings=_settings(), navigation_repository=repository, telegram=telegram)
+
+    response = app.test_client().post(
+        "/telegram/webhook",
+        json=_callback_update("c|session1|1"),
+        headers={"X-Telegram-Bot-Api-Secret-Token": "webhook-secret"},
+    )
+
+    assert response.status_code == 200
