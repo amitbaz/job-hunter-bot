@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from job_hunter.models import Job
 
-from .base import logger, strip_html
+from .base import is_stale_board_error, logger, strip_html
 
 _URL_TEMPLATE = "https://api.lever.co/v0/postings/{site}?mode=json"
 
@@ -18,8 +18,13 @@ class LeverSource:
     def discover(self) -> list[Job]:
         try:
             data = self._http.get_json(_URL_TEMPLATE.format(site=self._site))
-        except Exception:
-            logger.warning("lever discovery failed for site %s", self._site, exc_info=True)
+        except Exception as exc:
+            if is_stale_board_error(exc):
+                logger.info("lever board not found (404) for site %s", self._site)
+            else:
+                logger.warning(
+                    "lever discovery failed for site %s", self._site, exc_info=True
+                )
             return []
 
         jobs = []
