@@ -135,11 +135,15 @@ def test_brave_query_selection_round_robins_across_markets():
 class _Response:
     status_code = 200
 
-    def __init__(self, text: str):
+    def __init__(self, text: str = "", payload=None):
         self.text = text
+        self._payload = payload
 
     def raise_for_status(self):
         return None
+
+    def json(self):
+        return self._payload
 
 
 class _Http:
@@ -148,11 +152,33 @@ class _Http:
 
     def get(self, url, **kwargs):
         self.urls.append(url)
-        return _Response('<a class="result__a" href="https://jobs.ashbyhq.com/hera/123">Founding Software Engineer</a>')
+        if "api.search.brave.com" in url:
+            return _Response(
+                payload={
+                    "web": {
+                        "results": [
+                            {
+                                "title": "Founding Software Engineer",
+                                "url": "https://jobs.ashbyhq.com/hera/123",
+                            }
+                        ]
+                    }
+                }
+            )
+        return _Response(
+            '<a class="result__a" href="https://jobs.ashbyhq.com/hera/123">Founding Software Engineer</a>'
+        )
 
 
-def test_canonical_lookup_never_spends_brave_search(monkeypatch):
-    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "configured-but-budgeted")
+def test_canonical_lookup_uses_shared_brave_budget_then_falls_back_to_ddg(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "configured-and-budgeted")
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+    ledger = SearchUsageLedger(tmp_path / "state.sqlite3")
+    budget = search_budget.BraveRequestBudget(
+        ledger, monthly_limit=1, now=lambda: now
+    )
     http = _Http()
     job = Job(
         source="test",
@@ -161,8 +187,14 @@ def test_canonical_lookup_never_spends_brave_search(monkeypatch):
         url="https://example.com/job",
     )
 
-    _targeted_canonical_candidates(http, job, CircuitBreaker(5))
+    _targeted_canonical_candidates(http, job, CircuitBreaker(5), budget)
+    _targeted_canonical_candidates(http, job, CircuitBreaker(5), budget)
 
-    assert http.urls
-    assert all("api.search.brave.com" not in url for url in http.urls)
-    assert any("duckduckgo.com" in url for url in http.urls)
+    brave_calls = [url for url in http.urls if "api.search.brave.com" in url]
+    ddg_calls = [url for url in http.urls if "duckduckgo.com" in url]
+    assert len(brave_calls) == 1
+    assert len(ddg_calls) == 1
+
+    month_start = datetime(2026, 9, 1, tzinfo=UTC)
+    next_month = datetime(2026, 10, 1, tzinfo=UTC)
+    assert ledger.count(provider="brave", start_at=month_start, end_at=next_month) == 1
