@@ -1,8 +1,11 @@
+import base64
 import dataclasses
+from pathlib import Path
 
 import pytest
 
 from job_hunter.circuit_breaker import CircuitBreaker
+from job_hunter.config import load_settings
 from job_hunter.models import GeminiQuotaSettings, SearchPolicy, Settings
 from job_hunter.sources import (
     ArbeitnowSource,
@@ -19,6 +22,8 @@ from job_hunter.sources import (
 )
 from job_hunter.store import JobStore
 from tests.market_fixtures import make_market, make_market_policy
+
+_REPO_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config" / "search.yml"
 
 
 _DUCKDUCKGO_HTML = """
@@ -660,6 +665,39 @@ def test_build_sources_skips_wellfound_when_only_disabled_market_lists_it(
 
     kinds = [type(s).__name__ for s in sources]
     assert "WellfoundSource" not in kinds
+
+
+def test_build_sources_from_real_config_includes_new_coverage_sources_and_no_ddg(
+    fake_http, monkeypatch, tmp_path
+):
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "g")
+    monkeypatch.setenv(
+        "CANDIDATE_PROFILE_B64", base64.b64encode(b"profile").decode()
+    )
+    monkeypatch.setenv(
+        "COVER_LETTER_TEMPLATE_B64", base64.b64encode(b"template").decode()
+    )
+    monkeypatch.setenv("JOB_HUNTER_DRY_RUN", "1")
+    monkeypatch.setenv("GEMINI_FREE_RPM", "10")
+    monkeypatch.setenv("GEMINI_FREE_TPM", "250000")
+    monkeypatch.setenv("GEMINI_FREE_RPD", "500")
+    monkeypatch.setenv("JOB_HUNTER_DB_PATH", str(tmp_path / "usage.sqlite3"))
+
+    settings = load_settings(_REPO_CONFIG_PATH)
+    store = JobStore(str(tmp_path / "store.sqlite3"))
+
+    sources = build_sources(settings, fake_http, store=store)
+
+    kinds = [type(s).__name__ for s in sources]
+    assert "RemotiveSource" in kinds
+    assert "ArbeitnowSource" in kinds
+    assert "JobicySource" in kinds
+    assert "HimalayasSource" in kinds
+    assert "DevJobsSource" in kinds
+    assert "WellfoundSource" in kinds
+    assert "LearnedAtsSource" in kinds
+    assert "DuckDuckGoSource" not in kinds
 
 
 def test_duckduckgo_opens_circuit_after_consecutive_failures():
