@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from job_hunter.models import Job
 
-from .base import logger, strip_html
+from .base import is_stale_board_error, logger, strip_html
 
 _URL_TEMPLATE = "https://boards-api.greenhouse.io/v1/boards/{token}/jobs?content=true"
 
@@ -15,8 +15,13 @@ class GreenhouseSource:
     def discover(self) -> list[Job]:
         try:
             data = self._http.get_json(_URL_TEMPLATE.format(token=self._token))
-        except Exception:
-            logger.warning("greenhouse discovery failed for token %s", self._token, exc_info=True)
+        except Exception as exc:
+            if is_stale_board_error(exc):
+                logger.info("greenhouse board not found (404) for token %s", self._token)
+            else:
+                logger.warning(
+                    "greenhouse discovery failed for token %s", self._token, exc_info=True
+                )
             return []
 
         jobs = []

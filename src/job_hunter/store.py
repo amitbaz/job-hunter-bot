@@ -275,6 +275,7 @@ CREATE TABLE IF NOT EXISTS ats_registry (
 """
 
 _DELIVERABLE_SCORE_FLOOR = 60
+_STALE_BOARD_DEACTIVATION_THRESHOLD = 3
 _SUPPORTED_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
 
 
@@ -1356,27 +1357,71 @@ class JobStore:
             )
 
     def record_ats_scan_failure(
-        self, provider: str, board_identifier: str, now: datetime
+        self,
+        provider: str,
+        board_identifier: str,
+        now: datetime,
+        *,
+        permanent: bool = False,
     ) -> None:
-        """Increment scan failures and pause the board for 24 hours.
+        """Increment scan failures and back off the board.
 
-        Failures are isolated per board: a failed board is paused rather
-        than failing the whole run.
+        Every failure is isolated per board and gets the same 24h pause so
+        it retries soon. `consecutive_failures` is a single shared counter
+        incremented by every failure, transient or permanent alike — it does
+        not track which kind of failure contributed to it. `permanent=True`
+        (a stale-looking 404) additionally escalates: once that shared
+        counter reaches `_STALE_BOARD_DEACTIVATION_THRESHOLD`, a permanent
+        failure deactivates the board (`active = 0`) instead of just pausing
+        it. Transient failures accrue toward the same counter but never
+        deactivate a board on their own — only a `permanent=True` call checks
+        the threshold and can flip `active`. So a mixed sequence such as
+        [transient, transient, permanent] deactivates the board on that
+        single 404, not only after three permanent failures in a row.
+
+        Deactivation preserves registry history — it is not a delete — and
+        `upsert_ats_board` already reactivates any inactive board the next
+        time it is rediscovered. That reactivation only sets `active = 1`;
+        it does not reset `consecutive_failures`, so a rediscovered board
+        that immediately fails again resumes from its prior strike count and
+        can re-deactivate right away, not after three fresh strikes.
         """
         normalized_now = _normalize_utc(now)
         timestamp = normalized_now.isoformat()
         paused_until = (normalized_now + timedelta(hours=24)).isoformat()
         with self._conn:
-            self._conn.execute(
-                """
-                UPDATE ats_registry SET
-                    last_checked_at = ?,
-                    consecutive_failures = consecutive_failures + 1,
-                    paused_until = ?
-                WHERE provider = ? AND board_identifier = ?
-                """,
-                (timestamp, paused_until, provider, board_identifier),
-            )
+            if permanent:
+                self._conn.execute(
+                    """
+                    UPDATE ats_registry SET
+                        last_checked_at = ?,
+                        consecutive_failures = consecutive_failures + 1,
+                        paused_until = ?,
+                        active = CASE
+                            WHEN consecutive_failures + 1 >= ? THEN 0
+                            ELSE active
+                        END
+                    WHERE provider = ? AND board_identifier = ?
+                    """,
+                    (
+                        timestamp,
+                        paused_until,
+                        _STALE_BOARD_DEACTIVATION_THRESHOLD,
+                        provider,
+                        board_identifier,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE ats_registry SET
+                        last_checked_at = ?,
+                        consecutive_failures = consecutive_failures + 1,
+                        paused_until = ?
+                    WHERE provider = ? AND board_identifier = ?
+                    """,
+                    (timestamp, paused_until, provider, board_identifier),
+                )
 
     def record_ats_eligible_job(
         self, provider: str, board_identifier: str, now: datetime

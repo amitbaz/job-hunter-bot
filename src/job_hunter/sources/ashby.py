@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from job_hunter.models import Job
 
-from .base import logger, strip_html
+from .base import is_stale_board_error, logger, strip_html
 
 _URL_TEMPLATE = "https://api.ashbyhq.com/posting-api/job-board/{board}?includeCompensation=true"
 
@@ -15,8 +15,13 @@ class AshbySource:
     def discover(self) -> list[Job]:
         try:
             data = self._http.get_json(_URL_TEMPLATE.format(board=self._board))
-        except Exception:
-            logger.warning("ashby discovery failed for board %s", self._board, exc_info=True)
+        except Exception as exc:
+            if is_stale_board_error(exc):
+                logger.info("ashby board not found (404) for board %s", self._board)
+            else:
+                logger.warning(
+                    "ashby discovery failed for board %s", self._board, exc_info=True
+                )
             return []
 
         jobs = []

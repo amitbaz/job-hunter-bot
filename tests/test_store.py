@@ -488,6 +488,96 @@ def test_ats_scan_success_records_job_count_and_resets_failures():
     assert entry.paused_until is None
 
 
+def test_ats_permanent_failure_deactivates_board_after_three_in_a_row():
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="lever", board_identifier="dead-co")
+
+    for i in range(3):
+        store.record_ats_scan_failure(
+            "lever", "dead-co", now + timedelta(hours=25 * i), permanent=True
+        )
+
+    # Deactivated boards are never returned by list_due_ats_boards, even
+    # once any pause would have expired.
+    much_later = now + timedelta(days=30)
+    assert store.list_due_ats_boards(much_later) == []
+
+
+def test_ats_permanent_failure_stays_active_below_threshold():
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="lever", board_identifier="maybe-dead")
+
+    store.record_ats_scan_failure("lever", "maybe-dead", now, permanent=True)
+    store.record_ats_scan_failure(
+        "lever", "maybe-dead", now + timedelta(hours=25), permanent=True
+    )
+
+    due = store.list_due_ats_boards(now + timedelta(hours=50))
+    assert [e.board_identifier for e in due] == ["maybe-dead"]
+    assert due[0].consecutive_failures == 2
+
+
+def test_ats_transient_failure_never_deactivates_board():
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="greenhouse", board_identifier="flaky")
+
+    for i in range(10):
+        store.record_ats_scan_failure(
+            "greenhouse", "flaky", now + timedelta(hours=25 * i)
+        )
+
+    due = store.list_due_ats_boards(now + timedelta(days=30))
+    assert due[0].board_identifier == "flaky"
+    assert due[0].consecutive_failures == 10
+    assert due[0].active is True
+
+
+def test_ats_mixed_transient_then_permanent_failure_deactivates_board():
+    # consecutive_failures is one shared counter incremented by both
+    # transient and permanent failures, so two transient failures followed
+    # by a single permanent one reaches the threshold on that 404 alone —
+    # not after three permanent failures in a row. This pins the documented
+    # (if slightly surprising) real behavior of record_ats_scan_failure.
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="lever", board_identifier="mixed-co")
+
+    store.record_ats_scan_failure("lever", "mixed-co", now, permanent=False)
+    store.record_ats_scan_failure(
+        "lever", "mixed-co", now + timedelta(hours=25), permanent=False
+    )
+    store.record_ats_scan_failure(
+        "lever", "mixed-co", now + timedelta(hours=25 * 2), permanent=True
+    )
+
+    assert store.list_due_ats_boards(now + timedelta(days=30)) == []
+
+
+def test_ats_deactivated_board_reactivates_on_rediscovery():
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="lever", board_identifier="reborn-co")
+    for i in range(3):
+        store.record_ats_scan_failure(
+            "lever", "reborn-co", now + timedelta(hours=25 * i), permanent=True
+        )
+    assert store.list_due_ats_boards(now + timedelta(days=30)) == []
+
+    # The board resurfaces in a freshly discovered job pointing at the same
+    # provider/board — ordinary rediscovery reactivates it (existing
+    # upsert_ats_board behavior), but the still-unexpired pause still holds.
+    store.upsert_ats_board(provider="lever", board_identifier="reborn-co")
+    last_pause_start = now + timedelta(hours=25 * 2)
+    still_paused_check = last_pause_start + timedelta(hours=1)
+    assert store.list_due_ats_boards(still_paused_check) == []
+    after_pause = last_pause_start + timedelta(hours=25)
+    due = store.list_due_ats_boards(after_pause)
+    assert [e.board_identifier for e in due] == ["reborn-co"]
+
+
 def test_record_job_source_is_idempotent(tmp_path):
     store = JobStore(tmp_path / "state.sqlite3")
     job_id, _, _ = store.upsert_job(
