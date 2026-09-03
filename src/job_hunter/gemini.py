@@ -23,6 +23,14 @@ class GeminiError(RuntimeError):
     pass
 
 
+class GeminiIncompleteResponse(GeminiError):
+    """Raised when Gemini reports that a successful generation was incomplete."""
+
+    def __init__(self, *, finish_reason: str) -> None:
+        self.finish_reason = finish_reason
+        super().__init__(f"Gemini response incomplete: finish_reason={finish_reason}")
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -194,8 +202,10 @@ class GeminiClient:
 
         try:
             data = response.json()
-            parts = data["candidates"][0]["content"]["parts"]
+            candidate = data["candidates"][0]
+            parts = candidate["content"]["parts"]
             text = "".join(part.get("text", "") for part in parts)
+            finish_reason = candidate.get("finishReason")
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise GeminiError("Gemini response missing content") from exc
 
@@ -222,5 +232,8 @@ class GeminiClient:
                     purpose,
                 )
                 self._tracker.record_success(purpose, prompt, now)
+
+        if finish_reason == "MAX_TOKENS":
+            raise GeminiIncompleteResponse(finish_reason=finish_reason)
 
         return text
