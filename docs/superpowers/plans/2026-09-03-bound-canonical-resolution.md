@@ -49,7 +49,7 @@ def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
         )
     ]
     policy.max_canonical_resolutions_per_run = 2
-    resolver = CountingResolver()
+    resolver = SourceCountingResolver()
 
     result = collect_candidates(
         [FakeSource(jobs)], store, NoOpHttp(), policy, resolver=resolver
@@ -57,16 +57,12 @@ def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
 
     # Only the top-2-ranked jobs (by source_quality) get the expensive
     # resolution attempt, regardless of discovery order.
-    assert resolver.calls == ["Senior Product Engineer", "Senior Product Engineer"]
-    resolved_sources = {job.source for job in jobs if job.canonical_url}
-    assert resolved_sources == set()  # CountingResolver returns None by default
+    assert resolver.calls == ["remotive", "hackernews"]
     assert result.stats.canonical_budget_exhausted == 3
     assert len(result.eligible) == 5
 ```
 
-Note: `CountingResolver` records `job.title` per call (see existing fixture), so this only proves *count* + *which underlying jobs* via a follow-up assertion. Since all titles are identical, add a `CountingResolver` variant that instead records `job.source`:
-
-Add this fixture class near the existing `CountingResolver` (keep `CountingResolver` as-is for other tests; add a sibling):
+(`remotive` source_quality=7, `hackernews`=5, both `arbeitnow` copies=3 — the two highest-ranked sources win the 2-slot shortlist; ties within `hackernews`/`arbeitnow` break by company name, but only one `hackernews` and zero `arbeitnow` fit within the top 2. `CountingResolver`, the existing fixture, records `job.title` per call — useless here since every job shares the same title. Add a sibling fixture near it that records `job.source` instead, and use it for every test in this task that needs to know *which* job was resolved rather than just how many:
 
 ```python
 class SourceCountingResolver:
@@ -78,14 +74,6 @@ class SourceCountingResolver:
         self.calls.append(job.source)
         return self._resolution
 ```
-
-And use `SourceCountingResolver` instead of `CountingResolver` in the rewritten test above, asserting:
-
-```python
-    assert resolver.calls == ["remotive", "hackernews"]
-```
-
-(`remotive` source_quality=7, `hackernews`=5, both `arbeitnow` copies=3 — the two highest-ranked sources win the 2-slot shortlist; ties within `hackernews`/`arbeitnow` break by company name, but only one `hackernews` and zero `arbeitnow` fit within the top 2.)
 
 **Step 2: Add a production-shaped bounding test**
 
@@ -413,15 +401,27 @@ def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_
     store, policy
 ):
     policy.max_jobs_per_run = 1  # shortlist = 2
-    # Discovered in this order: a poor fit first, a strong fit second. Under
-    # discovery-order bounding the poor fit would win a shortlist slot;
-    # rank-based bounding must pick the strong fit regardless of order.
+    # All three share source/URL host, so only the profile-driven rank score
+    # (not source_quality) can explain who's shortlisted. Discovery order is
+    # poor_fit, third_job (also a poor fit), strong_fit -- the strong fit is
+    # discovered LAST, on purpose: discovery-order bounding would shortlist
+    # poor_fit and third_job (the first two seen) and exclude strong_fit;
+    # rank-based bounding must do the opposite and exclude third_job instead.
     poor_fit = Job(
         source="arbeitnow",
         source_job_id="1",
         title="Senior Product Engineer",
         company="Acme",
         url="https://arbeitnow.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    third_job = Job(
+        source="arbeitnow",
+        source_job_id="3",
+        title="Senior Product Engineer",
+        company="Gamma",
+        url="https://arbeitnow.test/jobs/3",
         description="React TypeScript",
         remote=True,
     )
@@ -434,15 +434,6 @@ def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_
         description="React TypeScript design system ownership",
         remote=True,
     )
-    third_job = Job(
-        source="arbeitnow",
-        source_job_id="3",
-        title="Senior Product Engineer",
-        company="Gamma",
-        url="https://arbeitnow.test/jobs/3",
-        description="React TypeScript",
-        remote=True,
-    )
     preferences = CandidatePreferences(
         preferred_roles=["staff frontend engineer"],
         preferred_seniority=["staff"],
@@ -452,10 +443,23 @@ def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_
         avoid_signals=[],
         summary="",
     )
-    resolver = SourceCountingResolver()
+
+    class JobIdCountingResolver:
+        """Records job.source_job_id per resolve() call -- distinguishes
+        which of the three same-source jobs was actually resolved, which
+        SourceCountingResolver (keyed on job.source) cannot do here."""
+
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, job):
+            self.calls.append(job.source_job_id)
+            return None
+
+    resolver = JobIdCountingResolver()
 
     result = collect_candidates(
-        [FakeSource([poor_fit, strong_fit, third_job])],
+        [FakeSource([poor_fit, third_job, strong_fit])],
         store,
         NoOpHttp(),
         policy,
@@ -463,18 +467,24 @@ def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_
         preferences=preferences,
     )
 
-    assert "2" not in [job.source_job_id for job in [poor_fit, strong_fit, third_job] if False]
-    assert len(resolver.calls) == 2
+    # profile_priority_score gives strong_fit (exact role/seniority match
+    # plus the must-have "design system" signal) 73, and poor_fit/third_job
+    # (identical except company name) 26 each, tied but broken by company
+    # name ("Acme" < "Gamma") in poor_fit's favor. Shortlist = top 2 by
+    # score: strong_fit and poor_fit. Pass 2 then resolves in ORIGINAL
+    # discovery order among the shortlisted -- poor_fit (seen 1st), then
+    # strong_fit (seen 3rd, last) -- skipping third_job (seen 2nd) entirely.
+    assert resolver.calls == ["1", "2"]
     assert result.stats.canonical_network_attempts == 2
+    assert result.stats.canonical_budget_exhausted == 1
+    assert len(result.eligible) == 3
 ```
 
-(This test only checks the *count* is bounded to the shortlist size of 2 under preference-driven ranking; adjust/tighten the assertion in Step 2 below once you've confirmed via a debugger or print which two jobs the profile-aware scorer actually ranks highest, since `profile_priority_score` combines several signals — do not guess the exact winners without running it.)
-
-**Step 2: Run and inspect, then tighten the assertion**
+**Step 2: Run it and confirm it passes**
 
 Run: `pytest tests/test_discovery.py::test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_order -v`
 
-This should already pass once Task 2 lands, since `collect_candidates` already accepts and threads `preferences` — the point of this test is to pin the *contract* (preferences change shortlist composition), not to introduce new production code. If it passes trivially without proving anything (e.g. because all three jobs tie), strengthen the fixture until the strong-fit job is provably prioritized over the poor-fit job — replace the placeholder assertion in Step 1 with a concrete one naming which `source_job_id`s ended up in `resolver.calls` by switching `SourceCountingResolver` to record `job.source_job_id` instead of `job.source` for this test only (define a small local resolver class in the test, or extend `SourceCountingResolver` to accept a field-getter).
+Expected: PASS — `collect_candidates` already accepts and threads `preferences` as of Task 2, so this test needs no new production code; it exists to pin the contract (preferences drive shortlist composition, not discovery order) with a regression test before touching `pipeline.py` in the next step.
 
 **Step 3: Reorder `run_pipeline` so `preferences` is available before `collect_candidates` runs**
 
