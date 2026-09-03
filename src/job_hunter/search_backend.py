@@ -14,6 +14,10 @@ _DDG_URL = "https://duckduckgo.com/html/"
 _BRAVE_URL = "https://api.search.brave.com/res/v1/web/search"
 
 
+class SearchBudgetExhausted(RuntimeError):
+    """Raised before provider I/O when no metered search capacity remains."""
+
+
 @dataclass(frozen=True, slots=True)
 class SearchHit:
     title: str
@@ -83,7 +87,7 @@ class BraveSearchBackend:
         http,
         api_key: str,
         *,
-        on_attempt: Callable[[], None] | None = None,
+        on_attempt: Callable[[], bool | None] | None = None,
     ) -> None:
         if not api_key.strip():
             raise ValueError("Brave Search API key must be non-empty")
@@ -95,8 +99,8 @@ class BraveSearchBackend:
         # Count conservatively before the request: if the network outcome is
         # ambiguous, treating the attempt as billable is safer than risking the
         # configured monthly free-tier ceiling.
-        if self._on_attempt is not None:
-            self._on_attempt()
+        if self._on_attempt is not None and self._on_attempt() is False:
+            raise SearchBudgetExhausted("Brave Search budget exhausted")
         response = self._http.get(
             _BRAVE_URL,
             params={"q": query, "count": 20, "safesearch": "moderate"},
@@ -165,6 +169,11 @@ class FallbackSearchBackend:
         if self._primary is not None:
             try:
                 return self._primary.search(query)
+            except SearchBudgetExhausted:
+                logger.info(
+                    "targeted search budget exhausted; falling back: backend=%s",
+                    self._primary.name,
+                )
             except Exception:
                 logger.warning(
                     "targeted search backend failed; falling back: backend=%s",
@@ -179,12 +188,12 @@ def build_search_backend(
     brave_api_key: str | None = None,
     *,
     enable_brave: bool = False,
-    on_brave_attempt: Callable[[], None] | None = None,
+    on_brave_attempt: Callable[[], bool | None] | None = None,
 ) -> SearchBackend:
     """Build the search chain.
 
-    Brave is deliberately opt-in even when a key exists so auxiliary lookups
-    such as canonical resolution cannot silently consume the metered allowance.
+    Brave is opt-in and callers that enable it should supply shared persisted
+    budget accounting so auxiliary lookups cannot silently consume capacity.
     """
     secondary = DuckDuckGoSearchBackend(http)
     primary = (
