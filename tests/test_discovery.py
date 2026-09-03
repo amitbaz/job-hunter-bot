@@ -7,6 +7,7 @@ from job_hunter.canonical import CanonicalResolver
 from job_hunter.discovery import collect_candidates
 from job_hunter.models import (
     AtsReference,
+    CandidatePreferences,
     CanonicalResolution,
     Evaluation,
     Job,
@@ -509,6 +510,16 @@ class CountingResolver:
         return self._resolution
 
 
+class SourceCountingResolver:
+    def __init__(self, resolution=None):
+        self.calls = []
+        self._resolution = resolution
+
+    def resolve(self, job):
+        self.calls.append(job.source)
+        return self._resolution
+
+
 def test_collect_candidates_skips_canonical_resolution_for_prefiltered_jobs(
     store, policy
 ):
@@ -546,26 +557,42 @@ def test_collect_candidates_skips_canonical_resolution_for_prefiltered_jobs(
 
 
 def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
+    # Same title/description so `_title_fit`/`_strength_evidence` tie --
+    # only `source_quality` (via `job.source`) differs, so rank order is
+    # deterministic: remotive (7) > hackernews (5) > duckduckgo (3,
+    # default -- ranking.py's 7-point tier already includes arbeitnow
+    # alongside remotive, so duckduckgo is the genuinely-default source
+    # here, not arbeitnow). Lowest-ranked sources are discovered FIRST on
+    # purpose: under the old discovery-order behavior they'd win the
+    # 2-slot shortlist; under rank-order bounding they must lose it.
     jobs = [
         Job(
-            source="arbeitnow",
+            source=source,
             source_job_id=str(index),
             title="Senior Product Engineer",
             company=f"Acme {index}",
-            url=f"https://arbeitnow.test/jobs/{index}",
+            url=f"https://{source}.test/jobs/{index}",
             description="React TypeScript",
             remote=True,
         )
-        for index in range(5)
+        for index, source in enumerate(
+            ["duckduckgo", "duckduckgo", "hackernews", "hackernews", "remotive"]
+        )
     ]
     policy.max_canonical_resolutions_per_run = 2
-    resolver = CountingResolver()
+    resolver = SourceCountingResolver()
 
     result = collect_candidates(
         [FakeSource(jobs)], store, NoOpHttp(), policy, resolver=resolver
     )
 
-    assert len(resolver.calls) == 2
+    # Only the top-2-ranked jobs (by source_quality) get the expensive
+    # resolution attempt, regardless of discovery order: remotive (idx 4,
+    # score 7) and the higher-tie-broken hackernews (idx 2, "Acme 2" <
+    # "Acme 3" beats the other hackernews at idx 3). Pass 2 then resolves
+    # in ORIGINAL discovery order among the shortlisted two, so idx 2
+    # (hackernews) is called before idx 4 (remotive) -- NOT rank order.
+    assert resolver.calls == ["hackernews", "remotive"]
     assert result.stats.canonical_budget_exhausted == 3
     assert len(result.eligible) == 5
 
@@ -701,6 +728,171 @@ def test_collect_candidates_attributes_market_before_prefilter(store, market_pol
     assert result.stats.eligible_by_market == {"london": 1}
 
 
+def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_order(
+    store, policy
+):
+    policy.max_jobs_per_run = 1  # shortlist = 2
+    # All three share source/URL host, so only the profile-driven rank score
+    # (not source_quality) can explain who's shortlisted. Discovery order is
+    # poor_fit, third_job (also a poor fit), strong_fit -- the strong fit is
+    # discovered LAST, on purpose: discovery-order bounding would shortlist
+    # poor_fit and third_job (the first two seen) and exclude strong_fit;
+    # rank-based bounding must do the opposite and exclude third_job instead.
+    poor_fit = Job(
+        source="arbeitnow",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://arbeitnow.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    third_job = Job(
+        source="arbeitnow",
+        source_job_id="3",
+        title="Senior Product Engineer",
+        company="Gamma",
+        url="https://arbeitnow.test/jobs/3",
+        description="React TypeScript",
+        remote=True,
+    )
+    strong_fit = Job(
+        source="arbeitnow",
+        source_job_id="2",
+        title="Staff Frontend Engineer",
+        company="Beta",
+        url="https://arbeitnow.test/jobs/2",
+        description="React TypeScript design system ownership",
+        remote=True,
+    )
+    preferences = CandidatePreferences(
+        preferred_roles=["staff frontend engineer"],
+        preferred_seniority=["staff"],
+        must_have_signals=["design system"],
+        nice_to_have_signals=[],
+        preferred_locations=[],
+        avoid_signals=[],
+        summary="",
+    )
+
+    class JobIdCountingResolver:
+        """Records job.source_job_id per resolve() call -- distinguishes
+        which of the three same-source jobs was actually resolved, which
+        SourceCountingResolver (keyed on job.source) cannot do here."""
+
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, job):
+            self.calls.append(job.source_job_id)
+            return None
+
+    resolver = JobIdCountingResolver()
+
+    result = collect_candidates(
+        [FakeSource([poor_fit, third_job, strong_fit])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+        preferences=preferences,
+    )
+
+    # profile_priority_score gives strong_fit (exact role/seniority match
+    # plus the must-have "design system" signal) 73, and poor_fit/third_job
+    # (identical except company name) 26 each, tied but broken by company
+    # name ("Acme" < "Gamma") in poor_fit's favor. Shortlist = top 2 by
+    # score: strong_fit and poor_fit. Pass 2 then resolves in ORIGINAL
+    # discovery order among the shortlisted -- poor_fit (seen 1st), then
+    # strong_fit (seen 3rd, last) -- skipping third_job (seen 2nd) entirely.
+    assert resolver.calls == ["1", "2"]
+    assert result.stats.canonical_network_attempts == 2
+    assert result.stats.canonical_budget_exhausted == 1
+    assert len(result.eligible) == 3
+
+
+def test_collect_candidates_shortlists_diversity_floor_sources_for_resolution(
+    store, policy
+):
+    # 8 remotive jobs + 2 hackernews jobs, all otherwise identical, so
+    # source_quality (remotive=7 > hackernews=5, ranking.py) is the only
+    # thing that separates their rank scores -- every remotive job outranks
+    # every hackernews job. max_jobs_per_run=2 makes shortlist_limit = 4
+    # (2 * _CANONICAL_SHORTLIST_MULTIPLIER). A flat top-4-by-rank slice
+    # would pick 4 remotive jobs and shortlist zero hackernews jobs. But
+    # select_diverse_candidates, with the default source_minimum_per_run=2,
+    # guarantees hackernews (the only other source, with exactly 2 jobs) both
+    # of its slots -- so both hackernews jobs get shortlisted alongside the
+    # top 2 remotive jobs, matching what final selection's own diversity
+    # floor would protect downstream.
+    policy.max_jobs_per_run = 2  # shortlist_limit = 4
+
+    remotive_companies = [
+        "Aaa Corp", "Bbb Corp", "Ccc Corp", "Ddd Corp",
+        "Eee Corp", "Fff Corp", "Ggg Corp", "Hhh Corp",
+    ]
+    remotive_jobs = [
+        Job(
+            source="remotive",
+            source_job_id=f"r{index + 1}",
+            title="Senior Product Engineer",
+            company=company,
+            url=f"https://remotive.test/jobs/r{index + 1}",
+            description="React TypeScript",
+            remote=True,
+        )
+        for index, company in enumerate(remotive_companies)
+    ]
+    hackernews_jobs = [
+        Job(
+            source="hackernews",
+            source_job_id=job_id,
+            title="Senior Product Engineer",
+            company=company,
+            url=f"https://hackernews.test/jobs/{job_id}",
+            description="React TypeScript",
+            remote=True,
+        )
+        for job_id, company in [("h1", "Zzz Inc"), ("h2", "Yyy Inc")]
+    ]
+    preferences = CandidatePreferences(
+        preferred_roles=["senior product engineer"],
+        preferred_seniority=["senior"],
+        must_have_signals=[],
+        nice_to_have_signals=[],
+        preferred_locations=[],
+        avoid_signals=[],
+        summary="",
+    )
+
+    class JobIdCountingResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, job):
+            self.calls.append(job.source_job_id)
+            return None
+
+    resolver = JobIdCountingResolver()
+
+    result = collect_candidates(
+        [FakeSource([*remotive_jobs, *hackernews_jobs])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+        preferences=preferences,
+    )
+
+    # Top 2 remotive by rank (alphabetically-first companies, since score
+    # ties within a source) plus both hackernews jobs, protected by the
+    # diversity floor.
+    assert set(resolver.calls) == {"r1", "r2", "h1", "h2"}
+    assert result.stats.canonical_network_attempts == 4
+    assert result.stats.canonical_budget_exhausted == 6
+    assert len(result.eligible) == 10
+
+
 def test_collect_candidates_rejects_onsite_israel_job(store, market_policy):
     source = FakeSource([
         Job(
@@ -831,3 +1023,63 @@ def test_collect_candidates_counts_one_eligible_per_canonical_duplicate_group_by
     assert result.stats.unique == 2
     assert len(result.eligible) == 1
     assert result.stats.eligible_by_market == {"london": 1}
+
+
+def test_collect_candidates_bounds_expensive_resolution_below_eligible_count(
+    store, policy
+):
+    policy.max_jobs_per_run = 5
+    policy.max_canonical_resolutions_per_run = 80  # not the binding constraint
+    jobs = [
+        Job(
+            source="arbeitnow",
+            source_job_id=str(index),
+            title="Senior Product Engineer",
+            company=f"Acme {index}",
+            url=f"https://arbeitnow.test/jobs/{index}",
+            description="React TypeScript",
+            remote=True,
+        )
+        for index in range(20)
+    ]
+    resolver = CountingResolver()
+
+    result = collect_candidates(
+        [FakeSource(jobs)], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    # Shortlist = max_jobs_per_run * 2 = 10, well below the 20 eligible jobs
+    # and below the flat 80 ceiling -- this is the production regression
+    # from issue #29 (eligible=55 with max_jobs_per_run=35 today).
+    assert len(resolver.calls) == 10
+    assert len(result.eligible) == 20
+    assert result.stats.canonical_network_attempts == 10
+    assert result.stats.canonical_budget_exhausted == 10
+
+
+def test_collect_candidates_always_resolves_already_ats_urls_outside_shortlist(
+    store, policy
+):
+    policy.max_jobs_per_run = 1  # shortlist = 2, far below 10 ATS jobs below
+    jobs = [
+        Job(
+            source="arbeitnow",
+            source_job_id=str(index),
+            title="Senior Product Engineer",
+            company=f"Acme {index}",
+            url=f"https://jobs.lever.co/acme-{index}/abc",
+            description="React TypeScript",
+            remote=True,
+        )
+        for index in range(10)
+    ]
+    resolver = CountingResolver()
+
+    result = collect_candidates(
+        [FakeSource(jobs)], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    # Every already-ATS URL resolves for free regardless of shortlist size.
+    assert len(resolver.calls) == 10
+    assert result.stats.canonical_network_attempts == 0
+    assert result.stats.canonical_budget_exhausted == 0

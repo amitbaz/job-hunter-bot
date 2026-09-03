@@ -10,14 +10,22 @@ from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import job_fallback_identity
 from job_hunter.market_policy import attribute_market, market_by_id
-from job_hunter.models import Job, SearchPolicy
+from job_hunter.models import CandidatePreferences, Job, SearchPolicy
 from job_hunter.normalize import canonicalize_url
 from job_hunter.prefilter import prefilter_job
+from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.store import JobStore
 
 logger = logging.getLogger(__name__)
 
 _ATS_HOSTS = ("jobs.ashbyhq.com", "jobs.lever.co", "boards.greenhouse.io")
+
+# How many candidates beyond max_jobs_per_run to keep in the canonical
+# resolution shortlist, to absorb resolution failures and any reordering
+# that happens once resolved data (e.g. source_quality) feeds back into
+# ranking. Fixed rather than configurable -- see docs/superpowers/plans/
+# 2026-09-03-bound-canonical-resolution.md for why.
+_CANONICAL_SHORTLIST_MULTIPLIER = 2
 
 # Bucket key for jobs that could not be tied to any configured market (or when
 # no markets are configured at all). Kept distinct from real market ids so
@@ -34,6 +42,8 @@ class DiscoveryStats:
     canonical_unresolved: int = 0
     cross_source_duplicates: int = 0
     canonical_budget_exhausted: int = 0
+    canonical_network_attempts: int = 0
+    canonical_shortlist_limit: int = 0
     prefilter_rejected: int = 0
     profession_rejected: int = 0
     eligible: int = 0
@@ -255,6 +265,7 @@ def collect_candidates(
     http: HttpClient,
     policy: SearchPolicy,
     resolver: CanonicalResolver | None = None,
+    preferences: CandidatePreferences | None = None,
 ) -> DiscoveryResult:
     """Discover, canonicalize, deduplicate, persist, and prefilter jobs.
 
@@ -289,10 +300,8 @@ def collect_candidates(
     unique_jobs, stats.cross_source_duplicates = _dedupe(raw_jobs)
     stats.unique = len(unique_jobs)
 
-    eligible: list[tuple[int, Job]] = []
-    eligible_job_ids: set[int] = set()
+    prefiltered: list[tuple[int, Job]] = []
     rediscovered_job_ids: list[int] = []
-    resolutions_used = 0
 
     for job in unique_jobs:
         observed_market_id = _cheap_market_attribution(job, policy)
@@ -327,22 +336,68 @@ def collect_candidates(
             _bump(stats.rejected_by_source, source_label)
             continue
 
-        # Canonical resolution costs a page fetch plus a public search, so it
-        # runs only for jobs that survived prefiltering, and only while the
-        # per-run budget lasts.
+        prefiltered.append((job_id, job))
+
+    # Canonical resolution costs a page fetch plus a public search for jobs
+    # not already on a supported ATS host, so that expensive path only runs
+    # for the highest-ranked prefiltered candidates: the ones that could
+    # realistically survive ranking/selection this run. The shortlist size
+    # is whichever is smaller, the flat per-run ceiling or max_jobs_per_run
+    # times the slack multiplier. Already-supported-ATS URLs resolve locally
+    # at zero network cost, so they are never gated by this shortlist -- and
+    # never consume a shortlist slot either, since they're filtered out
+    # before the slot count is applied below.
+    shortlisted_ids: set[int] = set()
+    if resolver is not None and prefiltered:
+        shortlist_limit = max(
+            0,
+            min(
+                policy.max_canonical_resolutions_per_run,
+                max(0, policy.max_jobs_per_run) * _CANONICAL_SHORTLIST_MULTIPLIER,
+            ),
+        )
+        stats.canonical_shortlist_limit = shortlist_limit
+        ranked_prefiltered = rank_jobs(prefiltered, policy, preferences)
+        needing_resolution_ranked = [
+            item
+            for item in ranked_prefiltered
+            if item[1].url and parse_supported_ats_url(item[1].url) is None
+        ]
+        # Mirror pipeline._select_candidates's own strategy here: a flat
+        # top-N slice when there's no candidate profile to diversify by,
+        # diversity-aware selection when there is. Final selection
+        # guarantees every source a minimum_per_source floor regardless of
+        # global rank, so a flat rank slice here could shortlist zero
+        # candidates from a source that final selection still picks --
+        # leaving those jobs unresolved even though they ship.
+        try:
+            if preferences is None:
+                shortlist = needing_resolution_ranked[:shortlist_limit]
+            else:
+                shortlist = select_diverse_candidates(
+                    needing_resolution_ranked,
+                    limit=shortlist_limit,
+                    minimum_per_source=policy.source_minimum_per_run,
+                    max_share=policy.source_max_share,
+                )
+        except Exception:
+            logger.exception(
+                "canonical shortlist selection failed; falling back to global rank"
+            )
+            shortlist = needing_resolution_ranked[:shortlist_limit]
+        shortlisted_ids = {item[0] for item in shortlist}
+
+    eligible: list[tuple[int, Job]] = []
+    eligible_job_ids: set[int] = set()
+
+    for job_id, job in prefiltered:
         if resolver is not None and job.url:
-            # An already-supported-ATS URL resolves for free inside
-            # CanonicalResolver.resolve() (method="direct", no network call),
-            # so it must not consume a budget slot.
             already_ats_url = parse_supported_ats_url(job.url) is not None
-            if (
-                not already_ats_url
-                and resolutions_used >= policy.max_canonical_resolutions_per_run
-            ):
+            if not already_ats_url and job_id not in shortlisted_ids:
                 stats.canonical_budget_exhausted += 1
             else:
                 if not already_ats_url:
-                    resolutions_used += 1
+                    stats.canonical_network_attempts += 1
                 try:
                     resolution = resolver.resolve(job)
                 except Exception:
@@ -388,7 +443,7 @@ def collect_candidates(
         eligible_job_ids.add(job_id)
         eligible.append((job_id, job))
         _bump(stats.eligible_by_market, job.market_id or _UNATTRIBUTED)
-        _bump(stats.eligible_by_source, source_label)
+        _bump(stats.eligible_by_source, metric_source_label(job.source))
         if job.ats_provider and job.ats_board:
             try:
                 store.record_ats_eligible_job(
@@ -404,11 +459,14 @@ def collect_candidates(
     logger.info(
         "discovery source contribution: %s canonical_resolved=%s "
         "canonical_unresolved=%s canonical_budget_exhausted=%s "
+        "canonical_network_attempts=%s canonical_shortlist_limit=%s "
         "cross_source_duplicates=%s",
         _format_source_contribution(stats.per_source),
         stats.canonical_resolved,
         stats.canonical_unresolved,
         stats.canonical_budget_exhausted,
+        stats.canonical_network_attempts,
+        stats.canonical_shortlist_limit,
         stats.cross_source_duplicates,
     )
 

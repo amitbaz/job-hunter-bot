@@ -319,6 +319,26 @@ def test_source_fetch_failure_does_not_block_targeted_search():
     assert result.method == "targeted_search"
 
 
+def test_reuses_already_fetched_page_html_without_refetching():
+    http = _Http(_Response(url="https://unused.test"))
+    resolver = CanonicalResolver(
+        http, search_candidates=lambda job: [], watch_target=lambda company: None
+    )
+    result = resolver.resolve(
+        Job(
+            source="wellfound",
+            title="Frontend Engineer",
+            company="Acme",
+            url="https://wellfound.com/jobs/123-frontend-engineer",
+            source_page_html='<a href="https://jobs.ashbyhq.com/acme/abc">Apply</a>',
+        )
+    )
+    assert result is not None
+    assert result.url == "https://jobs.ashbyhq.com/acme/abc"
+    assert result.method == "embedded"
+    assert http.calls == 0
+
+
 def test_resolution_failure_is_non_blocking():
     class _FailingHttp:
         def get(self, url, **kwargs):

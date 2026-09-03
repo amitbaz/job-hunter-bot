@@ -93,6 +93,7 @@ class Job:
     ats_job_id: str | None = None
     market_hint: str | None = None
     market_id: str | None = None
+    source_page_html: str = ""
 
 
 @dataclass(slots=True)

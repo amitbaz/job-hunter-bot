@@ -676,17 +676,6 @@ def run_pipeline(
     digest_items: list[DigestItem] = []
     pdf_deliveries: list[tuple[int, Path, DigestItem]] = []
     out_dir = cover_letter_output_dir(settings)
-    discovery = collect_candidates(
-        sources,
-        store,
-        http,
-        settings.policy,
-        resolver=resolver,
-    )
-    search_planned, search_attempted, search_succeeded, search_results = (
-        _aggregate_targeted_search_stats(base_sources)
-    )
-    watch_checks, watch_paused = _watch_check_outcomes(store, due_watches)
     try:
         candidate_context = get_candidate_context(settings.candidate_profile, settings.policy, gemini, store)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
@@ -702,6 +691,18 @@ def run_pipeline(
             candidate_context.load_error or "none",
         )
     preferences = candidate_context.preferences if candidate_context is not None else None
+    discovery = collect_candidates(
+        sources,
+        store,
+        http,
+        settings.policy,
+        resolver=resolver,
+        preferences=preferences,
+    )
+    search_planned, search_attempted, search_succeeded, search_results = (
+        _aggregate_targeted_search_stats(base_sources)
+    )
+    watch_checks, watch_paused = _watch_check_outcomes(store, due_watches)
     summary.skipped += discovery.stats.prefilter_rejected + discovery.stats.profession_rejected
     ranked = rank_jobs(discovery.eligible, settings.policy, preferences)
     selected = _select_candidates(ranked, settings.policy, preferences)
@@ -712,7 +713,7 @@ def run_pipeline(
     decision_counts_by_source: dict[str, dict[str, int]] = {}
     deferred_by_budget = max(0, len(ranked) - len(selected))
     logger.info(
-        "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s sources=%s",
+        "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s canonical_network_attempts=%s sources=%s",
         discovery.stats.raw,
         discovery.stats.unique,
         discovery.stats.prefilter_rejected,
@@ -720,6 +721,7 @@ def run_pipeline(
         discovery.stats.eligible,
         len(selected),
         deferred_by_budget,
+        discovery.stats.canonical_network_attempts,
         len(eligible_source_counts),
     )
     logger.info("eligible sources: %s", _format_source_counts(eligible_source_counts))
