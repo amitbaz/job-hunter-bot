@@ -70,6 +70,10 @@ class CanonicalResolver:
             # still works against the cached HTML below.
             response_url = job.url
             response_text = job.source_page_html
+            # Safe to skip the redirect-based ATS check below: response_url
+            # is job.url, and job.url already failed parse_supported_ats_url
+            # at the direct_ats check above, so the check re-run on
+            # response_url here is guaranteed to also return None.
         else:
             try:
                 response = self._http.get(job.url)

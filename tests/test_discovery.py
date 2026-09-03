@@ -811,6 +811,88 @@ def test_collect_candidates_prioritizes_resolution_by_preferences_not_discovery_
     assert len(result.eligible) == 3
 
 
+def test_collect_candidates_shortlists_diversity_floor_sources_for_resolution(
+    store, policy
+):
+    # 8 remotive jobs + 2 hackernews jobs, all otherwise identical, so
+    # source_quality (remotive=7 > hackernews=5, ranking.py) is the only
+    # thing that separates their rank scores -- every remotive job outranks
+    # every hackernews job. max_jobs_per_run=2 makes shortlist_limit = 4
+    # (2 * _CANONICAL_SHORTLIST_MULTIPLIER). A flat top-4-by-rank slice
+    # would pick 4 remotive jobs and shortlist zero hackernews jobs. But
+    # select_diverse_candidates, with the default source_minimum_per_run=2,
+    # guarantees hackernews (the only other source, with exactly 2 jobs) both
+    # of its slots -- so both hackernews jobs get shortlisted alongside the
+    # top 2 remotive jobs, matching what final selection's own diversity
+    # floor would protect downstream.
+    policy.max_jobs_per_run = 2  # shortlist_limit = 4
+
+    remotive_companies = [
+        "Aaa Corp", "Bbb Corp", "Ccc Corp", "Ddd Corp",
+        "Eee Corp", "Fff Corp", "Ggg Corp", "Hhh Corp",
+    ]
+    remotive_jobs = [
+        Job(
+            source="remotive",
+            source_job_id=f"r{index + 1}",
+            title="Senior Product Engineer",
+            company=company,
+            url=f"https://remotive.test/jobs/r{index + 1}",
+            description="React TypeScript",
+            remote=True,
+        )
+        for index, company in enumerate(remotive_companies)
+    ]
+    hackernews_jobs = [
+        Job(
+            source="hackernews",
+            source_job_id=job_id,
+            title="Senior Product Engineer",
+            company=company,
+            url=f"https://hackernews.test/jobs/{job_id}",
+            description="React TypeScript",
+            remote=True,
+        )
+        for job_id, company in [("h1", "Zzz Inc"), ("h2", "Yyy Inc")]
+    ]
+    preferences = CandidatePreferences(
+        preferred_roles=["senior product engineer"],
+        preferred_seniority=["senior"],
+        must_have_signals=[],
+        nice_to_have_signals=[],
+        preferred_locations=[],
+        avoid_signals=[],
+        summary="",
+    )
+
+    class JobIdCountingResolver:
+        def __init__(self):
+            self.calls = []
+
+        def resolve(self, job):
+            self.calls.append(job.source_job_id)
+            return None
+
+    resolver = JobIdCountingResolver()
+
+    result = collect_candidates(
+        [FakeSource([*remotive_jobs, *hackernews_jobs])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+        preferences=preferences,
+    )
+
+    # Top 2 remotive by rank (alphabetically-first companies, since score
+    # ties within a source) plus both hackernews jobs, protected by the
+    # diversity floor.
+    assert set(resolver.calls) == {"r1", "r2", "h1", "h2"}
+    assert result.stats.canonical_network_attempts == 4
+    assert result.stats.canonical_budget_exhausted == 6
+    assert len(result.eligible) == 10
+
+
 def test_collect_candidates_rejects_onsite_israel_job(store, market_policy):
     source = FakeSource([
         Job(

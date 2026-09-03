@@ -13,7 +13,7 @@ from job_hunter.market_policy import attribute_market, market_by_id
 from job_hunter.models import CandidatePreferences, Job, SearchPolicy
 from job_hunter.normalize import canonicalize_url
 from job_hunter.prefilter import prefilter_job
-from job_hunter.ranking import rank_jobs
+from job_hunter.ranking import rank_jobs, select_diverse_candidates
 from job_hunter.store import JobStore
 
 logger = logging.getLogger(__name__)
@@ -344,21 +344,48 @@ def collect_candidates(
     # realistically survive ranking/selection this run. The shortlist size
     # is whichever is smaller, the flat per-run ceiling or max_jobs_per_run
     # times the slack multiplier. Already-supported-ATS URLs resolve locally
-    # at zero network cost, so they are never gated by this shortlist.
+    # at zero network cost, so they are never gated by this shortlist -- and
+    # never consume a shortlist slot either, since they're filtered out
+    # before the slot count is applied below.
     shortlisted_ids: set[int] = set()
     if resolver is not None and prefiltered:
-        shortlist_limit = min(
-            policy.max_canonical_resolutions_per_run,
-            max(0, policy.max_jobs_per_run) * _CANONICAL_SHORTLIST_MULTIPLIER,
+        shortlist_limit = max(
+            0,
+            min(
+                policy.max_canonical_resolutions_per_run,
+                max(0, policy.max_jobs_per_run) * _CANONICAL_SHORTLIST_MULTIPLIER,
+            ),
         )
         stats.canonical_shortlist_limit = shortlist_limit
         ranked_prefiltered = rank_jobs(prefiltered, policy, preferences)
-        needing_resolution = [
-            ranked_job_id
-            for ranked_job_id, ranked_job, _score in ranked_prefiltered
-            if ranked_job.url and parse_supported_ats_url(ranked_job.url) is None
+        needing_resolution_ranked = [
+            item
+            for item in ranked_prefiltered
+            if item[1].url and parse_supported_ats_url(item[1].url) is None
         ]
-        shortlisted_ids = set(needing_resolution[:shortlist_limit])
+        # Mirror pipeline._select_candidates's own strategy here: a flat
+        # top-N slice when there's no candidate profile to diversify by,
+        # diversity-aware selection when there is. Final selection
+        # guarantees every source a minimum_per_source floor regardless of
+        # global rank, so a flat rank slice here could shortlist zero
+        # candidates from a source that final selection still picks --
+        # leaving those jobs unresolved even though they ship.
+        try:
+            if preferences is None:
+                shortlist = needing_resolution_ranked[:shortlist_limit]
+            else:
+                shortlist = select_diverse_candidates(
+                    needing_resolution_ranked,
+                    limit=shortlist_limit,
+                    minimum_per_source=policy.source_minimum_per_run,
+                    max_share=policy.source_max_share,
+                )
+        except Exception:
+            logger.exception(
+                "canonical shortlist selection failed; falling back to global rank"
+            )
+            shortlist = needing_resolution_ranked[:shortlist_limit]
+        shortlisted_ids = {item[0] for item in shortlist}
 
     eligible: list[tuple[int, Job]] = []
     eligible_job_ids: set[int] = set()
