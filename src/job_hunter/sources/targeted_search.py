@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.models import Job, SearchQuery
-from job_hunter.search_backend import SearchBackend
+from job_hunter.search_backend import SearchBackend, SearchBudgetExhausted
 
 from .base import logger
 
@@ -49,15 +49,22 @@ class TargetedSearchSource:
         for index, query in enumerate(self._queries):
             market_key = query.market_id or "legacy"
             if self._breaker is not None and self._breaker.is_open:
-                logger.warning(
-                    "targeted search circuit open; skipping %s remaining queries",
-                    len(self._queries) - index,
-                )
+                if self._breaker.claim_open_notice():
+                    logger.warning(
+                        "targeted search circuit open; skipping %s remaining queries",
+                        len(self._queries) - index,
+                    )
                 break
 
             _bump(self.stats.attempted_by_market, market_key)
             try:
                 response = self._backend.search(query.text)
+            except SearchBudgetExhausted:
+                logger.info(
+                    "targeted search budget exhausted; skipping %s remaining queries",
+                    len(self._queries) - index,
+                )
+                break
             except Exception:
                 logger.warning(
                     "targeted search query failed: market=%s query=%s",
