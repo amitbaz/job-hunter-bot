@@ -1,6 +1,7 @@
 import pytest
 import requests
 
+import job_hunter.search_backend as search_backend
 from job_hunter.search_backend import (
     BraveSearchBackend,
     DuckDuckGoSearchBackend,
@@ -65,6 +66,16 @@ def test_brave_search_normalizes_web_results_and_authenticates():
     assert kwargs["headers"]["Accept-Encoding"] == "gzip"
     assert kwargs["headers"]["Cache-Control"] == "no-cache"
     assert kwargs["params"]["q"] == "frontend london"
+
+
+def test_brave_search_makes_zero_http_calls_when_budget_reservation_is_denied():
+    http = _Http({"web": {"results": []}})
+    backend = BraveSearchBackend(http, "secret-key", on_attempt=lambda: False)
+
+    with pytest.raises(search_backend.SearchBudgetExhausted):
+        backend.search("frontend london")
+
+    assert http.calls == []
 
 
 def test_brave_validation_error_logs_only_sanitized_metadata(caplog):
