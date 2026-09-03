@@ -6,7 +6,7 @@ from datetime import date, datetime, timezone
 
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.discovery_queries import generate_search_queries
-from job_hunter.models import Settings
+from job_hunter.models import MarketPolicy, Settings
 from job_hunter.search_backend import BraveSearchBackend
 from job_hunter.search_budget import (
     SearchUsageLedger,
@@ -37,6 +37,7 @@ from .yc import YCSource
 
 logger = logging.getLogger(__name__)
 _DEFAULT_BRAVE_MONTHLY_QUERY_LIMIT = 250
+_KNOWN_DIRECT_SOURCES = frozenset({"devjobs", "wellfound"})
 
 __all__ = [
     "JobSource",
@@ -85,6 +86,31 @@ def _brave_monthly_query_limit() -> int:
     return value
 
 
+def _validate_direct_sources(markets: list[MarketPolicy]) -> None:
+    """Reject a `direct_sources` entry with no corresponding adapter.
+
+    A misconfigured entry (typo, unsupported name, or `wellfound` on a market
+    with no configured Wellfound routes) would otherwise silently produce zero
+    sources and zero log output, contradicting the constraint that a
+    configured `direct_sources` entry must correspond to an instantiated
+    adapter. Only enabled markets are checked.
+    """
+    for market in markets:
+        if not market.enabled:
+            continue
+        for name in market.direct_sources or []:
+            if name not in _KNOWN_DIRECT_SOURCES:
+                raise ValueError(
+                    f"market {market.id!r} direct_sources entry {name!r} does not "
+                    f"correspond to any known adapter (known: {sorted(_KNOWN_DIRECT_SOURCES)})"
+                )
+            if name == "wellfound" and not _WELLFOUND_LISTINGS.get(market.id):
+                raise ValueError(
+                    f"market {market.id!r} lists 'wellfound' in direct_sources but "
+                    "has no configured Wellfound routes"
+                )
+
+
 def build_sources(
     settings: Settings,
     http,
@@ -93,6 +119,7 @@ def build_sources(
     search_breaker: CircuitBreaker | None = None,
     query_date: date | None = None,
 ) -> list[JobSource]:
+    _validate_direct_sources(settings.policy.markets)
     queries = generate_search_queries(settings.policy, query_date)
     brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
     targeted_sources: list[JobSource] = []

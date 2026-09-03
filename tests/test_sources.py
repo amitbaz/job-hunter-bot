@@ -667,6 +667,67 @@ def test_build_sources_skips_wellfound_when_only_disabled_market_lists_it(
     assert "WellfoundSource" not in kinds
 
 
+def test_build_sources_rejects_unrecognized_direct_sources_entry(fake_http, policy):
+    policy_with_typo = dataclasses.replace(
+        policy,
+        markets=[make_market("germany_eu", 1.0, direct_sources=["dev_jobs"])],
+    )
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_typo,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    with pytest.raises(ValueError, match="dev_jobs"):
+        build_sources(settings, fake_http)
+
+
+def test_build_sources_rejects_wellfound_direct_source_without_routes(
+    fake_http, policy
+):
+    policy_without_routes = dataclasses.replace(
+        policy,
+        markets=[make_market("singapore", 1.0, direct_sources=["wellfound"])],
+    )
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_without_routes,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    with pytest.raises(ValueError, match="wellfound"):
+        build_sources(settings, fake_http)
+
+
+def test_build_sources_ignores_bad_direct_sources_on_disabled_market(
+    fake_http, policy
+):
+    policy_with_disabled_typo = dataclasses.replace(
+        policy,
+        markets=[make_market("germany_eu", 1.0, direct_sources=["dev_jobs"])],
+    )
+    policy_with_disabled_typo.markets[0].enabled = False
+    settings = Settings(
+        gemini_api_key="g",
+        candidate_profile="profile",
+        cover_letter_template="template",
+        timezone="Europe/Berlin",
+        scheduled_hour=9,
+        policy=policy_with_disabled_typo,
+        gemini_quota=GeminiQuotaSettings(rpm=10, tpm=250000, rpd=500),
+    )
+
+    build_sources(settings, fake_http)
+
+
 def test_build_sources_from_real_config_includes_new_coverage_sources_and_no_ddg(
     fake_http, monkeypatch, tmp_path
 ):
