@@ -654,7 +654,6 @@ def run_pipeline(
             store=store,
             search_breaker=search_breaker,
             query_date=query_date,
-            brave_budget=brave_budget,
         )
     )
     sources = [
