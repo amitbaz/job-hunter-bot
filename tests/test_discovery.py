@@ -194,6 +194,34 @@ def test_collect_candidates_counts_prefilter_rejections(store, policy):
     assert result.rediscovered_job_ids == []
 
 
+def test_collect_candidates_counts_jobs_by_bounded_source_label(store, policy):
+    eligible_job = Job(
+        source="devjobs",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        description="React TypeScript remote role",
+        remote=True,
+    )
+    rejected_jobs = [
+        Job(
+            source="devjobs",
+            source_job_id=str(index),
+            title="Junior QA Tester",
+            description="manual testing",
+        )
+        for index in (2, 3)
+    ]
+
+    result = collect_candidates(
+        [FakeSource([eligible_job, *rejected_jobs])], store, NoOpHttp(), policy
+    )
+
+    assert result.stats.unique_by_source == {"devjobs": 3}
+    assert result.stats.eligible_by_source == {"devjobs": 1}
+    assert result.stats.rejected_by_source == {"devjobs": 2}
+
+
 def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, policy):
     job = Job(
         source="ashby",
@@ -686,6 +714,7 @@ def test_collect_candidates_teaches_ats_board_even_for_backend_only_role(store, 
 
     assert result.eligible == []
     assert store.count_ats_boards() == 1
+    assert result.stats.ats_boards_discovered == 1
 
 
 def test_collect_candidates_teaches_ats_board_from_canonical_resolution(store, policy):
@@ -713,6 +742,7 @@ def test_collect_candidates_teaches_ats_board_from_canonical_resolution(store, p
 
     assert len(result.eligible) == 1
     assert store.count_ats_boards() == 1
+    assert result.stats.ats_boards_discovered == 1
     due = store.list_due_ats_boards(datetime.now(timezone.utc))
     assert [(entry.provider, entry.board_identifier) for entry in due] == [
         ("greenhouse", "acme")

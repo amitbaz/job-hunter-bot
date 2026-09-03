@@ -37,12 +37,16 @@ class DiscoveryStats:
     prefilter_rejected: int = 0
     profession_rejected: int = 0
     eligible: int = 0
+    ats_boards_discovered: int = 0
     per_source: dict[str, int] = field(default_factory=dict)
     raw_by_market: dict[str, int] = field(default_factory=dict)
     unique_by_market: dict[str, int] = field(default_factory=dict)
     rejected_by_market: dict[str, int] = field(default_factory=dict)
     eligible_by_market: dict[str, int] = field(default_factory=dict)
     reattributed_by_market: dict[str, int] = field(default_factory=dict)
+    unique_by_source: dict[str, int] = field(default_factory=dict)
+    rejected_by_source: dict[str, int] = field(default_factory=dict)
+    eligible_by_source: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -194,14 +198,18 @@ def _bump(counts: dict[str, int], key: str) -> None:
 
 def _harvest_ats_board_safely(
     store: JobStore, job: Job, market_hint: str | None = None
-) -> None:
-    """Learn a job's ATS board without letting a registry write drop the job."""
+) -> bool:
+    """Learn a job's ATS board without letting a registry write drop the job.
+
+    Returns True only when the harvest created a new registry entry.
+    """
     try:
-        harvest_ats_board(store, job, market_hint=market_hint)
+        return harvest_ats_board(store, job, market_hint=market_hint)
     except Exception:
         logger.exception(
             "ATS board harvesting failed: source=%s", metric_source_label(job.source)
         )
+        return False
 
 
 def _record_reattribution(
@@ -288,7 +296,8 @@ def collect_candidates(
 
     for job in unique_jobs:
         observed_market_id = _cheap_market_attribution(job, policy)
-        _harvest_ats_board_safely(store, job, market_hint=observed_market_id)
+        if _harvest_ats_board_safely(store, job, market_hint=observed_market_id):
+            stats.ats_boards_discovered += 1
         if job.url and not job.description:
             enrich_job(job, http)
 
@@ -299,7 +308,9 @@ def collect_candidates(
         if job.market_id:
             store.set_job_market(job_id, job.market_id)
         market_key = job.market_id or _UNATTRIBUTED
+        source_label = metric_source_label(job.source)
         _bump(stats.unique_by_market, market_key)
+        _bump(stats.unique_by_source, source_label)
 
         if not store.needs_evaluation(job_id):
             rediscovered_job_ids.append(job_id)
@@ -313,6 +324,7 @@ def collect_candidates(
             else:
                 stats.prefilter_rejected += 1
             _bump(stats.rejected_by_market, market_key)
+            _bump(stats.rejected_by_source, source_label)
             continue
 
         # Canonical resolution costs a page fetch plus a public search, so it
@@ -341,7 +353,8 @@ def collect_candidates(
                         job.ats_provider = resolution.ats.provider
                         job.ats_board = resolution.ats.board
                         job.ats_job_id = resolution.ats.job_id
-                        _harvest_ats_board_safely(store, job)
+                        if _harvest_ats_board_safely(store, job):
+                            stats.ats_boards_discovered += 1
                     # Canonical resolution can surface stronger, directly
                     # observed location evidence than the query-time hint that
                     # seeded the earlier attribution above, so re-run it
@@ -367,6 +380,7 @@ def collect_candidates(
         eligible_job_ids.add(job_id)
         eligible.append((job_id, job))
         _bump(stats.eligible_by_market, job.market_id or _UNATTRIBUTED)
+        _bump(stats.eligible_by_source, source_label)
         if job.ats_provider and job.ats_board:
             try:
                 store.record_ats_eligible_job(
