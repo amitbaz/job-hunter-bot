@@ -11,7 +11,7 @@ from job_hunter.models import Job
 from job_hunter.store import JobStore
 
 from .ashby import AshbySource
-from .base import logger
+from .base import is_stale_board_error, logger
 from .greenhouse import GreenhouseSource
 from .lever import LeverSource
 
@@ -87,17 +87,26 @@ class LearnedAtsSource:
             self.stats.boards_scanned += 1
             try:
                 jobs = self._scan_board(source_type, entry.board_identifier)
-            except Exception:
-                logger.warning(
-                    "learned ATS board scan failed for %s:%s",
+            except Exception as exc:
+                permanent = is_stale_board_error(exc)
+                # The adapter already logged the diagnostic for this exact
+                # failure (a full traceback for an unexpected error, a
+                # compact line for an expected 404) — logging it again here
+                # would duplicate that, so this is a compact health-state
+                # summary only, never exc_info=True.
+                logger.info(
+                    "learned ATS board scan failed for %s:%s (%s)",
                     entry.provider,
                     entry.board_identifier,
-                    exc_info=True,
+                    "404, stale board" if permanent else "see prior warning above",
                 )
                 self.stats.boards_failed += 1
                 try:
                     self._store.record_ats_scan_failure(
-                        entry.provider, entry.board_identifier, checked_at
+                        entry.provider,
+                        entry.board_identifier,
+                        checked_at,
+                        permanent=permanent,
                     )
                 except Exception:
                     logger.warning(
