@@ -275,6 +275,7 @@ CREATE TABLE IF NOT EXISTS ats_registry (
 """
 
 _DELIVERABLE_SCORE_FLOOR = 60
+_STALE_BOARD_DEACTIVATION_THRESHOLD = 3
 _SUPPORTED_ATS_PROVIDERS = frozenset({"ashby", "greenhouse", "lever"})
 
 
@@ -1356,27 +1357,62 @@ class JobStore:
             )
 
     def record_ats_scan_failure(
-        self, provider: str, board_identifier: str, now: datetime
+        self,
+        provider: str,
+        board_identifier: str,
+        now: datetime,
+        *,
+        permanent: bool = False,
     ) -> None:
-        """Increment scan failures and pause the board for 24 hours.
+        """Increment scan failures and back off the board.
 
-        Failures are isolated per board: a failed board is paused rather
-        than failing the whole run.
+        Every failure is isolated per board and gets the same 24h pause so
+        it retries soon. `permanent=True` (a stale-looking 404) additionally
+        escalates: after `_STALE_BOARD_DEACTIVATION_THRESHOLD` consecutive
+        permanent failures the board is deactivated (`active = 0`) instead
+        of being paused forever. Deactivation preserves registry history —
+        it is not a delete — and `upsert_ats_board` already reactivates any
+        inactive board the next time it is rediscovered.
+
+        Transient failures (`permanent=False`) never deactivate a board:
+        a network blip is not evidence the board is gone.
         """
         normalized_now = _normalize_utc(now)
         timestamp = normalized_now.isoformat()
         paused_until = (normalized_now + timedelta(hours=24)).isoformat()
         with self._conn:
-            self._conn.execute(
-                """
-                UPDATE ats_registry SET
-                    last_checked_at = ?,
-                    consecutive_failures = consecutive_failures + 1,
-                    paused_until = ?
-                WHERE provider = ? AND board_identifier = ?
-                """,
-                (timestamp, paused_until, provider, board_identifier),
-            )
+            if permanent:
+                self._conn.execute(
+                    """
+                    UPDATE ats_registry SET
+                        last_checked_at = ?,
+                        consecutive_failures = consecutive_failures + 1,
+                        paused_until = ?,
+                        active = CASE
+                            WHEN consecutive_failures + 1 >= ? THEN 0
+                            ELSE active
+                        END
+                    WHERE provider = ? AND board_identifier = ?
+                    """,
+                    (
+                        timestamp,
+                        paused_until,
+                        _STALE_BOARD_DEACTIVATION_THRESHOLD,
+                        provider,
+                        board_identifier,
+                    ),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE ats_registry SET
+                        last_checked_at = ?,
+                        consecutive_failures = consecutive_failures + 1,
+                        paused_until = ?
+                    WHERE provider = ? AND board_identifier = ?
+                    """,
+                    (timestamp, paused_until, provider, board_identifier),
+                )
 
     def record_ats_eligible_job(
         self, provider: str, board_identifier: str, now: datetime
