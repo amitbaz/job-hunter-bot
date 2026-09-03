@@ -29,8 +29,11 @@ class FakeGemini:
         max_output_tokens=None,
         json_mode=False,
         json_schema=None,
+        max_attempts=1,
     ):
-        self.prompts.append((prompt, purpose, thinking_level, max_output_tokens, json_mode))
+        self.prompts.append(
+            (prompt, purpose, thinking_level, max_output_tokens, json_mode, max_attempts)
+        )
         return self.text
 
 
@@ -183,7 +186,7 @@ def test_evaluation_rejects_invalid_json(fake_gemini, job, policy, context):
 def test_evaluation_prompt_uses_compact_context_not_full_profile(fake_gemini, job, policy, context):
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
 
     # Compact evidence/summary from the context must reach the prompt...
     assert context.evaluation_summary in prompt
@@ -198,7 +201,7 @@ def test_evaluation_prompt_uses_compact_context_not_full_profile(fake_gemini, jo
 def test_evaluation_prompt_preserves_hard_blockers_and_thresholds(fake_gemini, job, policy, context):
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
 
     assert str(policy.salary_floor_eur) in prompt
     assert "hard blocker" in prompt.lower()
@@ -209,12 +212,13 @@ def test_evaluation_prompt_preserves_hard_blockers_and_thresholds(fake_gemini, j
 def test_evaluation_uses_expected_resource_controls(fake_gemini, job, policy, context):
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    _prompt, purpose, thinking_level, max_output_tokens, json_mode = fake_gemini.prompts[0]
+    _prompt, purpose, thinking_level, max_output_tokens, json_mode, max_attempts = fake_gemini.prompts[0]
 
     assert purpose == "job_evaluation"
     assert thinking_level == "low"
     assert max_output_tokens == 1200
     assert json_mode is True
+    assert max_attempts == 2
 
 
 # --- Market-aware prompt content (Task 6) -----------------------------------
@@ -233,7 +237,7 @@ def test_market_aware_prompt_drops_the_legacy_remote_only_framing(fake_gemini, c
     )
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
 
     assert "for a remote-only job search" not in prompt
     assert "for a market-driven job search" in prompt
@@ -244,7 +248,7 @@ def test_legacy_prompt_keeps_the_remote_only_framing(fake_gemini, job, policy, c
     """The no-market (legacy) path's opening sentence must stay unchanged."""
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
 
     assert prompt.startswith(
         "You are evaluating a job posting against a candidate profile "
@@ -263,7 +267,7 @@ def test_evaluation_prompt_includes_london_market_details(fake_gemini, context):
     )
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
     lower = prompt.lower()
 
     assert "GBP" in prompt
@@ -285,7 +289,7 @@ def test_evaluation_prompt_includes_sf_market_salary_floor(fake_gemini, context)
     )
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
 
     assert "USD" in prompt
     assert "200000" in prompt
@@ -302,7 +306,7 @@ def test_evaluation_prompt_full_stack_adds_backend_ramp_language(fake_gemini, co
     )
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
     lower = prompt.lower()
 
     assert "senior frontend engineer" in lower
@@ -320,7 +324,7 @@ def test_evaluation_prompt_full_stack_hyphenated_title_also_matches(fake_gemini,
     )
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
 
     assert "do not invent senior backend experience" in prompt.lower()
 
@@ -332,7 +336,7 @@ def test_evaluation_prompt_falls_back_to_legacy_without_market_id(fake_gemini, c
     job = Job(source="ashby", title="Senior Product Engineer", description="React TypeScript remote")
     fake_gemini.text = json.dumps(_valid_payload())
     evaluate_job(job, context, policy, fake_gemini)
-    prompt, _purpose, _thinking, _max_tokens, _json_mode = fake_gemini.prompts[0]
+    prompt, _purpose, _thinking, _max_tokens, _json_mode, _max_attempts = fake_gemini.prompts[0]
     lower = prompt.lower()
 
     assert f"eur {policy.salary_floor_eur}" in lower

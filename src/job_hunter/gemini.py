@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 _RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+_TRANSIENT_RETRY_DELAY_SECONDS = 2.0
 
 
 class GeminiError(RuntimeError):
@@ -122,9 +123,18 @@ class GeminiClient:
         max_output_tokens: int | None = None,
         json_mode: bool = False,
         json_schema: dict | None = None,
+        max_attempts: int = 1,
     ) -> str:
-        now = self._preflight_with_pacing(purpose, prompt)
+        """Call Gemini, optionally retrying transient failures.
 
+        `max_attempts` bounds retries for HTTP 5xx responses and network
+        timeouts only (`_RETRYABLE_STATUS_CODES` / `requests.Timeout`) —
+        the failures a production run showed to be safe to retry. Every
+        attempt re-runs preflight pacing and is recorded to the tracker, so
+        usage accounting reflects retries exactly like fresh calls. 429s,
+        other 4xx, and malformed response bodies never consume retry budget:
+        they are permanent or already handled by the quota pause path.
+        """
         url = f"{_BASE_URL}/{self.model}:generateContent"
         headers = {
             "x-goog-api-key": self._api_key,
@@ -143,41 +153,71 @@ class GeminiClient:
         if generation_config:
             payload["generationConfig"] = generation_config
 
-        try:
-            response = self._http.post(
-                url,
-                json=payload,
-                headers=headers,
-                retry_status_codes=_RETRYABLE_STATUS_CODES,
-                retry=False,
-            )
-        except requests.RequestException as exc:
-            if self._tracker is not None:
-                self._tracker.record_error(
-                    purpose,
-                    prompt,
-                    now,
-                    error_code=type(exc).__name__,
-                )
-            raise
+        attempt = 0
+        while True:
+            attempt += 1
+            now = self._preflight_with_pacing(purpose, prompt)
 
-        if response.status_code == 429:
-            kind, error_code = _classify_429(response)
-            if self._tracker is not None:
-                paused_until, reason = self._tracker.record_429(
-                    purpose, prompt, now, kind=kind, error_code=error_code
+            try:
+                response = self._http.post(
+                    url,
+                    json=payload,
+                    headers=headers,
+                    retry_status_codes=_RETRYABLE_STATUS_CODES,
+                    retry=False,
                 )
-                raise GeminiQuotaPaused(
-                    f"Gemini {self.model} is paused until {paused_until} ({reason})",
-                    paused_until=paused_until,
-                    reason=reason,
-                )
-            raise GeminiError(f"Gemini API error 429: {response.text}")
+            except requests.RequestException as exc:
+                if self._tracker is not None:
+                    self._tracker.record_error(
+                        purpose,
+                        prompt,
+                        now,
+                        error_code=type(exc).__name__,
+                    )
+                if isinstance(exc, requests.Timeout) and attempt < max_attempts:
+                    logger.warning(
+                        "Gemini %s timed out (attempt %s/%s); retrying: purpose=%s",
+                        self.model,
+                        attempt,
+                        max_attempts,
+                        purpose,
+                    )
+                    self._sleep_fn(_TRANSIENT_RETRY_DELAY_SECONDS)
+                    continue
+                raise
 
-        if response.status_code >= 400:
-            if self._tracker is not None:
-                self._tracker.record_error(purpose, prompt, now, http_status=response.status_code)
-            raise GeminiError(f"Gemini API error {response.status_code}: {response.text}")
+            if response.status_code == 429:
+                kind, error_code = _classify_429(response)
+                if self._tracker is not None:
+                    paused_until, reason = self._tracker.record_429(
+                        purpose, prompt, now, kind=kind, error_code=error_code
+                    )
+                    raise GeminiQuotaPaused(
+                        f"Gemini {self.model} is paused until {paused_until} ({reason})",
+                        paused_until=paused_until,
+                        reason=reason,
+                    )
+                raise GeminiError(f"Gemini API error 429: {response.text}")
+
+            if response.status_code >= 400:
+                if self._tracker is not None:
+                    self._tracker.record_error(
+                        purpose, prompt, now, http_status=response.status_code
+                    )
+                if response.status_code in _RETRYABLE_STATUS_CODES and attempt < max_attempts:
+                    logger.warning(
+                        "Gemini %s returned %s (attempt %s/%s); retrying: purpose=%s",
+                        self.model,
+                        response.status_code,
+                        attempt,
+                        max_attempts,
+                        purpose,
+                    )
+                    self._sleep_fn(_TRANSIENT_RETRY_DELAY_SECONDS)
+                    continue
+                raise GeminiError(f"Gemini API error {response.status_code}: {response.text}")
+
+            break
 
         try:
             data = response.json()

@@ -21,6 +21,10 @@ SCORE_MAXIMA = {
 
 HIGH_PRIORITY_THRESHOLD = 85
 
+# One retry for transient Gemini 5xx/timeout failures during evaluation; see
+# GeminiClient.generate_text's max_attempts docstring for what qualifies.
+_EVALUATION_MAX_ATTEMPTS = 2
+
 
 class EvaluationError(ValueError):
     pass
@@ -204,6 +208,7 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
         thinking_level="low",
         max_output_tokens=1200,
         json_mode=True,
+        max_attempts=_EVALUATION_MAX_ATTEMPTS,
     )
     cleaned = _strip_code_fences(raw)
 
