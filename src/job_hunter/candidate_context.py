@@ -244,10 +244,33 @@ def _context_from_dict(data: dict) -> CandidateContext:
     )
 
 
-def _fallback_after_error(policy: SearchPolicy, exc: Exception, *, reason: str = "") -> CandidateContext:
+def _fallback_after_error(
+    policy: SearchPolicy,
+    exc: Exception,
+    *,
+    reason: str = "",
+    category: str = "",
+) -> CandidateContext:
     error_name = type(exc).__name__
-    if reason:
-        logger.warning("candidate context extraction failed; using fallback: error=%s reason=%s", error_name, reason)
+    if category and reason:
+        logger.warning(
+            "candidate context extraction failed; using fallback: error=%s category=%s reason=%s",
+            error_name,
+            category,
+            reason,
+        )
+    elif category:
+        logger.warning(
+            "candidate context extraction failed; using fallback: error=%s category=%s",
+            error_name,
+            category,
+        )
+    elif reason:
+        logger.warning(
+            "candidate context extraction failed; using fallback: error=%s reason=%s",
+            error_name,
+            reason,
+        )
     else:
         logger.warning("candidate context extraction failed; using fallback: error=%s", error_name)
     return _fallback_context(policy, source="fallback_error", load_error=error_name)
@@ -297,10 +320,11 @@ def get_candidate_context(
         return _fallback_after_error(
             policy,
             exc,
-            reason=f"category=provider_truncation finish_reason={exc.finish_reason} retry_exhausted=true",
+            category="provider_truncation",
+            reason=f"finish_reason={exc.finish_reason} retry_exhausted=true",
         )
     except Exception as exc:
-        return _fallback_after_error(policy, exc)
+        return _fallback_after_error(policy, exc, category="provider_error")
 
     try:
         context = _parse_context(raw)
@@ -308,10 +332,11 @@ def get_candidate_context(
         return _fallback_after_error(
             policy,
             exc,
-            reason=f"category=malformed_structured_output {' '.join(str(exc).split())[:180]}",
+            category="malformed_structured_output",
+            reason=" ".join(str(exc).split())[:180],
         )
     except Exception as exc:
-        return _fallback_after_error(policy, exc)
+        return _fallback_after_error(policy, exc, category="validation_error")
 
     store.save_candidate_context(
         cache_key=cache_key,
