@@ -19,6 +19,7 @@ class FakeGemini:
         max_output_tokens=None,
         json_mode=False,
         json_schema=None,
+        max_attempts=1,
     ):
         if purpose == "candidate_context":
             return json.dumps(

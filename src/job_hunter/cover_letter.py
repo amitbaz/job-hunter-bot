@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import logging
 from datetime import date
 from typing import TYPE_CHECKING
 
+from job_hunter.gemini import GeminiIncompleteResponse
 from job_hunter.models import CandidateContext, Evaluation, Job
 
 if TYPE_CHECKING:
     from job_hunter.gemini import GeminiClient
+
+logger = logging.getLogger(__name__)
+
+# Bounded MAX_TOKENS recovery: one retry at double the output budget before
+# giving up. Keeps the pipeline from discarding an otherwise-good letter that
+# merely ran out of room the first time.
+_OUTPUT_TOKEN_BUDGETS = (800, 1600)
 
 _KNOWN_PLACEHOLDERS = (
     "[Company]",
@@ -57,12 +66,35 @@ def generate_cover_letter(
     gemini: "GeminiClient",
     today: date,
 ) -> str:
-    text = gemini.generate_text(
-        _build_cover_letter_prompt(job, evaluation, context, template, today),
-        purpose="cover_letter",
-        thinking_level="low",
-        max_output_tokens=800,
-    )
+    prompt = _build_cover_letter_prompt(job, evaluation, context, template, today)
+
+    text: str | None = None
+    last_finish_reason: str | None = None
+    for attempt, max_output_tokens in enumerate(_OUTPUT_TOKEN_BUDGETS, start=1):
+        try:
+            text = gemini.generate_text(
+                prompt,
+                purpose="cover_letter",
+                thinking_level="low",
+                max_output_tokens=max_output_tokens,
+            )
+        except GeminiIncompleteResponse as exc:
+            last_finish_reason = exc.finish_reason
+            retrying = attempt < len(_OUTPUT_TOKEN_BUDGETS)
+            logger.warning(
+                "cover letter hit finish_reason=%s at max_output_tokens=%s (attempt %s/%s); %s",
+                exc.finish_reason,
+                max_output_tokens,
+                attempt,
+                len(_OUTPUT_TOKEN_BUDGETS),
+                "retrying with larger output budget" if retrying else "giving up",
+            )
+            continue
+        break
+
+    if text is None:
+        raise GeminiIncompleteResponse(last_finish_reason or "MAX_TOKENS")
+
     text = text.strip()
 
     if not text:

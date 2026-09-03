@@ -3,6 +3,7 @@ from datetime import date
 import pytest
 
 from job_hunter.cover_letter import generate_cover_letter
+from job_hunter.gemini import GeminiIncompleteResponse
 from job_hunter.models import CandidateContext, CandidatePreferences, Evaluation, Job
 
 
@@ -23,6 +24,39 @@ class FakeGemini:
     ):
         self.prompts.append((prompt, purpose, thinking_level, max_output_tokens, json_mode))
         return self.text
+
+
+class TruncatingThenSucceedingGemini(FakeGemini):
+    """Raises GeminiIncompleteResponse on the first call, then succeeds."""
+
+    def __init__(self, final_text):
+        super().__init__()
+        self._final_text = final_text
+        self.calls = 0
+
+    def generate_text(self, prompt, **kwargs):
+        self.calls += 1
+        self.prompts.append(
+            (prompt, kwargs.get("purpose"), kwargs.get("thinking_level"), kwargs.get("max_output_tokens"), kwargs.get("json_mode", False))
+        )
+        if self.calls == 1:
+            raise GeminiIncompleteResponse("MAX_TOKENS")
+        return self._final_text
+
+
+class AlwaysTruncatingGemini(FakeGemini):
+    """Raises GeminiIncompleteResponse on every call."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def generate_text(self, prompt, **kwargs):
+        self.calls += 1
+        self.prompts.append(
+            (prompt, kwargs.get("purpose"), kwargs.get("thinking_level"), kwargs.get("max_output_tokens"), kwargs.get("json_mode", False))
+        )
+        raise GeminiIncompleteResponse("MAX_TOKENS")
 
 
 @pytest.fixture
@@ -132,3 +166,26 @@ def test_cover_letter_uses_expected_resource_controls(fake_gemini, job, evaluati
     assert purpose == "cover_letter"
     assert thinking_level == "low"
     assert max_output_tokens == 800
+
+
+def test_cover_letter_recovers_from_max_tokens_with_larger_budget(job, evaluation, context):
+    gemini = TruncatingThenSucceedingGemini("Dear Hiring Team, I am excited to apply.")
+
+    result = generate_cover_letter(job, evaluation, context, "template", gemini, date(2026, 8, 30))
+
+    assert result == "Dear Hiring Team, I am excited to apply."
+    assert gemini.calls == 2
+    first_budget = gemini.prompts[0][3]
+    second_budget = gemini.prompts[1][3]
+    assert first_budget == 800
+    assert second_budget > first_budget
+
+
+def test_cover_letter_repeated_max_tokens_raises_cleanly(job, evaluation, context):
+    gemini = AlwaysTruncatingGemini()
+
+    with pytest.raises(GeminiIncompleteResponse):
+        generate_cover_letter(job, evaluation, context, "template", gemini, date(2026, 8, 30))
+
+    # Bounded: exactly two attempts, never unbounded retrying.
+    assert gemini.calls == 2
