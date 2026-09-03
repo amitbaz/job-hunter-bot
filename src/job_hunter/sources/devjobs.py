@@ -28,6 +28,7 @@ class DevJobsSource:
 
     def discover(self) -> list[Job]:
         jobs: list[Job] = []
+        seen_job_ids: set[str] = set()
         for category in _CATEGORIES:
             try:
                 response = self._http.get(
@@ -40,8 +41,10 @@ class DevJobsSource:
                 )
                 continue
 
-            job_ids = _extract_job_ids(response.text)[: self._max_jobs_per_category]
-            for job_id in job_ids:
+            job_ids = _extract_job_ids(response.text)
+            new_job_ids = [job_id for job_id in job_ids if job_id not in seen_job_ids]
+            for job_id in new_job_ids[: self._max_jobs_per_category]:
+                seen_job_ids.add(job_id)
                 job = self._fetch_job(job_id)
                 if job is not None:
                     jobs.append(job)

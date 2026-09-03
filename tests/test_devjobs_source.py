@@ -64,7 +64,9 @@ def test_devjobs_parses_listing_and_detail(work_mode, expected_remote):
 
     jobs = DevJobsSource(http).discover()
 
-    assert len(jobs) == 2  # Frontend + Full Stack categories, same listing fixture
+    # Frontend and Full Stack share the same listing fixture and thus the same
+    # job id; cross-category dedup means the id is fetched only once.
+    assert len(jobs) == 1
     job = jobs[0]
     assert job.title == "Frontend Engineer"
     assert job.company == "Loora"
@@ -107,9 +109,9 @@ def test_devjobs_detail_failure_skips_only_that_posting():
     http = PartiallyFailingHttp(listing_html=listing_html)
     jobs = DevJobsSource(http).discover()
 
-    # 2 categories share the same listing/detail fixtures: job 1 fails in both,
-    # job 2 succeeds in both, so exactly the successful posting comes back twice.
-    assert len(jobs) == 2
+    # Both categories share the same listing fixture, so cross-category dedup
+    # fetches each id only once: job 1 fails, job 2 succeeds.
+    assert len(jobs) == 1
     assert all(job.source_job_id == "2" for job in jobs)
 
 
@@ -139,9 +141,43 @@ def test_devjobs_deduplicates_detail_ids_within_a_listing():
     jobs = DevJobsSource(http).discover()
 
     detail_calls = [call for call in http.calls if "job-details" in call[0]]
-    # 2 categories x 1 unique id per listing == 2 detail requests, not 4
+    # The listing's own duplicate anchor collapses to 1 id, and cross-category
+    # dedup means the second category's identical listing adds nothing.
+    assert len(detail_calls) == 1
+    assert len(jobs) == 1
+
+
+def test_devjobs_dedupes_job_ids_across_categories():
+    frontend_html = """
+    <html><body>
+        <a href="/job-details/1">Job One</a>
+    </body></html>
+    """
+    fullstack_html = """
+    <html><body>
+        <a href="/job-details/1">Job One</a>
+        <a href="/job-details/2">Job Two</a>
+    </body></html>
+    """
+
+    class PerCategoryHttp(FakeHttp):
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if "job-details" in url:
+                job_id = url.rstrip("/").rsplit("/", 1)[-1]
+                html = self.detail_html_by_id.get(job_id, _detail_html("Remote"))
+                return FakeResponse(html)
+            category = kwargs.get("params", {}).get("developerTypes")
+            return FakeResponse(frontend_html if category == "Frontend" else fullstack_html)
+
+    http = PerCategoryHttp()
+    jobs = DevJobsSource(http).discover()
+
+    detail_calls = [call for call in http.calls if "job-details" in call[0]]
+    # Job 1 appears in both categories' listings but is only fetched once;
+    # job 2 is unique to Full Stack and is fetched once too.
     assert len(detail_calls) == 2
-    assert len(jobs) == 2
+    assert {job.source_job_id for job in jobs} == {"1", "2"}
 
 
 def test_devjobs_caps_detail_requests_per_category():
@@ -157,5 +193,6 @@ def test_devjobs_caps_detail_requests_per_category():
     DevJobsSource(http, max_jobs_per_category=2).discover()
 
     detail_calls = [call for call in http.calls if "job-details" in call[0]]
-    # 2 categories x cap of 2 == 4 detail requests, never 3 per category
-    assert len(detail_calls) == 4
+    # Frontend takes ids 1,2 (cap of 2); Full Stack sees the same listing but,
+    # after cross-category dedup, only id 3 remains unseen.
+    assert len(detail_calls) == 3
