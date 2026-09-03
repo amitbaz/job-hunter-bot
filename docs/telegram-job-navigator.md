@@ -105,6 +105,7 @@ TELEGRAM_BOT_TOKEN=<same bot token used by the daily runner>
 TELEGRAM_WEBHOOK_SECRET=<random URL-safe secret>
 GITHUB_REPOSITORY=amitbaz/job-hunter-bot
 GITHUB_STATE_TOKEN=<repository-scoped token with Actions read access>
+GITHUB_DISPATCH_TOKEN=<repository-scoped token with permission to trigger repository_dispatch>
 GITHUB_STATE_ARTIFACT_NAME=job-hunter-state
 GITHUB_STATE_CACHE_DIR=/tmp/job-hunter-state
 ```
@@ -182,7 +183,7 @@ Company: Example GmbH
 Location: Berlin
 Match: 87%
 
-[ View job ]  [ Apply ]
+[ View job ]  [ Apply ]  [ Gen CL ]
 [ ◀ Previous ]  [ 3 / 12 ]  [ Next ▶ ]
 ```
 
@@ -226,10 +227,10 @@ Valid Telegram requests are acknowledged with HTTP 200 after application-level f
 - GitHub Actions remains the scheduler.
 - SQLite remains the source of truth.
 - Deliverability remains score `> 60` plus the current decision allowlist.
-- Strong matches still receive cover-letter PDFs.
+- Cover letters are no longer generated automatically; tapping Gen CL on a job's card
+  triggers generation (or resends an already-generated letter) for that job only.
 - Failed Telegram card delivery leaves jobs pending for the next run.
 - A successful card marks all represented jobs as `telegram_message` delivered.
-- If only a PDF failed, the bot retries the PDF without sending a duplicate navigator card.
 - The bot still sends nothing when a run has no new/pending deliverable jobs.
 - `Apply` does not submit or mark an application.
 - No Supabase runtime dependency is introduced by this deployment.
