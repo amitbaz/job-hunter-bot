@@ -1625,6 +1625,7 @@ def test_pipeline_caps_evaluations_at_diverse_shortlist_budget(settings, caplog)
     assert summary.ready_to_apply == 35
     assert gemini.eval_calls == 35
     assert "deferred_by_budget=65" in caplog.text
+    assert "canonical_network_attempts=" in caplog.text
     assert "eligible sources: ashby=80 remotive=20" in caplog.text
     assert "selected sources: ashby=18 remotive=17" in caplog.text
 

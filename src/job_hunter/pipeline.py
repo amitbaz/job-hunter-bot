@@ -713,7 +713,7 @@ def run_pipeline(
     decision_counts_by_source: dict[str, dict[str, int]] = {}
     deferred_by_budget = max(0, len(ranked) - len(selected))
     logger.info(
-        "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s sources=%s",
+        "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s canonical_network_attempts=%s sources=%s",
         discovery.stats.raw,
         discovery.stats.unique,
         discovery.stats.prefilter_rejected,
@@ -721,6 +721,7 @@ def run_pipeline(
         discovery.stats.eligible,
         len(selected),
         deferred_by_budget,
+        discovery.stats.canonical_network_attempts,
         len(eligible_source_counts),
     )
     logger.info("eligible sources: %s", _format_source_counts(eligible_source_counts))
