@@ -1367,15 +1367,24 @@ class JobStore:
         """Increment scan failures and back off the board.
 
         Every failure is isolated per board and gets the same 24h pause so
-        it retries soon. `permanent=True` (a stale-looking 404) additionally
-        escalates: after `_STALE_BOARD_DEACTIVATION_THRESHOLD` consecutive
-        permanent failures the board is deactivated (`active = 0`) instead
-        of being paused forever. Deactivation preserves registry history —
-        it is not a delete — and `upsert_ats_board` already reactivates any
-        inactive board the next time it is rediscovered.
+        it retries soon. `consecutive_failures` is a single shared counter
+        incremented by every failure, transient or permanent alike — it does
+        not track which kind of failure contributed to it. `permanent=True`
+        (a stale-looking 404) additionally escalates: once that shared
+        counter reaches `_STALE_BOARD_DEACTIVATION_THRESHOLD`, a permanent
+        failure deactivates the board (`active = 0`) instead of just pausing
+        it. Transient failures accrue toward the same counter but never
+        deactivate a board on their own — only a `permanent=True` call checks
+        the threshold and can flip `active`. So a mixed sequence such as
+        [transient, transient, permanent] deactivates the board on that
+        single 404, not only after three permanent failures in a row.
 
-        Transient failures (`permanent=False`) never deactivate a board:
-        a network blip is not evidence the board is gone.
+        Deactivation preserves registry history — it is not a delete — and
+        `upsert_ats_board` already reactivates any inactive board the next
+        time it is rediscovered. That reactivation only sets `active = 1`;
+        it does not reset `consecutive_failures`, so a rediscovered board
+        that immediately fails again resumes from its prior strike count and
+        can re-deactivate right away, not after three fresh strikes.
         """
         normalized_now = _normalize_utc(now)
         timestamp = normalized_now.isoformat()

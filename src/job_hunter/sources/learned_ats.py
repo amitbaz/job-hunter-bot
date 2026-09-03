@@ -98,7 +98,9 @@ class LearnedAtsSource:
                     "learned ATS board scan failed for %s:%s (%s)",
                     entry.provider,
                     entry.board_identifier,
-                    "404, stale board" if permanent else "see prior warning above",
+                    "404, stale board"
+                    if permanent
+                    else f"unexpected {type(exc).__name__}, see adapter's own warning log",
                 )
                 self.stats.boards_failed += 1
                 try:

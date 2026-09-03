@@ -535,6 +535,27 @@ def test_ats_transient_failure_never_deactivates_board():
     assert due[0].active is True
 
 
+def test_ats_mixed_transient_then_permanent_failure_deactivates_board():
+    # consecutive_failures is one shared counter incremented by both
+    # transient and permanent failures, so two transient failures followed
+    # by a single permanent one reaches the threshold on that 404 alone —
+    # not after three permanent failures in a row. This pins the documented
+    # (if slightly surprising) real behavior of record_ats_scan_failure.
+    store = JobStore(":memory:")
+    now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)
+    store.upsert_ats_board(provider="lever", board_identifier="mixed-co")
+
+    store.record_ats_scan_failure("lever", "mixed-co", now, permanent=False)
+    store.record_ats_scan_failure(
+        "lever", "mixed-co", now + timedelta(hours=25), permanent=False
+    )
+    store.record_ats_scan_failure(
+        "lever", "mixed-co", now + timedelta(hours=25 * 2), permanent=True
+    )
+
+    assert store.list_due_ats_boards(now + timedelta(days=30)) == []
+
+
 def test_ats_deactivated_board_reactivates_on_rediscovery():
     store = JobStore(":memory:")
     now = datetime(2026, 9, 3, 8, 0, tzinfo=timezone.utc)

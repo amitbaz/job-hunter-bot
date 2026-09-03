@@ -221,3 +221,28 @@ def test_learned_ats_source_deactivates_board_after_repeated_404s():
         e.board_identifier for e in store.list_due_ats_boards(final_check)
     }
     assert due_identifiers == {"healthy-co"}
+
+
+def test_learned_ats_source_never_deactivates_board_after_repeated_transient_errors():
+    # Mirror image of test_learned_ats_source_deactivates_board_after_repeated_404s:
+    # repeated *transient* (non-404) errors must never deactivate a board.
+    # This is the test that would fail if `permanent` were ever hardcoded or
+    # inverted for the unexpected-error path instead of being threaded
+    # through as `is_stale_board_error(exc)`.
+    store = JobStore(":memory:")
+    _seed_board(store, "greenhouse", "flaky-co")
+    base = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    http = RoutingHttp(fail_urls={"flaky-co"})
+
+    for i in range(3):
+        checked_at = base + timedelta(hours=25 * i)
+        source = LearnedAtsSource(
+            store, http, limit=10, market_order=["berlin"], now=lambda t=checked_at: t
+        )
+        source.discover()
+
+    final_check = base + timedelta(hours=25 * 3)
+    due_identifiers = {
+        e.board_identifier for e in store.list_due_ats_boards(final_check)
+    }
+    assert due_identifiers == {"flaky-co"}
