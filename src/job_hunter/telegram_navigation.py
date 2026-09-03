@@ -5,7 +5,7 @@ from typing import Callable, Protocol
 
 from job_hunter.models import DigestItem, NavigationCard, NavigationSession
 
-_CALLBACK_ACTIONS = {"n", "a", "x"}
+_CALLBACK_ACTIONS = {"n", "a", "x", "c"}
 
 
 class InteractiveTelegram(Protocol):
@@ -74,6 +74,7 @@ def build_navigation_card(
     if card.url:
         actions.append({"text": "View job", "url": card.url})
     actions.append({"text": "Apply", "callback_data": encode_callback("a", session_id, index)})
+    actions.append({"text": "Gen CL", "callback_data": encode_callback("c", session_id, index)})
 
     previous_index = index - 1 if index > 0 else index
     next_index = index + 1 if index < total - 1 else index
@@ -112,6 +113,7 @@ def handle_callback_query(
     *,
     session_loader: Callable[[str], NavigationSession | None],
     telegram: InteractiveTelegram,
+    on_generate: Callable[[int], None] | None = None,
 ) -> bool:
     callback_id = str(callback_query.get("id") or "")
     parsed = parse_callback(str(callback_query.get("data") or ""))
@@ -152,6 +154,12 @@ def handle_callback_query(
     if session.telegram_message_id is not None and str(message_id) != str(session.telegram_message_id):
         answer("This action is no longer available.")
         return False
+
+    if action == "c":
+        if on_generate is not None:
+            on_generate(session.cards[target_index].job_id)
+        answer("Generating your cover letter - I'll send it here shortly.")
+        return True
 
     text, keyboard = build_navigation_card(
         session.cards[target_index],

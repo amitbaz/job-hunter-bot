@@ -210,3 +210,43 @@ def test_edit_failure_returns_short_callback_error():
         telegram=telegram,
     ) is False
     assert telegram.answers[-1][1] == "Could not update this job right now."
+
+
+def test_gen_cl_callback_invokes_on_generate_and_answers():
+    telegram = FakeTelegram()
+    generated = []
+    handled = handle_callback_query(
+        {
+            "id": "cb-gen",
+            "data": "c|session1|1",
+            "message": {"message_id": 99, "chat": {"id": 123}},
+        },
+        session_loader=lambda _sid: _session(),
+        telegram=telegram,
+        on_generate=lambda job_id: generated.append(job_id),
+    )
+
+    assert handled is True
+    assert generated == [2]  # cards[1].job_id
+    assert telegram.edits == []
+    assert telegram.answers[-1][0] == "cb-gen"
+    assert "cover letter" in telegram.answers[-1][1].lower()
+
+
+def test_gen_cl_callback_on_expired_session_does_not_call_on_generate():
+    telegram = FakeTelegram()
+    generated = []
+    handled = handle_callback_query(
+        {
+            "id": "cb-gen",
+            "data": "c|session1|0",
+            "message": {"message_id": 99, "chat": {"id": 123}},
+        },
+        session_loader=lambda _sid: _session(expires_at="2000-01-01T00:00:00+00:00"),
+        telegram=telegram,
+        on_generate=lambda job_id: generated.append(job_id),
+    )
+
+    assert handled is False
+    assert generated == []
+    assert telegram.answers[-1][1] == "This job list has expired."
