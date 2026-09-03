@@ -6,6 +6,7 @@ import logging
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
+from job_hunter.gemini import GeminiIncompleteResponse
 from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
 from job_hunter.models import CandidateContext, CandidatePreferences, SearchPolicy
 from job_hunter.normalize import normalize_text
@@ -18,7 +19,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CANDIDATE_CONTEXT_SCHEMA_VERSION = "1"
-
 FALLBACK_CONTEXT_SUMMARY = "Fallback candidate context derived from search policy."
 
 _EVIDENCE_FIELDS = (
@@ -36,6 +36,8 @@ _TOP_LEVEL_FIELDS = ("preferences", *_EVIDENCE_FIELDS, "evaluation_summary")
 _MAX_LIST_ITEMS = 20
 _MAX_ITEM_LENGTH = 180
 _MAX_SUMMARY_LENGTH = 1500
+_INITIAL_OUTPUT_TOKENS = 1800
+_RETRY_OUTPUT_TOKENS = 3600
 
 _PREFERENCES_FIELDS = (
     "preferred_roles",
@@ -54,36 +56,12 @@ _PREFERENCES_MAX_SUMMARY_LENGTH = 280
 _PREFERENCES_SCHEMA = {
     "type": "OBJECT",
     "properties": {
-        "preferred_roles": {
-            "type": "ARRAY",
-            "items": {"type": "STRING"},
-            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
-        },
-        "preferred_seniority": {
-            "type": "ARRAY",
-            "items": {"type": "STRING"},
-            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
-        },
-        "must_have_signals": {
-            "type": "ARRAY",
-            "items": {"type": "STRING"},
-            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
-        },
-        "nice_to_have_signals": {
-            "type": "ARRAY",
-            "items": {"type": "STRING"},
-            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
-        },
-        "preferred_locations": {
-            "type": "ARRAY",
-            "items": {"type": "STRING"},
-            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
-        },
-        "avoid_signals": {
-            "type": "ARRAY",
-            "items": {"type": "STRING"},
-            "maxItems": _PREFERENCES_MAX_LIST_ITEMS,
-        },
+        "preferred_roles": {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _PREFERENCES_MAX_LIST_ITEMS},
+        "preferred_seniority": {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _PREFERENCES_MAX_LIST_ITEMS},
+        "must_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _PREFERENCES_MAX_LIST_ITEMS},
+        "nice_to_have_signals": {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _PREFERENCES_MAX_LIST_ITEMS},
+        "preferred_locations": {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _PREFERENCES_MAX_LIST_ITEMS},
+        "avoid_signals": {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _PREFERENCES_MAX_LIST_ITEMS},
         "summary": {"type": "STRING"},
     },
     "required": list(_PREFERENCES_FIELDS),
@@ -94,11 +72,7 @@ CANDIDATE_CONTEXT_SCHEMA = {
     "properties": {
         "preferences": _PREFERENCES_SCHEMA,
         **{
-            field: {
-                "type": "ARRAY",
-                "items": {"type": "STRING"},
-                "maxItems": _MAX_LIST_ITEMS,
-            }
+            field: {"type": "ARRAY", "items": {"type": "STRING"}, "maxItems": _MAX_LIST_ITEMS}
             for field in _EVIDENCE_FIELDS
         },
         "evaluation_summary": {"type": "STRING"},
@@ -242,12 +216,7 @@ def _parse_context(raw: str) -> CandidateContext:
     )
 
 
-def _fallback_context(
-    policy: SearchPolicy,
-    *,
-    source: str,
-    load_error: str = "",
-) -> CandidateContext:
+def _fallback_context(policy: SearchPolicy, *, source: str, load_error: str = "") -> CandidateContext:
     return CandidateContext(
         preferences=_build_fallback_preferences(policy),
         technical_skills=[],
@@ -278,20 +247,20 @@ def _context_from_dict(data: dict) -> CandidateContext:
 def _fallback_after_error(policy: SearchPolicy, exc: Exception, *, reason: str = "") -> CandidateContext:
     error_name = type(exc).__name__
     if reason:
-        logger.warning(
-            "candidate context extraction failed; using fallback: error=%s reason=%s",
-            error_name,
-            reason,
-        )
+        logger.warning("candidate context extraction failed; using fallback: error=%s reason=%s", error_name, reason)
     else:
-        logger.warning(
-            "candidate context extraction failed; using fallback: error=%s",
-            error_name,
-        )
-    return _fallback_context(
-        policy,
-        source="fallback_error",
-        load_error=error_name,
+        logger.warning("candidate context extraction failed; using fallback: error=%s", error_name)
+    return _fallback_context(policy, source="fallback_error", load_error=error_name)
+
+
+def _extract(gemini: "GeminiClient", prompt: str, max_output_tokens: int) -> str:
+    return gemini.generate_text(
+        prompt,
+        purpose="candidate_context",
+        thinking_level="medium",
+        max_output_tokens=max_output_tokens,
+        json_mode=True,
+        json_schema=CANDIDATE_CONTEXT_SCHEMA,
     )
 
 
@@ -312,24 +281,35 @@ def get_candidate_context(
     if cached is not None:
         return _context_from_dict(cached.context)
 
+    prompt = _build_extraction_prompt(profile)
     try:
-        raw = gemini.generate_text(
-            _build_extraction_prompt(profile),
-            purpose="candidate_context",
-            thinking_level="medium",
-            max_output_tokens=1800,
-            json_mode=True,
-            json_schema=CANDIDATE_CONTEXT_SCHEMA,
-        )
+        try:
+            raw = _extract(gemini, prompt, _INITIAL_OUTPUT_TOKENS)
+        except GeminiIncompleteResponse as exc:
+            logger.warning(
+                "candidate context generation incomplete; retrying once: category=provider_truncation finish_reason=%s",
+                exc.finish_reason,
+            )
+            raw = _extract(gemini, prompt, _RETRY_OUTPUT_TOKENS)
     except (GeminiBudgetExceeded, GeminiQuotaPaused):
         raise
+    except GeminiIncompleteResponse as exc:
+        return _fallback_after_error(
+            policy,
+            exc,
+            reason=f"category=provider_truncation finish_reason={exc.finish_reason} retry_exhausted=true",
+        )
     except Exception as exc:
         return _fallback_after_error(policy, exc)
 
     try:
         context = _parse_context(raw)
     except ValueError as exc:
-        return _fallback_after_error(policy, exc, reason=" ".join(str(exc).split())[:240])
+        return _fallback_after_error(
+            policy,
+            exc,
+            reason=f"category=malformed_structured_output {' '.join(str(exc).split())[:180]}",
+        )
     except Exception as exc:
         return _fallback_after_error(policy, exc)
 
