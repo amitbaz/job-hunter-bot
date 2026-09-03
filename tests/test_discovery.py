@@ -556,9 +556,14 @@ def test_collect_candidates_skips_canonical_resolution_for_prefiltered_jobs(
 
 
 def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
-    # Two markets: same title/description so `_title_fit`/`_strength_evidence`
-    # tie -- only `source_quality` (via `job.source`) differs, so rank order
-    # is deterministic: remotive (7) > hackernews (5) > arbeitnow (3, default).
+    # Same title/description so `_title_fit`/`_strength_evidence` tie --
+    # only `source_quality` (via `job.source`) differs, so rank order is
+    # deterministic: remotive (7) > hackernews (5) > duckduckgo (3,
+    # default -- ranking.py's 7-point tier already includes arbeitnow
+    # alongside remotive, so duckduckgo is the genuinely-default source
+    # here, not arbeitnow). Lowest-ranked sources are discovered FIRST on
+    # purpose: under the old discovery-order behavior they'd win the
+    # 2-slot shortlist; under rank-order bounding they must lose it.
     jobs = [
         Job(
             source=source,
@@ -570,7 +575,7 @@ def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
             remote=True,
         )
         for index, source in enumerate(
-            ["arbeitnow", "hackernews", "remotive", "arbeitnow", "hackernews"]
+            ["duckduckgo", "duckduckgo", "hackernews", "hackernews", "remotive"]
         )
     ]
     policy.max_canonical_resolutions_per_run = 2
@@ -581,8 +586,12 @@ def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
     )
 
     # Only the top-2-ranked jobs (by source_quality) get the expensive
-    # resolution attempt, regardless of discovery order.
-    assert resolver.calls == ["remotive", "hackernews"]
+    # resolution attempt, regardless of discovery order: remotive (idx 4,
+    # score 7) and the higher-tie-broken hackernews (idx 2, "Acme 2" <
+    # "Acme 3" beats the other hackernews at idx 3). Pass 2 then resolves
+    # in ORIGINAL discovery order among the shortlisted two, so idx 2
+    # (hackernews) is called before idx 4 (remotive) -- NOT rank order.
+    assert resolver.calls == ["hackernews", "remotive"]
     assert result.stats.canonical_budget_exhausted == 3
     assert len(result.eligible) == 5
 
