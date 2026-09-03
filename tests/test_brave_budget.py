@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 
+import job_hunter.search_budget as search_budget
 from job_hunter.circuit_breaker import CircuitBreaker
 from job_hunter.models import Job, SearchQuery
 from job_hunter.pipeline import _targeted_canonical_candidates
@@ -34,6 +35,20 @@ def test_brave_budget_spreads_250_monthly_queries_and_blocks_same_day_reruns(tmp
     assert brave_queries_available_today(ledger, monthly_limit=250, now=tomorrow) == 9
 
 
+def test_brave_budget_daily_target_does_not_shrink_as_today_is_consumed(tmp_path):
+    ledger = SearchUsageLedger(tmp_path / "state.sqlite3")
+    now = datetime(2026, 9, 1, 12, 0, tzinfo=UTC)
+
+    assert brave_queries_available_today(ledger, monthly_limit=1000, now=now) == 34
+
+    for minute in range(10):
+        ledger.record(provider="brave", occurred_at=now.replace(minute=minute))
+
+    # The day started with a 34-query share. Using 10 should leave 24, rather
+    # than recalculating the daily target downward after each request.
+    assert brave_queries_available_today(ledger, monthly_limit=1000, now=now) == 24
+
+
 def test_brave_budget_never_exceeds_monthly_limit(tmp_path):
     ledger = SearchUsageLedger(tmp_path / "state.sqlite3")
     now = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
@@ -45,6 +60,48 @@ def test_brave_budget_never_exceeds_monthly_limit(tmp_path):
         )
 
     assert brave_queries_available_today(ledger, monthly_limit=250, now=now) == 0
+
+
+def test_brave_request_budget_hard_cap_is_shared_across_consumers(tmp_path):
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+    db_path = tmp_path / "state.sqlite3"
+    discovery_budget = search_budget.BraveRequestBudget(
+        SearchUsageLedger(db_path), monthly_limit=3, now=lambda: now
+    )
+    canonical_budget = search_budget.BraveRequestBudget(
+        SearchUsageLedger(db_path), monthly_limit=3, now=lambda: now
+    )
+
+    assert discovery_budget.reserve() is True
+    assert discovery_budget.reserve() is True
+    assert canonical_budget.reserve() is True
+    assert canonical_budget.reserve() is False
+
+    ledger = SearchUsageLedger(db_path)
+    month_start = datetime(2026, 9, 1, tzinfo=UTC)
+    next_month = datetime(2026, 10, 1, tzinfo=UTC)
+    assert ledger.count(provider="brave", start_at=month_start, end_at=next_month) == 3
+
+
+def test_brave_discovery_priority_is_soft_within_shared_daily_allowance(tmp_path):
+    now = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
+    budget = search_budget.BraveRequestBudget(
+        SearchUsageLedger(tmp_path / "state.sqlite3"),
+        monthly_limit=10,
+        discovery_share=0.8,
+        now=lambda: now,
+    )
+
+    assert budget.discovery_allowance() == 8
+
+    for _ in range(8):
+        assert budget.reserve() is True
+
+    # The discovery split is not a second hard budget: canonical work can use
+    # the rest of the same persisted daily/monthly allowance.
+    assert budget.reserve() is True
+    assert budget.reserve() is True
+    assert budget.reserve() is False
 
 
 def test_brave_query_selection_round_robins_across_markets():
