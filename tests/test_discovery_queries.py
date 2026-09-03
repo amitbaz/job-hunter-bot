@@ -170,37 +170,37 @@ def make_production_shaped_policy(max_queries: int = 30) -> SearchPolicy:
                 "germany_eu",
                 0.35,
                 templates=['"{role}" remote Germany', '"{role}" remote Europe'],
-                domains=["wellfound.com", "jobs.ashbyhq.com", "boards.greenhouse.io"],
+                discovery_domains=["wellfound.com", "jobs.ashbyhq.com", "boards.greenhouse.io"],
             ),
             make_market(
                 "israel_remote",
                 0.25,
                 templates=['"{role}" remote Israel', '"{role}" remote Tel Aviv'],
-                domains=["devjobs.co.il", "jobs.ashbyhq.com", "boards.greenhouse.io"],
+                discovery_domains=["devjobs.co.il", "jobs.ashbyhq.com", "boards.greenhouse.io"],
             ),
             make_market(
                 "london",
                 0.17,
                 templates=['"{role}" London sponsorship', '"{role}" London visa'],
-                domains=["workvisajobs.co.uk", "wellfound.com"],
+                discovery_domains=["workvisajobs.co.uk", "wellfound.com"],
             ),
             make_market(
                 "singapore",
                 0.10,
                 templates=['"{role}" Singapore sponsorship', '"{role}" Singapore visa'],
-                domains=["nodeflair.com", "glints.com"],
+                discovery_domains=["nodeflair.com", "glints.com"],
             ),
             make_market(
                 "us_nyc_sf",
                 0.10,
                 templates=['"{role}" NYC sponsorship', '"{role}" San Francisco sponsorship'],
-                domains=["builtin.com", "wellfound.com"],
+                discovery_domains=["builtin.com", "wellfound.com"],
             ),
             make_market(
                 "secondary_eu_relocation",
                 0.03,
                 templates=['"{role}" Amsterdam English', '"{role}" Paris English'],
-                domains=["wellfound.com", "jobs.ashbyhq.com"],
+                discovery_domains=["wellfound.com", "jobs.ashbyhq.com"],
             ),
         ],
     )
@@ -260,3 +260,26 @@ def test_legacy_config_returns_search_query_without_market_id():
     for query in queries:
         assert query.market_id is None
         assert isinstance(query.text, str)
+
+
+def test_generate_search_queries_uses_only_discovery_domains_for_site_variants():
+    market = make_market(
+        "london",
+        1.0,
+        direct_sources=["wellfound"],
+        discovery_domains=["jobs.ashbyhq.com"],
+    )
+    policy = SearchPolicy(
+        target_titles=[],
+        positive_keywords=[],
+        blocked_title_keywords=[],
+        salary_floor_eur=90000,
+        thresholds={"package": 75, "possible": 65},
+        role_families=["senior frontend engineer"],
+        max_search_queries_per_run=2,
+        markets=[market],
+    )
+    queries = generate_search_queries(policy, date(2026, 9, 3))
+    texts = [query.text for query in queries]
+    assert any("site:jobs.ashbyhq.com" in text for text in texts)
+    assert all("site:wellfound" not in text for text in texts)

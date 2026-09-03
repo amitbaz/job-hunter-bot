@@ -42,9 +42,11 @@ from job_hunter.search_backend import build_search_backend
 from job_hunter.sources import (
     CompanyWatchSource,
     GmailStagedSource,
+    LearnedAtsSource,
     TargetedSearchSource,
     build_sources,
 )
+from job_hunter.sources.learned_ats import LearnedAtsStats
 from job_hunter.store import JobStore
 from job_hunter.telegram import (
     TelegramClient,
@@ -158,13 +160,34 @@ def _bump_market_count(counts: dict[str, int], market_id: str | None) -> None:
 
 
 def _record_decision(
-    decision_counts: dict[str, dict[str, int]], market_id: str | None, decision: str | None
+    decision_counts: dict[str, dict[str, int]], key: str | None, decision: str | None
 ) -> None:
-    """Tally one fresh evaluation outcome under its market for per-market logging."""
-    if not market_id or not decision:
+    """Tally one fresh evaluation outcome under its key (market or source) for per-key logging."""
+    if not key or not decision:
         return
-    bucket = decision_counts.setdefault(market_id, {})
+    bucket = decision_counts.setdefault(key, {})
     bucket[decision] = bucket.get(decision, 0) + 1
+
+
+def _bump_source_count(counts: dict[str, int], source_label: str) -> None:
+    counts[source_label] = counts.get(source_label, 0) + 1
+
+
+def _raw_counts_by_source(per_source: dict[str, int]) -> dict[str, int]:
+    """Bound each raw job.source string down to its metric label before summing."""
+    counts: dict[str, int] = {}
+    for source, count in per_source.items():
+        label = metric_source_label(source)
+        counts[label] = counts.get(label, 0) + count
+    return counts
+
+
+def _learned_ats_stats(sources) -> LearnedAtsStats:
+    """Return the run's LearnedAtsSource stats, or zeros when none ran this run."""
+    for source in sources:
+        if isinstance(source, LearnedAtsSource):
+            return source.stats
+    return LearnedAtsStats()
 
 
 def _aggregate_targeted_search_stats(
@@ -227,6 +250,57 @@ def _log_market_metrics(
             search_results.get(market_id, 0),
             discovery.stats.reattributed_by_market.get(market_id, 0),
         )
+
+
+def _log_source_metrics(
+    discovery,
+    raw_by_source: dict[str, int],
+    selected_by_source: dict[str, int],
+    decision_counts_by_source: dict[str, dict[str, int]],
+    delivered_by_source: dict[str, int],
+) -> None:
+    """Log one structured source_quality line per bounded source label seen this run."""
+    sources = (
+        set(raw_by_source)
+        | set(discovery.stats.unique_by_source)
+        | set(discovery.stats.rejected_by_source)
+        | set(discovery.stats.eligible_by_source)
+        | set(selected_by_source)
+        | set(decision_counts_by_source)
+        | set(delivered_by_source)
+    )
+    for source in sorted(sources):
+        decisions = decision_counts_by_source.get(source, {})
+        logger.info(
+            "source_quality source=%s raw=%s unique=%s rejected=%s eligible=%s "
+            "selected=%s high_priority=%s package_match=%s possible_match=%s "
+            "skip=%s blocked=%s delivered=%s",
+            source,
+            raw_by_source.get(source, 0),
+            discovery.stats.unique_by_source.get(source, 0),
+            discovery.stats.rejected_by_source.get(source, 0),
+            discovery.stats.eligible_by_source.get(source, 0),
+            selected_by_source.get(source, 0),
+            decisions.get("high_priority", 0),
+            decisions.get("package_match", 0),
+            decisions.get("possible_match", 0),
+            decisions.get("skip", 0),
+            decisions.get("blocked", 0),
+            delivered_by_source.get(source, 0),
+        )
+
+
+def _log_ats_registry_metrics(store: JobStore, discovery, learned_stats: LearnedAtsStats) -> None:
+    """Log one final ats_registry line summarizing registry health this run."""
+    logger.info(
+        "ats_registry total=%s discovered=%s scanned=%s successful=%s failed=%s jobs_raw=%s",
+        store.count_ats_boards(),
+        discovery.stats.ats_boards_discovered,
+        learned_stats.boards_scanned,
+        learned_stats.boards_successful,
+        learned_stats.boards_failed,
+        learned_stats.jobs_raw,
+    )
 
 
 def _due_watch_state(
@@ -563,7 +637,11 @@ def run_pipeline(
         sources
         if sources is not None
         else build_sources(
-            settings, http, search_breaker=search_breaker, query_date=query_date
+            settings,
+            http,
+            store=store,
+            search_breaker=search_breaker,
+            query_date=query_date,
         )
     )
     sources = [
@@ -619,6 +697,7 @@ def run_pipeline(
     selected_source_counts = _source_counts(selected)
     selected_by_market = _market_counts(selected)
     decision_counts: dict[str, dict[str, int]] = {}
+    decision_counts_by_source: dict[str, dict[str, int]] = {}
     deferred_by_budget = max(0, len(ranked) - len(selected))
     logger.info(
         "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s sources=%s",
@@ -667,6 +746,7 @@ def run_pipeline(
             job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
         )
         _record_decision(decision_counts, job.market_id, decision)
+        _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
         if promoted:
             companies_promoted += 1
         quota_blocked = quota_blocked or blocked
@@ -681,6 +761,7 @@ def run_pipeline(
             job_id, job, candidate_context, settings, store, gemini, out_dir, digest_items, pdf_deliveries, summary
         )
         _record_decision(decision_counts, job.market_id, decision)
+        _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
         if promoted:
             companies_promoted += 1
         quota_blocked = quota_blocked or blocked
@@ -703,6 +784,7 @@ def run_pipeline(
         logger.info(_format_gemini_usage_log(usage_summary))
 
     delivered_by_market: dict[str, int] = {}
+    delivered_by_source: dict[str, int] = {}
     if not settings.dry_run:
         deliverable_items = select_deliverable_items(digest_items)
         interactive_sender = getattr(telegram, "send_job_card", None)
@@ -714,6 +796,11 @@ def run_pipeline(
                 for item in deliverable_items:
                     store.mark_delivered(item.job_id, "telegram_message", message_id)
                     _bump_market_count(delivered_by_market, item.market_id)
+                    delivered_job = store.get_job(item.job_id)
+                    if delivered_job is not None:
+                        _bump_source_count(
+                            delivered_by_source, metric_source_label(delivered_job.source)
+                        )
 
         pdf_deliveries.sort(
             key=lambda entry: (
@@ -779,6 +866,11 @@ def run_pipeline(
                 for card in session.cards:
                     store.mark_delivered(card.job_id, "telegram_message", str(message_id))
                     _bump_market_count(delivered_by_market, card.market_id)
+                    delivered_job = store.get_job(card.job_id)
+                    if delivered_job is not None:
+                        _bump_source_count(
+                            delivered_by_source, metric_source_label(delivered_job.source)
+                        )
 
     _log_market_metrics(
         settings,
@@ -791,6 +883,14 @@ def run_pipeline(
         decision_counts,
         delivered_by_market,
     )
+    _log_source_metrics(
+        discovery,
+        _raw_counts_by_source(discovery.stats.per_source),
+        selected_source_counts,
+        decision_counts_by_source,
+        delivered_by_source,
+    )
+    _log_ats_registry_metrics(store, discovery, _learned_ats_stats(base_sources))
 
     logger.info(
         "company watch outcomes: companies_promoted=%s watch_checks=%s watch_paused=%s",

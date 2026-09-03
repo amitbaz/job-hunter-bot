@@ -77,6 +77,7 @@ blocked_title_keywords:
   - backend developer
   - back-end developer
 max_search_queries_per_run: 30
+max_learned_ats_boards_per_run: 75
 role_families:
   - senior frontend engineer
   - staff frontend engineer
@@ -101,7 +102,8 @@ markets:
     remote_policy: preferred
     relocation_policy: selective
     sponsorship_policy: not_required
-    source_domains:
+    direct_sources: [wellfound]
+    discovery_domains:
       - wellfound.com
       - welcometothejungle.com
       - app.welcometothejungle.com
@@ -122,7 +124,8 @@ markets:
     remote_policy: required
     relocation_policy: none
     sponsorship_policy: not_required
-    source_domains:
+    direct_sources: [devjobs]
+    discovery_domains:
       - jobs.techaviv.com
       - devjobs.co.il
       - gotfriends.co.il
@@ -144,7 +147,8 @@ markets:
     remote_policy: allowed
     relocation_policy: allowed
     sponsorship_policy: required
-    source_domains:
+    direct_sources: [wellfound]
+    discovery_domains:
       - workvisajobs.co.uk
       - welcometothejungle.com
       - builtin.com
@@ -166,7 +170,8 @@ markets:
     remote_policy: allowed
     relocation_policy: allowed
     sponsorship_policy: required
-    source_domains:
+    direct_sources: []
+    discovery_domains:
       - nodeflair.com
       - sg.jobstreet.com
       - glints.com
@@ -191,7 +196,8 @@ markets:
     remote_policy: allowed
     relocation_policy: allowed
     sponsorship_policy: required
-    source_domains:
+    direct_sources: [wellfound]
+    discovery_domains:
       - builtin.com
       - wellfound.com
       - ycombinator.com
@@ -217,7 +223,8 @@ markets:
     remote_policy: allowed
     relocation_policy: selective
     sponsorship_policy: not_required
-    source_domains:
+    direct_sources: []
+    discovery_domains:
       - wellfound.com
       - welcometothejungle.com
       - jobs.ashbyhq.com

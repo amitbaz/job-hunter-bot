@@ -121,7 +121,7 @@ def generate_search_queries(policy: SearchPolicy, run_date: date | None = None) 
             local_seen: set[str] = set()
             for template in market.query_templates:
                 base = " ".join(template.format(role=role).split())
-                variants = [base] + [f"site:{domain} {base}" for domain in market.source_domains]
+                variants = [base] + [f"site:{domain} {base}" for domain in market.discovery_domains]
                 for text in variants:
                     text = " ".join(text.split())
                     if not text or text in local_seen:

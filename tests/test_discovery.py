@@ -1,7 +1,9 @@
 import logging
+from datetime import datetime, timezone
 
 import pytest
 
+from job_hunter.canonical import CanonicalResolver
 from job_hunter.discovery import collect_candidates
 from job_hunter.models import (
     AtsReference,
@@ -191,6 +193,34 @@ def test_collect_candidates_counts_prefilter_rejections(store, policy):
     assert result.stats.prefilter_rejected == 1
     assert result.eligible == []
     assert result.rediscovered_job_ids == []
+
+
+def test_collect_candidates_counts_jobs_by_bounded_source_label(store, policy):
+    eligible_job = Job(
+        source="devjobs",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        description="React TypeScript remote role",
+        remote=True,
+    )
+    rejected_jobs = [
+        Job(
+            source="devjobs",
+            source_job_id=str(index),
+            title="Junior QA Tester",
+            description="manual testing",
+        )
+        for index in (2, 3)
+    ]
+
+    result = collect_candidates(
+        [FakeSource([eligible_job, *rejected_jobs])], store, NoOpHttp(), policy
+    )
+
+    assert result.stats.unique_by_source == {"devjobs": 3}
+    assert result.stats.eligible_by_source == {"devjobs": 1}
+    assert result.stats.rejected_by_source == {"devjobs": 2}
 
 
 def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, policy):
@@ -540,6 +570,46 @@ def test_collect_candidates_caps_canonical_resolutions_per_run(store, policy):
     assert len(result.eligible) == 5
 
 
+def test_collect_candidates_does_not_charge_budget_for_already_ats_urls(
+    store, policy
+):
+    already_ats = Job(
+        source="arbeitnow",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://jobs.lever.co/acme/abc123",
+        description="React TypeScript",
+        remote=True,
+    )
+    needs_resolution = Job(
+        source="arbeitnow",
+        source_job_id="2",
+        title="Senior Product Engineer",
+        company="Beta",
+        url="https://aggregator.test/jobs/2",
+        description="React TypeScript",
+        remote=True,
+    )
+    policy.max_canonical_resolutions_per_run = 1
+    resolver = CanonicalResolver(NoOpHttp(), lambda job: [], lambda company: None)
+
+    result = collect_candidates(
+        [FakeSource([already_ats, needs_resolution])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=resolver,
+    )
+
+    # The already-ATS job resolves for free (method="direct", no network call),
+    # so it must not consume the single resolution slot: the second job still
+    # gets its resolution attempt instead of being counted as budget-exhausted.
+    assert result.stats.canonical_resolved == 1
+    assert result.stats.canonical_unresolved == 1
+    assert result.stats.canonical_budget_exhausted == 0
+
+
 def test_collect_candidates_still_canonicalizes_eligible_jobs(store, policy):
     job = Job(
         source="aggregator",
@@ -670,6 +740,54 @@ def test_collect_candidates_survives_unattributed_uncertainty_for_remote_job(
     job_id, job = result.eligible[0]
     assert job.market_id == "germany_eu"
     assert result.stats.eligible_by_market == {"germany_eu": 1}
+
+
+def test_collect_candidates_teaches_ats_board_even_for_backend_only_role(store, policy):
+    job = Job(
+        source="feed",
+        title="Backend Engineer",
+        company="Example",
+        url="https://jobs.ashbyhq.com/example/backend-1",
+        description="Python backend services",
+    )
+
+    result = collect_candidates([FakeSource([job])], store, NoOpHttp(), policy)
+
+    assert result.eligible == []
+    assert store.count_ats_boards() == 1
+    assert result.stats.ats_boards_discovered == 1
+
+
+def test_collect_candidates_teaches_ats_board_from_canonical_resolution(store, policy):
+    job = Job(
+        source="aggregator",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://aggregator.test/jobs/1",
+        description="React TypeScript",
+        remote=True,
+    )
+    resolver = FakeResolver(
+        CanonicalResolution(
+            url="https://boards.greenhouse.io/acme/jobs/123",
+            ats=AtsReference(provider="greenhouse", board="acme", job_id="123"),
+            confidence=0.9,
+            method="targeted_search",
+        )
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])], store, NoOpHttp(), policy, resolver=resolver
+    )
+
+    assert len(result.eligible) == 1
+    assert store.count_ats_boards() == 1
+    assert result.stats.ats_boards_discovered == 1
+    due = store.list_due_ats_boards(datetime.now(timezone.utc))
+    assert [(entry.provider, entry.board_identifier) for entry in due] == [
+        ("greenhouse", "acme")
+    ]
 
 
 def test_collect_candidates_counts_one_eligible_per_canonical_duplicate_group_by_market(

@@ -92,6 +92,7 @@ def load_settings(config_path: Path) -> Settings:
         max_canonical_resolutions_per_run=data.get(
             "max_canonical_resolutions_per_run", 80
         ),
+        max_learned_ats_boards_per_run=_parse_max_learned_ats_boards_per_run(data),
         engineering_title_keywords=list(
             data.get("engineering_title_keywords", DEFAULT_ENGINEERING_TITLE_KEYWORDS)
         ),
@@ -160,6 +161,13 @@ def _require_positive_int_env(name: str) -> int:
     return value
 
 
+def _parse_max_learned_ats_boards_per_run(data: dict) -> int:
+    value = data.get("max_learned_ats_boards_per_run", 75)
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError("max_learned_ats_boards_per_run must be a positive integer")
+    return value
+
+
 def _parse_markets(entries: object) -> list[MarketPolicy]:
     if not isinstance(entries, list):
         raise ValueError("markets must be a list")
@@ -214,11 +222,21 @@ def _parse_markets(entries: object) -> list[MarketPolicy]:
         allowed_fields = {
             "id", "query_share", "locations", "allowed_languages", "salary",
             "remote_policy", "relocation_policy", "sponsorship_policy",
-            "source_domains", "query_templates", "role_families", "enabled"
+            "direct_sources", "discovery_domains", "source_domains",
+            "query_templates", "role_families", "enabled"
         }
         unknown_fields = sorted(set(entry) - allowed_fields, key=str)
         if unknown_fields:
             raise ValueError(f"markets[{index}].{unknown_fields[0]} is not allowed")
+
+        if "source_domains" in entry and "discovery_domains" in entry:
+            raise ValueError(
+                f"markets[{index}] cannot define both source_domains and discovery_domains"
+            )
+        discovery_domains = entry.get(
+            "discovery_domains",
+            entry.get("source_domains", []),
+        )
 
         markets.append(MarketPolicy(
             id=market_id,
@@ -233,7 +251,8 @@ def _parse_markets(entries: object) -> list[MarketPolicy]:
             remote_policy=remote_policy,
             relocation_policy=relocation_policy,
             sponsorship_policy=sponsorship_policy,
-            source_domains=entry.get("source_domains", []),
+            direct_sources=entry.get("direct_sources", []),
+            discovery_domains=discovery_domains,
             query_templates=entry.get("query_templates", []),
             role_families=entry.get("role_families", []),
             enabled=entry.get("enabled", True),

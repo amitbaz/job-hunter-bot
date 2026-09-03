@@ -63,7 +63,8 @@ class MarketPolicy:
     remote_policy: str
     relocation_policy: str
     sponsorship_policy: str
-    source_domains: list[str] = field(default_factory=list)
+    direct_sources: list[str] = field(default_factory=list)
+    discovery_domains: list[str] = field(default_factory=list)
     query_templates: list[str] = field(default_factory=list)
     role_families: list[str] = field(default_factory=list)
     enabled: bool = True
@@ -107,6 +108,24 @@ class CanonicalResolution:
     ats: AtsReference | None
     confidence: float
     method: str
+
+
+@dataclass(frozen=True, slots=True)
+class AtsRegistryEntry:
+    provider: str
+    board_identifier: str
+    company_name: str
+    market_hint: str
+    first_seen_at: str
+    last_seen_at: str
+    last_checked_at: str | None
+    last_success_at: str | None
+    last_eligible_at: str | None
+    last_job_count: int
+    eligible_jobs_seen: int
+    consecutive_failures: int
+    active: bool
+    paused_until: str | None
 
 
 @dataclass(slots=True)
@@ -169,6 +188,7 @@ class SearchPolicy:
     manual_company_watch: list[CompanyWatchSeed] = field(default_factory=list)
     max_search_queries_per_run: int = 30
     max_canonical_resolutions_per_run: int = 80
+    max_learned_ats_boards_per_run: int = 75
     engineering_title_keywords: list[str] = field(
         default_factory=lambda: list(DEFAULT_ENGINEERING_TITLE_KEYWORDS)
     )

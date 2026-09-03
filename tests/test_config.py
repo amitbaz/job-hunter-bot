@@ -291,6 +291,7 @@ def test_load_settings_uses_profile_discovery_defaults(monkeypatch, tmp_path: Pa
     assert settings.policy.source_minimum_per_run == 2
     assert settings.policy.source_max_share == 0.5
     assert settings.policy.manual_company_watch == []
+    assert settings.policy.max_learned_ats_boards_per_run == 75
 
 
 def test_load_settings_supports_legacy_manual_company_names(monkeypatch, tmp_path: Path):
@@ -474,4 +475,76 @@ def test_load_settings_rejects_invalid_market(monkeypatch, tmp_path, bad_market_
         f"  - {bad_market_yaml}\n"
     )
     with pytest.raises(ValueError, match=expected_error):
+        load_settings(cfg)
+
+
+def test_market_source_config_distinguishes_direct_and_discovery(monkeypatch, tmp_path):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds: {package: 75, possible: 65}\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "markets:\n"
+        "  - id: israel_remote\n"
+        "    query_share: 1.0\n"
+        "    locations: [Israel]\n"
+        "    allowed_languages: [English, Hebrew]\n"
+        "    salary: {currency: ILS, gross_base_floor: 420000}\n"
+        "    remote_policy: required\n"
+        "    relocation_policy: none\n"
+        "    sponsorship_policy: not_required\n"
+        "    direct_sources: [devjobs]\n"
+        "    discovery_domains: [jobs.techaviv.com, jobs.ashbyhq.com]\n"
+    )
+
+    market = load_settings(cfg).policy.markets[0]
+
+    assert market.direct_sources == ["devjobs"]
+    assert market.discovery_domains == ["jobs.techaviv.com", "jobs.ashbyhq.com"]
+
+
+def test_legacy_source_domains_are_discovery_only(monkeypatch, tmp_path):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds: {package: 75, possible: 65}\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "markets:\n"
+        "  - id: london\n"
+        "    query_share: 1.0\n"
+        "    locations: [London]\n"
+        "    allowed_languages: [English]\n"
+        "    salary: {currency: GBP, gross_base_floor: 90000}\n"
+        "    remote_policy: allowed\n"
+        "    relocation_policy: allowed\n"
+        "    sponsorship_policy: required\n"
+        "    source_domains: [wellfound.com]\n"
+    )
+
+    market = load_settings(cfg).policy.markets[0]
+
+    assert market.direct_sources == []
+    assert market.discovery_domains == ["wellfound.com"]
+
+
+def test_market_rejects_source_domains_and_discovery_domains_together(monkeypatch, tmp_path):
+    _set_required_bot_env(monkeypatch)
+    cfg = tmp_path / "search.yml"
+    cfg.write_text(
+        "thresholds: {package: 75, possible: 65}\n"
+        "target_titles: []\npositive_keywords: []\nblocked_title_keywords: []\n"
+        "markets:\n"
+        "  - id: london\n"
+        "    query_share: 1.0\n"
+        "    locations: [London]\n"
+        "    allowed_languages: [English]\n"
+        "    salary: {currency: GBP, gross_base_floor: 90000}\n"
+        "    remote_policy: allowed\n"
+        "    relocation_policy: allowed\n"
+        "    sponsorship_policy: required\n"
+        "    source_domains: [wellfound.com]\n"
+        "    discovery_domains: [jobs.ashbyhq.com]\n"
+    )
+
+    with pytest.raises(ValueError, match="cannot define both source_domains and discovery_domains"):
         load_settings(cfg)
