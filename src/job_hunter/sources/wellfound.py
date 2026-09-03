@@ -13,6 +13,7 @@ from .base import logger
 _BASE_URL = "https://wellfound.com"
 _JOB_PATH_RE = re.compile(r"^/jobs/(\d+)-")
 _TITLE_SUFFIX = " | Wellfound"
+_WELLFOUND_RETRY_STATUS_CODES = {500, 502, 503, 504}
 _WORK_MODES = {
     "Remote only": True,
     "In office": False,
@@ -62,13 +63,12 @@ class WellfoundSource:
         jobs: list[Job] = []
         seen_job_ids: set[str] = set()
         for listing in self.listings:
-            try:
-                response = self._http.get(listing.url)
-                response.raise_for_status()
-            except Exception:
-                logger.warning(
-                    "wellfound listing failed for %s", listing.url, exc_info=True
-                )
+            response = self._get_response(
+                listing.url,
+                kind="listing",
+                target=listing.url,
+            )
+            if response is None:
                 continue
 
             links = _extract_job_links(response.text)
@@ -80,16 +80,49 @@ class WellfoundSource:
                     jobs.append(job)
         return jobs
 
-    def _fetch_job(self, job_id: str, detail_url: str, market_id: str) -> Job | None:
+    def _get_response(self, url: str, *, kind: str, target: str):
         try:
-            response = self._http.get(detail_url)
-            response.raise_for_status()
+            response = self._http.get(
+                url,
+                retry_status_codes=_WELLFOUND_RETRY_STATUS_CODES,
+            )
         except Exception:
             logger.warning(
-                "wellfound detail fetch failed for id %s", job_id, exc_info=True
+                "wellfound %s fetch failed for %s",
+                kind,
+                target,
+                exc_info=True,
             )
             return None
 
+        if response.status_code == 429:
+            logger.warning(
+                "wellfound rate limited: kind=%s status=429 target=%s",
+                kind,
+                target,
+            )
+            return None
+
+        try:
+            response.raise_for_status()
+        except Exception:
+            logger.warning(
+                "wellfound %s fetch failed for %s",
+                kind,
+                target,
+                exc_info=True,
+            )
+            return None
+        return response
+
+    def _fetch_job(self, job_id: str, detail_url: str, market_id: str) -> Job | None:
+        response = self._get_response(
+            detail_url,
+            kind="detail",
+            target=job_id,
+        )
+        if response is None:
+            return None
         return _parse_detail(response.text, job_id, detail_url, market_id)
 
 
