@@ -113,9 +113,9 @@ def _merge_fields(richer: Job, weaker: Job) -> Job:
         richer.company = weaker.company
     if not richer.location and weaker.location:
         richer.location = weaker.location
-    if content_confidence.tier_rank(weaker.content_confidence) < content_confidence.tier_rank(
-        richer.content_confidence
-    ):
+    if weaker.description and content_confidence.tier_rank(
+        weaker.content_confidence
+    ) < content_confidence.tier_rank(richer.content_confidence):
         richer.description = weaker.description
         richer.content_confidence = weaker.content_confidence
     if richer.remote is None and weaker.remote is not None:

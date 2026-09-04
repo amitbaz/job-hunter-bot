@@ -5,7 +5,7 @@ import pytest
 
 from job_hunter.canonical import CanonicalResolver
 from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS, PARTIAL_UNKNOWN
-from job_hunter.discovery import _dedupe, collect_candidates
+from job_hunter.discovery import _dedupe, _merge_fields, collect_candidates
 from job_hunter.models import (
     AtsReference,
     CandidatePreferences,
@@ -291,6 +291,32 @@ def test_dedupe_still_fills_empty_description_from_weaker_source():
     assert merged[0].content_confidence == AGGREGATOR_TEXT
 
 
+def test_merge_fields_does_not_overwrite_real_description_with_empty_one():
+    # richer has real description text but an unset content_confidence tier,
+    # which ranks worse than any real tier including the weaker job's.
+    richer = Job(
+        source="ashby",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-3",
+        description="authoritative JD text",
+        content_confidence="",
+    )
+    weaker = Job(
+        source="hackernews",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-3",
+        description="",
+        content_confidence=PARTIAL_UNKNOWN,
+    )
+    merged = _merge_fields(richer, weaker)
+    assert merged.description == "authoritative JD text"
+    assert merged.content_confidence == ""
+
+
 def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, policy):
     job = Job(
         source="ashby",
@@ -299,6 +325,7 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
         company="Acme",
         description="React TypeScript remote role",
         remote=True,
+        content_confidence=OFFICIAL_ATS,
     )
     job_id, _is_new, _changed = store.upsert_job(job)
     store.save_evaluation(
@@ -316,6 +343,7 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
             rationale="",
             model="gemini-test",
             status="ok",
+            content_confidence=OFFICIAL_ATS,
         ),
     )
 
@@ -435,6 +463,7 @@ def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, po
         url=legacy_url,
         description="React TypeScript",
         remote=True,
+        content_confidence=AGGREGATOR_TEXT,
     )
     legacy_id, _, _ = store.upsert_job(legacy)
     store.save_evaluation(
@@ -452,6 +481,7 @@ def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, po
             rationale="",
             model="gemini-test",
             status="ok",
+            content_confidence=AGGREGATOR_TEXT,
         ),
     )
     canonical_id, _, _ = store.upsert_job(

@@ -1844,11 +1844,13 @@ class JobStore:
         Conditions:
         - No evaluation row exists, OR
         - Most recent evaluation has status == 'failed', OR
-        - The job description changed since the most recent evaluation.
+        - The job description changed since the most recent evaluation, OR
+        - The job's content_confidence changed since the most recent evaluation.
         """
         row = self._conn.execute(
             """
-            SELECT e.status, e.description_hash_at_eval, j.description_hash
+            SELECT e.status, e.description_hash_at_eval, j.description_hash,
+                   e.content_confidence_at_eval, j.content_confidence
             FROM   evaluations e
             JOIN   jobs j ON j.id = e.job_id
             WHERE  e.job_id = ?
@@ -1867,6 +1869,9 @@ class JobStore:
         if row["description_hash_at_eval"] != row["description_hash"]:
             return True
 
+        if row["content_confidence_at_eval"] != row["content_confidence"]:
+            return True
+
         return False
 
     def save_evaluation(self, job_id: int, evaluation: Evaluation) -> None:
@@ -1876,7 +1881,8 @@ class JobStore:
                 "SELECT description_hash, content_confidence FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             description_hash = row["description_hash"] if row else ""
-            content_confidence_value = row["content_confidence"] if row else ""
+            row_content_confidence = row["content_confidence"] if row else ""
+            content_confidence_value = evaluation.content_confidence or row_content_confidence or ""
             self._conn.execute(
                 """
                 INSERT INTO evaluations
