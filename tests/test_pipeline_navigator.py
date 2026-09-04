@@ -274,7 +274,7 @@ def test_pipeline_sends_gmail_activity_before_job_navigator(tmp_path):
     assert "Gmail activity I couldn't link" in telegram.messages[0]
     assert "Montash — Senior Frontend Engineer" in telegram.messages[0]
     assert "deterministic recruiter template" not in telegram.messages[0]
-    assert "https://mail.google.com/mail/#all/gmail-review-1" in telegram.messages[0]
+    assert "https://mail.google.com/mail/u/0/#all/thread-gmail-review-1" in telegram.messages[0]
     assert store.pending_review_events() == []
     delivery = store._conn.execute(
         "SELECT telegram_message_id FROM review_deliveries WHERE event_id = ?",
