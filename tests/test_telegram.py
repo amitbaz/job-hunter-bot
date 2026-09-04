@@ -81,6 +81,7 @@ def _review_item(**overrides):
         rationale="ambiguous scheduling language",
         event_type="RECRUITER_CONTACT",
         source_message_id="gmail-message-1",
+        source_thread_id="gmail-thread-1",
     )
     defaults.update(overrides)
     return ReviewItem(**defaults)
@@ -158,7 +159,7 @@ def test_build_gmail_review_digest_uses_user_facing_activity_copy():
         "Gmail activity I couldn't link\n\n"
         "Montash — Senior Frontend Engineer\n"
         "A recruiter contacted you, but I couldn't link this email to a tracked job.\n"
-        "Open email: https://mail.google.com/mail/#all/gmail-message-1"
+        "Open email: https://mail.google.com/mail/u/0/#all/gmail-thread-1"
     )
     assert "deterministic recruiter template" not in digest
 
