@@ -53,13 +53,13 @@ jobs:
 
           replace(
               "tests/test_telegram.py",
-              '                    source_message_id="m-company",\n                ),',
-              '                    source_message_id="m-company",\n                    source_thread_id="thread-m-company",\n                ),',
+              '                source_message_id="m-company",\n            ),',
+              '                source_message_id="m-company",\n                source_thread_id="thread-m-company",\n            ),',
           )
           replace(
               "tests/test_telegram.py",
-              '                    source_message_id="m-subject",\n                    occurred_at="2026-08-31T11:00:00+00:00",',
-              '                    source_message_id="m-subject",\n                    source_thread_id="thread-m-subject",\n                    occurred_at="2026-08-31T11:00:00+00:00",',
+              '                source_message_id="m-subject",\n                occurred_at="2026-08-31T11:00:00+00:00",',
+              '                source_message_id="m-subject",\n                source_thread_id="thread-m-subject",\n                occurred_at="2026-08-31T11:00:00+00:00",',
           )
           replace(
               "tests/test_telegram.py",
