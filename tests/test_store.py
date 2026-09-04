@@ -1895,3 +1895,26 @@ def test_save_evaluation_persists_evaluation_confidence_not_jobs_row(tmp_path):
     store.save_evaluation(job_id, evaluation)
     saved = store.get_evaluation(job_id)
     assert saved.content_confidence == AGGREGATOR_TEXT
+
+
+def test_evaluation_raw_model_score_round_trip(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(Job(source="x", source_job_id="1", title="Analyst", company="Acme"))
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=64, raw_model_score=89))
+    loaded = store.get_evaluation(job_id)
+    assert loaded.total_score == 64
+    assert loaded.raw_model_score == 89
+
+
+def test_legacy_evaluation_rows_backfill_raw_model_score(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    store = JobStore(db_path)
+    job_id, _, _ = store.upsert_job(Job(source="x", source_job_id="1", title="Analyst", company="Acme"))
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=77, raw_model_score=77))
+    # Simulate a row written before the column existed.
+    with store._conn:
+        store._conn.execute("UPDATE evaluations SET raw_model_score = 0")
+    store._conn.close()
+
+    reopened = JobStore(db_path)
+    assert reopened.get_evaluation(job_id).raw_model_score == 77
