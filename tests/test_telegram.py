@@ -81,6 +81,7 @@ def _review_item(**overrides):
         rationale="ambiguous scheduling language",
         event_type="RECRUITER_CONTACT",
         source_message_id="gmail-message-1",
+        source_thread_id="gmail-thread-1",
     )
     defaults.update(overrides)
     return ReviewItem(**defaults)
@@ -158,7 +159,7 @@ def test_build_gmail_review_digest_uses_user_facing_activity_copy():
         "Gmail activity I couldn't link\n\n"
         "Montash — Senior Frontend Engineer\n"
         "A recruiter contacted you, but I couldn't link this email to a tracked job.\n"
-        "Open email: https://mail.google.com/mail/#all/gmail-message-1"
+        "Open email: https://mail.google.com/mail/u/0/#all/gmail-thread-1"
     )
     assert "deterministic recruiter template" not in digest
 
@@ -192,6 +193,7 @@ def test_gmail_activity_identity_falls_back_to_company_event_label_then_subject(
                 event_type="REVIEW_NEEDED",
                 subject="Supabase product update",
                 source_message_id="m-company",
+                source_thread_id="thread-m-company",
             ),
             _review_item(
                 event_id=2,
@@ -200,6 +202,7 @@ def test_gmail_activity_identity_falls_back_to_company_event_label_then_subject(
                 event_type="INTERVIEW",
                 subject="Interview details inside",
                 source_message_id="m-subject",
+                source_thread_id="thread-m-subject",
                 occurred_at="2026-08-31T11:00:00+00:00",
             ),
         ]
@@ -207,8 +210,8 @@ def test_gmail_activity_identity_falls_back_to_company_event_label_then_subject(
 
     assert "Supabase — Job-related activity" in digest
     assert "Interview details inside" in digest
-    assert "https://mail.google.com/mail/#all/m-company" in digest
-    assert "https://mail.google.com/mail/#all/m-subject" in digest
+    assert "https://mail.google.com/mail/u/0/#all/thread-m-company" in digest
+    assert "https://mail.google.com/mail/u/0/#all/thread-m-subject" in digest
 
 
 def test_gmail_activity_digest_sorts_events_by_time_then_id():
@@ -230,6 +233,7 @@ def test_gmail_activity_chunking_keeps_each_event_atomic():
             event_id=index,
             company=f"Company {index}",
             source_message_id=f"m-{index}",
+            source_thread_id=f"thread-m-{index}",
             rationale="internal detail that must not be shown",
         )
         for index in range(1, 8)
@@ -246,7 +250,7 @@ def test_gmail_activity_chunking_keeps_each_event_atomic():
         delivered_ids.extend(event_ids)
         for event_id in event_ids:
             assert f"Company {event_id} — Frontend Engineer" in text
-            assert f"https://mail.google.com/mail/#all/m-{event_id}" in text
+            assert f"https://mail.google.com/mail/u/0/#all/thread-m-{event_id}" in text
     assert delivered_ids == list(range(1, 8))
 
 

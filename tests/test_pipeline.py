@@ -1023,10 +1023,10 @@ def test_pipeline_delivers_all_pending_gmail_reviews_in_one_message(settings):
         "Gmail activity I couldn't link\n\n"
         "Acme — Frontend Engineer\n"
         "This looks job-related, but I couldn't classify or link it confidently.\n"
-        "Open email: https://mail.google.com/mail/#all/review-1\n\n"
+        "Open email: https://mail.google.com/mail/u/0/#all/thread-review-1\n\n"
         "Beta — Frontend Engineer\n"
         "This looks job-related, but I couldn't classify or link it confidently.\n"
-        "Open email: https://mail.google.com/mail/#all/review-2"
+        "Open email: https://mail.google.com/mail/u/0/#all/thread-review-2"
     ]
     assert store.pending_review_events() == []
     delivered = store._conn.execute(
@@ -1059,7 +1059,7 @@ def test_pipeline_retries_gmail_reviews_after_a_failed_telegram_send(settings):
         "Gmail activity I couldn't link\n\n"
         "Acme — Frontend Engineer\n"
         "This looks job-related, but I couldn't classify or link it confidently.\n"
-        "Open email: https://mail.google.com/mail/#all/review-1"
+        "Open email: https://mail.google.com/mail/u/0/#all/thread-review-1"
     ]
 
 
@@ -1123,7 +1123,7 @@ def test_pipeline_sends_gmail_reviews_after_normal_job_delivery_without_scoring_
         "Gmail activity I couldn't link\n\n"
         "Review Co — Review Role\n"
         "This looks job-related, but I couldn't classify or link it confidently.\n"
-        "Open email: https://mail.google.com/mail/#all/review-1"
+        "Open email: https://mail.google.com/mail/u/0/#all/thread-review-1"
     )
 
 
