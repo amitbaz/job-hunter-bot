@@ -13,18 +13,9 @@ from job_hunter.job_identity import (
     normalize_job_title,
 )
 from job_hunter.models import AtsReference, CanonicalResolution, Job
-from job_hunter.sources import ashby as ashby_source
-from job_hunter.sources import greenhouse as greenhouse_source
-from job_hunter.sources import lever as lever_source
 
 if TYPE_CHECKING:
     from job_hunter.http import HttpClient
-
-_DESCRIPTION_FETCHERS = {
-    "ashby": ashby_source,
-    "lever": lever_source,
-    "greenhouse": greenhouse_source,
-}
 
 
 def parse_supported_ats_url(url: str) -> AtsReference | None:
@@ -185,8 +176,22 @@ def fetch_authoritative_description(
 
     Non-fatal by design, matching the rest of this module: a fetch failure
     here should never take down canonical resolution.
+
+    The adapter imports below are deliberately local rather than module-level:
+    job_hunter.sources imports job_hunter.ats_registry, which imports
+    parse_supported_ats_url from this module, so importing job_hunter.sources
+    at module scope here creates a circular import.
     """
-    adapter = _DESCRIPTION_FETCHERS.get(ats.provider)
+    from job_hunter.sources import ashby as ashby_source
+    from job_hunter.sources import greenhouse as greenhouse_source
+    from job_hunter.sources import lever as lever_source
+
+    description_fetchers = {
+        "ashby": ashby_source,
+        "lever": lever_source,
+        "greenhouse": greenhouse_source,
+    }
+    adapter = description_fetchers.get(ats.provider)
     if adapter is None:
         return None
     try:
