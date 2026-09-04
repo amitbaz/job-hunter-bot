@@ -90,6 +90,7 @@ def test_review_without_company_or_role_falls_back_to_subject():
                 rationale="semantic classification requires review",
                 event_type="REVIEW_NEEDED",
                 source_message_id="m1",
+                source_thread_id="t1",
             )
         ]
     )
