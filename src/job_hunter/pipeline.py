@@ -762,6 +762,7 @@ def run_pipeline(
                     rationale=row["rationale"],
                     event_type=row["event_type"],
                     source_message_id=row["source_message_id"],
+                    source_thread_id=row["source_thread_id"],
                 )
                 for row in pending_reviews
             ]
