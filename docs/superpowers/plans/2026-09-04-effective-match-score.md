@@ -496,7 +496,7 @@ Confirm each against a real test, by name:
 | Criterion | Covered by |
 |---|---|
 | Raw 89 + `unsupported` `deep_expert` must-have is no longer 89; effective score below `possible`; decision `skip` | `test_major_unsupported_must_have_caps_score_below_possible` |
-| Raw 71 + central `experience`/`deep_expert` must-have cannot show as `Match: 71%` | `test_experience_depth_unsupported_must_have_is_also_capped` + `test_capped_job_is_excluded_from_digest_and_navigation` |
+| Raw 71 + central `experience`/`deep_expert` must-have cannot show as `Match: 71%` | `test_experience_depth_unsupported_must_have_is_also_capped` + `test_capped_job_is_excluded_from_delivery` |
 | Unsupported *preferred* requirement still scores strongly and can be `package_match`/`high_priority` | `test_unsupported_preferred_requirement_does_not_gate` |
 | Unsupported *familiarity*-depth must-have is not capped | `test_familiarity_depth_unsupported_must_have_does_not_gate` |
 | Telegram card display and navigation sort both use the effective score | No code change needed — both read `total_score` (`telegram_navigation.py:52,69`), which now carries the capped value. State this explicitly in the PR body. |

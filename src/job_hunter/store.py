@@ -337,8 +337,11 @@ class JobStore:
             self._conn.execute(_CREATE_EVALUATIONS)
             self._add_missing_columns("evaluations", _MARKET_EVALUATION_COLUMNS)
             self._add_missing_columns("evaluations", _CONTENT_TRUST_EVALUATION_COLUMNS)
-            self._add_missing_columns("evaluations", _RAW_SCORE_EVALUATION_COLUMNS)
-            self._backfill_raw_model_score()
+            added_raw_score_columns = self._add_missing_columns(
+                "evaluations", _RAW_SCORE_EVALUATION_COLUMNS
+            )
+            if "raw_model_score" in added_raw_score_columns:
+                self._backfill_raw_model_score()
             self._conn.execute(_CREATE_MATERIALS)
             self._conn.execute(_CREATE_DELIVERIES)
             self._conn.execute(_CREATE_GEMINI_USAGE)
@@ -364,20 +367,26 @@ class JobStore:
         `_add_missing_columns` can only ALTER TABLE ... ADD COLUMN with a fixed
         default, so rows written before `raw_model_score` existed would read
         back as 0. Before the cap was introduced no score was ever adjusted, so
-        their raw score equalled their total. Idempotent and cheap: a genuine
-        all-zero evaluation has total_score = 0, making the update a no-op.
+        their raw score equalled their total. Callers only run this once, right
+        after `raw_model_score` is actually added to the schema (see
+        `_init_db`), so it is a one-time migration rather than a repeated
+        full-table scan. A genuine all-zero evaluation has total_score = 0,
+        making the update a no-op for that row.
         """
         self._conn.execute(
             "UPDATE evaluations SET raw_model_score = total_score WHERE raw_model_score = 0"
         )
 
-    def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
+    def _add_missing_columns(self, table: str, columns: dict[str, str]) -> list[str]:
         existing = {
             row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")
         }
+        added = []
         for name, definition in columns.items():
             if name not in existing:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
+                added.append(name)
+        return added
 
     # ------------------------------------------------------------------
     # Gemini persistence

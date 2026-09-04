@@ -529,6 +529,52 @@ def test_pipeline_promotes_package_match_only_after_evaluation_is_persisted(
     assert "PRIVATE_GMAIL_BODY" not in caplog.text
 
 
+def test_pipeline_logs_when_match_score_is_capped(settings, caplog):
+    job = _job()
+    store = JobStore(settings.db_path)
+    gemini = FakeGemini(
+        evaluation_payload={
+            "scores": {
+                "role_seniority": 25,
+                "technical": 20,
+                "product_architecture": 15,
+                "career_direction": 7,
+                "location_language": 8,
+                "company_environment": 5,
+            },
+            "total_score": 80,
+            "hard_blockers": [],
+            "strengths": ["React expertise"],
+            "gaps": [],
+            "salary_note": "Not disclosed",
+            "location_note": "Remote EU friendly",
+            "decision": "package_match",
+            "rationale": "Strong fit but missing a must-have",
+            "requirements": {
+                "must_have": [
+                    {
+                        "requirement": "5+ years distributed systems",
+                        "depth": "deep_expert",
+                        "candidate_support": "unsupported",
+                    }
+                ],
+                "preferred": [],
+            },
+        }
+    )
+
+    with caplog.at_level(logging.INFO):
+        run_pipeline(
+            settings,
+            sources=[FakeSource([job])],
+            store=store,
+            gemini=gemini,
+            telegram=FakeTelegram(),
+        )
+
+    assert "capped match score job_id=1 raw=80 effective=64 decision=skip" in caplog.text
+
+
 def test_pipeline_aggregates_untrusted_gmail_source_labels_in_logs(settings, caplog):
     settings.dry_run = True
     store = JobStore(settings.db_path)
@@ -2007,7 +2053,7 @@ def test_run_pipeline_forwards_store_to_build_sources_when_sources_not_given(
     assert captured["store"] is store
 
 
-def test_capped_job_is_excluded_from_digest_and_navigation():
+def test_capped_job_is_excluded_from_delivery():
     capped = DigestItem(
         job_id=1,
         company="Forecast GmbH",
