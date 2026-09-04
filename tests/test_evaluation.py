@@ -4,7 +4,7 @@ import pytest
 
 from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS, PARTIAL_UNKNOWN
 from job_hunter.evaluation import EvaluationError, evaluate_job
-from job_hunter.models import CandidateContext, CandidatePreferences, Job, SearchPolicy
+from job_hunter.models import CandidateContext, CandidatePreferences, Evaluation, Job, SearchPolicy
 from tests.market_fixtures import make_market_policy
 
 # A sentinel that would only appear in the prompt if some future change
@@ -481,3 +481,20 @@ def test_prompt_instructs_requirement_extraction(fake_gemini, job, policy, conte
     evaluate_job(job, context, policy, fake_gemini)
     prompt = fake_gemini.prompts[0][0]
     assert "must-have" in prompt.lower() or "must_have" in prompt
+
+
+def test_evaluation_defaults_raw_model_score_to_zero():
+    evaluation = Evaluation(
+        job_id=1,
+        total_score=70,
+        scores={},
+        decision="possible_match",
+        hard_blockers=[],
+        strengths=[],
+        gaps=[],
+        salary_note="",
+        location_note="",
+        rationale="",
+        model="m",
+    )
+    assert evaluation.raw_model_score == 0
