@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS, PARTIAL_UNKNOWN
 from job_hunter.evaluation import EvaluationError, evaluate_job
 from job_hunter.models import CandidateContext, CandidatePreferences, Job, SearchPolicy
 from tests.market_fixtures import make_market_policy
@@ -55,7 +56,12 @@ def policy():
 
 @pytest.fixture
 def job():
-    return Job(source="ashby", title="Senior Product Engineer", description="React TypeScript remote")
+    return Job(
+        source="ashby",
+        title="Senior Product Engineer",
+        description="React TypeScript remote",
+        content_confidence="official_ats",
+    )
 
 
 @pytest.fixture
@@ -101,6 +107,14 @@ def _valid_payload(**overrides):
         "location_note": "Remote EU friendly",
         "decision": "high_priority",
         "rationale": "Strong fit",
+        "requirements": {
+            "must_have": [
+                {"requirement": "React", "depth": "experience", "candidate_support": "supported"}
+            ],
+            "preferred": [
+                {"requirement": "GraphQL", "depth": "familiarity", "candidate_support": "unknown"}
+            ],
+        },
     }
     payload.update(overrides)
     return payload
@@ -362,3 +376,108 @@ def test_evaluate_job_market_id_defaults_to_empty_string(fake_gemini, job, polic
     evaluation = evaluate_job(job, context, policy, fake_gemini)
 
     assert evaluation.market_id == ""
+
+
+# --- Requirement-aware gating (Task 7) --------------------------------------
+
+
+def test_missing_requirements_field_is_rejected(fake_gemini, job, policy, context):
+    payload = _valid_payload()
+    del payload["requirements"]
+    fake_gemini.text = json.dumps(payload)
+    with pytest.raises(EvaluationError, match="requirements"):
+        evaluate_job(job, context, policy, fake_gemini)
+
+
+def test_invalid_requirement_depth_is_rejected(fake_gemini, job, policy, context):
+    payload = _valid_payload()
+    payload["requirements"]["must_have"][0]["depth"] = "nonsense"
+    fake_gemini.text = json.dumps(payload)
+    with pytest.raises(EvaluationError, match="depth"):
+        evaluate_job(job, context, policy, fake_gemini)
+
+
+def test_major_unsupported_must_have_caps_below_high_priority(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89)
+    payload["requirements"]["must_have"] = [
+        {"requirement": "Deep PostgreSQL expertise", "depth": "deep_expert", "candidate_support": "unsupported"}
+    ]
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.total_score == 89
+    assert evaluation.decision not in ("high_priority", "package_match")
+    assert evaluation.decision == "possible_match"
+
+
+def test_familiarity_depth_unsupported_must_have_does_not_gate(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89)
+    payload["requirements"]["must_have"] = [
+        {"requirement": "Basic SQL familiarity", "depth": "familiarity", "candidate_support": "unsupported"}
+    ]
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.decision == "high_priority"
+
+
+def test_unsupported_preferred_requirement_does_not_gate(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89)
+    payload["requirements"]["preferred"] = [
+        {"requirement": "PostgreSQL", "depth": "deep_expert", "candidate_support": "unsupported"}
+    ]
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.decision == "high_priority"
+
+
+def test_insufficient_content_confidence_caps_below_high_priority(fake_gemini, job, policy, context):
+    job.content_confidence = PARTIAL_UNKNOWN
+    payload = _valid_payload(total_score=89)
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.decision == "possible_match"
+
+
+def test_insufficient_content_still_allows_possible_match_and_skip(fake_gemini, job, policy, context):
+    job.content_confidence = PARTIAL_UNKNOWN
+    payload = _valid_payload(
+        scores={
+            "role_seniority": 15,
+            "technical": 13,
+            "product_architecture": 10,
+            "career_direction": 5,
+            "location_language": 5,
+            "company_environment": 2,
+        },
+        total_score=50,
+    )
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.decision == "skip"  # below possible threshold on its own merits
+
+
+def test_hard_blockers_still_force_blocked_regardless_of_requirements(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89, hard_blockers=["Below salary floor"])
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.decision == "blocked"
+
+
+def test_evaluation_persists_content_confidence_and_requirements(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.content_confidence == "official_ats"
+    assert evaluation.requirements["must_have"][0]["requirement"] == "React"
+
+
+def test_prompt_includes_content_confidence_tier(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt = fake_gemini.prompts[0][0]
+    assert "official_ats" in prompt
+
+
+def test_prompt_instructs_requirement_extraction(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluate_job(job, context, policy, fake_gemini)
+    prompt = fake_gemini.prompts[0][0]
+    assert "must-have" in prompt.lower() or "must_have" in prompt
