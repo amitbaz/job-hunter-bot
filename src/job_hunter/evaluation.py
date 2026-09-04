@@ -255,7 +255,7 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
     raw = gemini.generate_text(
         _build_evaluation_prompt(job, context, policy, market),
         purpose="job_evaluation",
-        thinking_level="low",
+        thinking_level="medium",
         max_output_tokens=1200,
         json_mode=True,
         max_attempts=_EVALUATION_MAX_ATTEMPTS,
