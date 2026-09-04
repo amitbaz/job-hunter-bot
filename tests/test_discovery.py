@@ -4,7 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from job_hunter.canonical import CanonicalResolver
-from job_hunter.discovery import collect_candidates
+from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS, PARTIAL_UNKNOWN
+from job_hunter.discovery import _dedupe, _merge_fields, collect_candidates
 from job_hunter.models import (
     AtsReference,
     CandidatePreferences,
@@ -224,6 +225,98 @@ def test_collect_candidates_counts_jobs_by_bounded_source_label(store, policy):
     assert result.stats.rejected_by_source == {"devjobs": 2}
 
 
+def test_raw_jobs_get_content_confidence_from_source(store, policy):
+    job = Job(
+        source="ashby",
+        source_job_id="1",
+        title="Senior Product Engineer",
+        company="Acme",
+        url="https://jobs.ashbyhq.com/acme/1",
+        description="React TypeScript",
+        remote=True,
+    )
+
+    result = collect_candidates([FakeSource([job])], store, NoOpHttp(), policy)
+
+    assert len(result.eligible) == 1
+    assert result.eligible[0][1].content_confidence == OFFICIAL_ATS
+
+
+def test_dedupe_prefers_higher_confidence_description_over_longer_weaker_one():
+    weak = Job(
+        source="hackernews",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-1",
+        description="a" * 500,  # long but low-trust
+        content_confidence=AGGREGATOR_TEXT,
+    )
+    strong = Job(
+        source="ashby",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-1",
+        description="short but authoritative JD",
+        content_confidence=OFFICIAL_ATS,
+    )
+    merged, _ = _dedupe([weak, strong])
+    assert len(merged) == 1
+    assert merged[0].description == "short but authoritative JD"
+    assert merged[0].content_confidence == OFFICIAL_ATS
+
+
+def test_dedupe_still_fills_empty_description_from_weaker_source():
+    empty = Job(
+        source="targeted_search",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-2",
+        description="",
+        content_confidence=PARTIAL_UNKNOWN,
+    )
+    weak = Job(
+        source="hackernews",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-2",
+        description="a comment about the role",
+        content_confidence=AGGREGATOR_TEXT,
+    )
+    merged, _ = _dedupe([empty, weak])
+    assert merged[0].description == "a comment about the role"
+    assert merged[0].content_confidence == AGGREGATOR_TEXT
+
+
+def test_merge_fields_does_not_overwrite_real_description_with_empty_one():
+    # richer has real description text but an unset content_confidence tier,
+    # which ranks worse than any real tier including the weaker job's.
+    richer = Job(
+        source="ashby",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-3",
+        description="authoritative JD text",
+        content_confidence="",
+    )
+    weaker = Job(
+        source="hackernews",
+        title="Senior Engineer",
+        company="Acme",
+        location="Remote",
+        url="https://example.com/acme-3",
+        description="",
+        content_confidence=PARTIAL_UNKNOWN,
+    )
+    merged = _merge_fields(richer, weaker)
+    assert merged.description == "authoritative JD text"
+    assert merged.content_confidence == ""
+
+
 def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, policy):
     job = Job(
         source="ashby",
@@ -232,6 +325,7 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
         company="Acme",
         description="React TypeScript remote role",
         remote=True,
+        content_confidence=OFFICIAL_ATS,
     )
     job_id, _is_new, _changed = store.upsert_job(job)
     store.save_evaluation(
@@ -249,6 +343,7 @@ def test_collect_candidates_excludes_already_evaluated_unchanged_job(store, poli
             rationale="",
             model="gemini-test",
             status="ok",
+            content_confidence=OFFICIAL_ATS,
         ),
     )
 
@@ -368,6 +463,7 @@ def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, po
         url=legacy_url,
         description="React TypeScript",
         remote=True,
+        content_confidence=AGGREGATOR_TEXT,
     )
     legacy_id, _, _ = store.upsert_job(legacy)
     store.save_evaluation(
@@ -385,6 +481,7 @@ def test_collect_candidates_late_canonicalization_keeps_history_job_id(store, po
             rationale="",
             model="gemini-test",
             status="ok",
+            content_confidence=AGGREGATOR_TEXT,
         ),
     )
     canonical_id, _, _ = store.upsert_job(
@@ -456,6 +553,111 @@ def test_collect_candidates_counts_unresolved_canonical_urls(store, policy):
     assert result.stats.canonical_resolved == 0
     assert result.stats.canonical_unresolved == 1
     assert result.eligible[0][1].url == "https://yc.test/unresolved"
+
+
+def test_canonical_resolution_upgrades_description_when_ats_found(
+    store, policy, monkeypatch
+):
+    job = Job(
+        source="hackernews",
+        title="Senior Product Engineer",
+        company="Acme",
+        location="Berlin",
+        url="https://news.ycombinator.com/item?id=1",
+        description="original weak text React TypeScript",
+        remote=True,
+    )
+    resolution = CanonicalResolution(
+        url="https://jobs.ashbyhq.com/acme/abc",
+        ats=AtsReference(provider="ashby", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="test",
+    )
+    monkeypatch.setattr(
+        "job_hunter.discovery.fetch_authoritative_description",
+        lambda ats, url, http: "The real authoritative JD",
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert result.eligible[0][1].description == "The real authoritative JD"
+    assert result.eligible[0][1].content_confidence == OFFICIAL_ATS
+
+
+def test_canonical_resolution_skips_description_fetch_when_already_official_ats(
+    store, policy, monkeypatch
+):
+    job = Job(
+        source="ashby",
+        title="Senior Product Engineer",
+        company="Acme",
+        location="Berlin",
+        url="https://jobs.ashbyhq.com/acme/abc",
+        description="already authoritative React TypeScript",
+        remote=True,
+    )
+    resolution = CanonicalResolution(
+        url="https://jobs.ashbyhq.com/acme/abc",
+        ats=AtsReference(provider="ashby", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="direct",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "job_hunter.discovery.fetch_authoritative_description",
+        lambda ats, url, http: calls.append(1) or "should not be used",
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert calls == []
+    assert result.eligible[0][1].description == "already authoritative React TypeScript"
+
+
+def test_canonical_resolution_keeps_existing_description_when_fetch_fails(
+    store, policy, monkeypatch
+):
+    job = Job(
+        source="hackernews",
+        title="Senior Product Engineer",
+        company="Acme",
+        location="Berlin",
+        url="https://news.ycombinator.com/item?id=1",
+        description="original weak text React TypeScript",
+        remote=True,
+    )
+    resolution = CanonicalResolution(
+        url="https://jobs.ashbyhq.com/acme/abc",
+        ats=AtsReference(provider="ashby", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="test",
+    )
+    monkeypatch.setattr(
+        "job_hunter.discovery.fetch_authoritative_description",
+        lambda ats, url, http: None,
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert result.eligible[0][1].description == "original weak text React TypeScript"
 
 
 def test_resolver_exception_preserves_candidate_and_continues_collection(store, policy):

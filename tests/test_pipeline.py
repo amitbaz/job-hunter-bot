@@ -94,6 +94,12 @@ class FakeGemini:
                 "location_note": "Remote EU friendly",
                 "decision": "high_priority",
                 "rationale": "Strong fit",
+                "requirements": {
+                    "must_have": [
+                        {"requirement": "React", "depth": "experience", "candidate_support": "supported"}
+                    ],
+                    "preferred": [],
+                },
             }
             return json.dumps(payload)
         self.cover_letter_calls += 1
@@ -246,6 +252,7 @@ def _job(**overrides):
         location="Remote",
         remote=True,
         description="React TypeScript remote role",
+        content_confidence="official_ats",
     )
     defaults.update(overrides)
     return Job(**defaults)
@@ -321,6 +328,12 @@ def _evaluation_payload(scores, decision):
         "location_note": "Remote EU friendly",
         "decision": decision,
         "rationale": "Strong fit",
+        "requirements": {
+            "must_have": [
+                {"requirement": "React", "depth": "experience", "candidate_support": "supported"}
+            ],
+            "preferred": [],
+        },
     }
 
 
@@ -541,7 +554,11 @@ def test_pipeline_aggregates_untrusted_gmail_source_labels_in_logs(settings, cap
             telegram=FakeTelegram(),
         )
 
-    assert summary.ready_to_apply == 1
+    # The staged job's real description is never fetched in this test's
+    # no-network environment, so its content_confidence stays partial_unknown
+    # and the deterministic gating caps it at possible_match rather than
+    # ready_to_apply (Task 7).
+    assert summary.possible_matches == 1
     assert "gmail=1" in caplog.text
     assert platform not in caplog.text
     assert "PRIVATE_PLATFORM_SECRET" not in caplog.text
@@ -1137,7 +1154,11 @@ def test_pipeline_evaluates_staged_gmail_job_through_normal_discovery(settings):
         telegram=telegram,
     )
 
-    assert summary.ready_to_apply == 1
+    # The staged job's real description is never fetched in this test's
+    # no-network environment, so its content_confidence stays partial_unknown
+    # and the deterministic gating caps it at possible_match rather than
+    # ready_to_apply (Task 7).
+    assert summary.possible_matches == 1
     assert gemini.eval_calls == 1
     assert store.count_jobs() == 1
     job = store.get_job(1)

@@ -5,6 +5,7 @@ from threading import Barrier, BrokenBarrierError
 
 import pytest
 
+from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import Evaluation, Job, Material
 from job_hunter.store import JobStore
@@ -745,6 +746,24 @@ def test_needs_evaluation_true_after_description_changes_post_evaluation(tmp_pat
     job.description = "React and TypeScript"
     store.upsert_job(job)
     assert store.needs_evaluation(job_id) is True
+
+
+def test_needs_evaluation_true_after_content_confidence_changes_post_evaluation(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(
+        source="x", source_job_id="1", title="Senior Product Engineer",
+        description="React", content_confidence=AGGREGATOR_TEXT,
+    )
+    job_id, _, _ = store.upsert_job(job)
+    store.save_evaluation(job_id, _evaluation(job_id, content_confidence=AGGREGATOR_TEXT))
+    assert store.needs_evaluation(job_id) is False
+
+    # Description text stays byte-identical, but the job's tier upgrades
+    # (e.g. duplicate postings merge and the surviving row's tier improves).
+    job.content_confidence = OFFICIAL_ATS
+    same_id, _is_new, description_changed = store.upsert_job(job)
+    assert description_changed is False
+    assert store.needs_evaluation(same_id) is True
 
 
 def test_count_and_delivery(tmp_path):
@@ -1787,3 +1806,92 @@ def test_logical_upsert_reports_description_change_caused_by_merge(tmp_path):
         "SELECT description FROM jobs WHERE id = ?", (survivor_id,)
     ).fetchone()
     assert merged["description"] == duplicate_description
+
+
+def test_upsert_logical_job_persists_content_confidence(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job = Job(source="ashby", title="Eng", description="full JD", content_confidence=OFFICIAL_ATS)
+
+    job_id, _, _ = store.upsert_logical_job(job)
+
+    stored = store.get_job(job_id)
+    assert stored.content_confidence == OFFICIAL_ATS
+
+
+def test_upsert_logical_job_upgrades_description_by_confidence_not_length(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    weak = Job(
+        source="hackernews", title="Eng", company="Acme", location="Remote",
+        canonical_url="https://jobs.example.com/acme/1",
+        description="a" * 300, content_confidence=AGGREGATOR_TEXT,
+    )
+    job_id, _, _ = store.upsert_logical_job(weak)
+
+    strong = Job(
+        source="ashby", title="Eng", company="Acme", location="Remote",
+        canonical_url="https://jobs.example.com/acme/1",
+        description="short authoritative JD", content_confidence=OFFICIAL_ATS,
+    )
+    same_id, _, changed = store.upsert_logical_job(strong)
+
+    assert same_id == job_id
+    assert changed is True
+    stored = store.get_job(job_id)
+    assert stored.description == "short authoritative JD"
+    assert stored.content_confidence == OFFICIAL_ATS
+
+
+def test_upsert_logical_job_keeps_stronger_description_against_weaker_update(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    strong = Job(
+        source="ashby", title="Eng", company="Acme", location="Remote",
+        canonical_url="https://jobs.example.com/acme/2",
+        description="authoritative JD text", content_confidence=OFFICIAL_ATS,
+    )
+    job_id, _, _ = store.upsert_logical_job(strong)
+
+    weak = Job(
+        source="hackernews", title="Eng", company="Acme", location="Remote",
+        canonical_url="https://jobs.example.com/acme/2",
+        description="a" * 5000, content_confidence=AGGREGATOR_TEXT,
+    )
+    store.upsert_logical_job(weak)
+
+    stored = store.get_job(job_id)
+    assert stored.description == "authoritative JD text"
+    assert stored.content_confidence == OFFICIAL_ATS
+
+
+def test_save_evaluation_persists_content_confidence_and_requirements(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(Job(source="ashby", title="Eng", description="JD", content_confidence=OFFICIAL_ATS))
+    evaluation = Evaluation(
+        job_id=job_id, total_score=80, scores={}, decision="package_match",
+        hard_blockers=[], strengths=[], gaps=[], salary_note="", location_note="",
+        rationale="", model="test", content_confidence=OFFICIAL_ATS,
+        requirements={"must_have": [], "preferred": []},
+    )
+    store.save_evaluation(job_id, evaluation)
+    saved = store.get_evaluation(job_id)
+    assert saved.content_confidence == OFFICIAL_ATS
+    assert saved.requirements == {"must_have": [], "preferred": []}
+
+
+def test_save_evaluation_persists_evaluation_confidence_not_jobs_row(tmp_path):
+    # The jobs row can legitimately hold a different (e.g. stronger) tier than
+    # the in-memory job that evaluate_job's gating logic actually acted on.
+    # The persisted snapshot must reflect what drove the gating decision, not
+    # whatever happens to be in the jobs table at save time.
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(
+        Job(source="ashby", title="Eng", description="JD", content_confidence=OFFICIAL_ATS)
+    )
+    evaluation = Evaluation(
+        job_id=job_id, total_score=60, scores={}, decision="possible_match",
+        hard_blockers=[], strengths=[], gaps=[], salary_note="", location_note="",
+        rationale="", model="test", content_confidence=AGGREGATOR_TEXT,
+        requirements={},
+    )
+    store.save_evaluation(job_id, evaluation)
+    saved = store.get_evaluation(job_id)
+    assert saved.content_confidence == AGGREGATOR_TEXT

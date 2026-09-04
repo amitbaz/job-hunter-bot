@@ -167,3 +167,34 @@ def _titles_match(left: Job, right: Job) -> bool:
 
 def _same_ats_board(left: AtsReference | None, right: AtsReference) -> bool:
     return left is not None and (left.provider, left.board) == (right.provider, right.board)
+
+
+def fetch_authoritative_description(
+    ats: AtsReference, target_url: str, http: "HttpClient"
+) -> str | None:
+    """Fetch the full official description for a resolved ATS posting.
+
+    Non-fatal by design, matching the rest of this module: a fetch failure
+    here should never take down canonical resolution.
+
+    The adapter imports below are deliberately local rather than module-level:
+    job_hunter.sources imports job_hunter.ats_registry, which imports
+    parse_supported_ats_url from this module, so importing job_hunter.sources
+    at module scope here creates a circular import.
+    """
+    from job_hunter.sources import ashby as ashby_source
+    from job_hunter.sources import greenhouse as greenhouse_source
+    from job_hunter.sources import lever as lever_source
+
+    description_fetchers = {
+        "ashby": ashby_source,
+        "lever": lever_source,
+        "greenhouse": greenhouse_source,
+    }
+    adapter = description_fetchers.get(ats.provider)
+    if adapter is None:
+        return None
+    try:
+        return adapter.fetch_description(ats.board, target_url, http)
+    except Exception:
+        return None

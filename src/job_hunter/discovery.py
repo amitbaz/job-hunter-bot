@@ -4,8 +4,13 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from job_hunter import content_confidence
 from job_hunter.ats_registry import harvest_ats_board
-from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
+from job_hunter.canonical import (
+    CanonicalResolver,
+    fetch_authoritative_description,
+    parse_supported_ats_url,
+)
 from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import job_fallback_identity
@@ -88,10 +93,13 @@ def _is_ats_url(job: Job) -> bool:
     return any(host in url for host in _ATS_HOSTS)
 
 
-def _richness_key(job: Job) -> tuple[bool, bool, bool, bool, bool]:
+def _richness_key(job: Job) -> tuple[bool, int, bool, bool, bool]:
+    tier_score = len(content_confidence.TIERS) - 1 - content_confidence.tier_rank(
+        job.content_confidence
+    )
     return (
         _is_ats_url(job),
-        bool(job.description),
+        tier_score,
         bool(job.company),
         bool(job.location),
         job.remote is not None,
@@ -105,8 +113,11 @@ def _merge_fields(richer: Job, weaker: Job) -> Job:
         richer.company = weaker.company
     if not richer.location and weaker.location:
         richer.location = weaker.location
-    if not richer.description and weaker.description:
+    if weaker.description and content_confidence.tier_rank(
+        weaker.content_confidence
+    ) < content_confidence.tier_rank(richer.content_confidence):
         richer.description = weaker.description
+        richer.content_confidence = weaker.content_confidence
     if richer.remote is None and weaker.remote is not None:
         richer.remote = weaker.remote
     if not richer.url and weaker.url:
@@ -288,6 +299,9 @@ def collect_candidates(
             stats.per_source[job.source] = stats.per_source.get(job.source, 0) + 1
             if job.url:
                 job.original_url = job.original_url or job.url
+            job.content_confidence = content_confidence.infer_content_confidence(
+                job.source, job.description
+            )
             raw_market_id = _cheap_market_attribution(job, policy)
             _bump(stats.raw_by_market, raw_market_id or _UNATTRIBUTED)
             raw_jobs.append(job)
@@ -418,6 +432,13 @@ def collect_candidates(
                         job.ats_job_id = resolution.ats.job_id
                         if _harvest_ats_board_safely(store, job):
                             stats.ats_boards_discovered += 1
+                        if job.content_confidence != content_confidence.OFFICIAL_ATS:
+                            authoritative = fetch_authoritative_description(
+                                resolution.ats, resolution.url, http
+                            )
+                            if authoritative:
+                                job.description = authoritative
+                                job.content_confidence = content_confidence.OFFICIAL_ATS
                     # Canonical resolution can surface stronger, directly
                     # observed location evidence than the query-time hint that
                     # seeded the earlier attribution above, so re-run it

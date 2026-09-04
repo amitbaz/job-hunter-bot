@@ -1,4 +1,42 @@
-from job_hunter.fetching import extract_job_from_html, extract_job_page_links
+from job_hunter.content_confidence import CANONICAL_EMPLOYER_PAGE, SOURCE_DETAIL_PAGE
+from job_hunter.fetching import enrich_job, extract_job_from_html, extract_job_page_links
+from job_hunter.models import Job
+
+
+class FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+class FakeHttp:
+    def __init__(self, html):
+        self._html = html
+
+    def get(self, url, **kwargs):
+        return FakeResponse(self._html)
+
+
+_JOB_POSTING_HTML = """
+<html><head>
+<script type="application/ld+json">
+{
+  "@type": "JobPosting",
+  "title": "Senior Product Engineer",
+  "hiringOrganization": {"name": "Acme"},
+  "jobLocationType": "TELECOMMUTE",
+  "description": "<p>Loves React and TypeScript</p>"
+}
+</script>
+</head><body></body></html>
+"""
+
+_PLAIN_BODY_HTML = """
+<html><head><title>Senior Engineer at Acme</title></head>
+<body><p>Some job description here with React</p></body></html>
+"""
 
 
 def test_extracts_jobposting_json_ld():
@@ -51,3 +89,36 @@ def test_extract_job_page_links_uses_nested_jobposting_url():
         "https://example.test/jobs/1",
         "https://boards.greenhouse.io/acme/jobs/789",
     ]
+
+
+def test_enrich_job_sets_canonical_employer_page_tier_from_json_ld():
+    job = Job(source="duckduckgo", title="", url="https://example.com/jobs/1")
+    http = FakeHttp(_JOB_POSTING_HTML)
+
+    enrich_job(job, http)
+
+    assert job.content_confidence == CANONICAL_EMPLOYER_PAGE
+
+
+def test_enrich_job_sets_source_detail_page_tier_from_body_fallback():
+    job = Job(source="duckduckgo", title="", url="https://example.com/jobs/1")
+    http = FakeHttp(_PLAIN_BODY_HTML)
+
+    enrich_job(job, http)
+
+    assert job.content_confidence == SOURCE_DETAIL_PAGE
+
+
+def test_enrich_job_does_not_touch_confidence_when_description_already_present():
+    job = Job(
+        source="hackernews",
+        title="x",
+        description="already have text",
+        content_confidence="aggregator_text",
+        url="https://example.com/x",
+    )
+    http = FakeHttp(_JOB_POSTING_HTML)
+
+    enrich_job(job, http)
+
+    assert job.content_confidence == "aggregator_text"

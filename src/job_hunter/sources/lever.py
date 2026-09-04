@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from job_hunter.models import Job
+from job_hunter.normalize import canonicalize_url
 
 from .base import is_stale_board_error, logger, strip_html
 
@@ -52,3 +53,13 @@ class LeverSource:
                 )
             )
         return jobs
+
+
+def fetch_description(site: str, target_url: str, http) -> str | None:
+    data = http.get_json(_URL_TEMPLATE.format(site=site))
+    target = canonicalize_url(target_url)
+    for item in data:
+        if canonicalize_url(item.get("hostedUrl", "")) == target:
+            description = item.get("descriptionPlain") or item.get("description", "")
+            return strip_html(description) or None
+    return None

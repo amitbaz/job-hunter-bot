@@ -94,6 +94,7 @@ class Job:
     market_hint: str | None = None
     market_id: str | None = None
     source_page_html: str = ""
+    content_confidence: str = ""
 
 
 @dataclass(slots=True)
@@ -152,6 +153,8 @@ class Evaluation:
     model: str
     status: str = "ok"
     market_id: str = ""
+    content_confidence: str = ""
+    requirements: dict = field(default_factory=dict)
 
 
 @dataclass(slots=True)

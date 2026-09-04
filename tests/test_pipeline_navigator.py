@@ -64,6 +64,12 @@ class FakeGemini:
                     "location_note": "",
                     "decision": "possible_match",
                     "rationale": "Good fit",
+                    "requirements": {
+                        "must_have": [
+                            {"requirement": "React", "depth": "experience", "candidate_support": "supported"}
+                        ],
+                        "preferred": [],
+                    },
                 }
             )
         raise AssertionError("cover letter should not be generated for possible_match")
@@ -135,6 +141,7 @@ def _job(source_job_id, company, location):
         url=f"https://example.test/{source_job_id}",
         remote=True,
         description="React TypeScript product engineering role",
+        content_confidence="official_ats",
     )
 
 

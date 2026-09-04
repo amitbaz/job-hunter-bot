@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from job_hunter.models import Job
+from job_hunter.normalize import canonicalize_url
 
 from .base import is_stale_board_error, logger, strip_html
 
@@ -42,3 +43,12 @@ class GreenhouseSource:
                 )
             )
         return jobs
+
+
+def fetch_description(token: str, target_url: str, http) -> str | None:
+    data = http.get_json(_URL_TEMPLATE.format(token=token))
+    target = canonicalize_url(target_url)
+    for item in data.get("jobs", []):
+        if canonicalize_url(item.get("absolute_url", "")) == target:
+            return strip_html(item.get("content", "")) or None
+    return None
