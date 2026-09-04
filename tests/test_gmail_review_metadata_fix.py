@@ -99,6 +99,6 @@ def test_review_without_company_or_role_falls_back_to_subject():
         "Gmail activity I couldn't link\n\n"
         "Interview invitation from Acme\n"
         "This looks job-related, but I couldn't classify or link it confidently.\n"
-        "Open email: https://mail.google.com/mail/#all/m1"
+        "Open email: https://mail.google.com/mail/u/0/#all/t1"
     )
     assert "semantic classification requires review" not in digest
