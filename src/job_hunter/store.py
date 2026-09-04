@@ -5,6 +5,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from job_hunter import content_confidence
 from job_hunter.gmail_models import (
     AUTO_CONFIDENCE_THRESHOLD,
     LEGACY_SEMANTIC_FAILURE_RATIONALE,
@@ -54,6 +55,10 @@ _R2_JOB_COLUMNS = {
     "ats_board": "TEXT",
     "ats_job_id": "TEXT",
     "market_id": "TEXT NOT NULL DEFAULT ''",
+}
+
+_R3_JOB_COLUMNS = {
+    "content_confidence": "TEXT NOT NULL DEFAULT ''",
 }
 
 _CREATE_JOB_SOURCES = """
@@ -113,6 +118,11 @@ CREATE TABLE IF NOT EXISTS evaluations (
 """
 
 _MARKET_EVALUATION_COLUMNS = {"market_id": "TEXT NOT NULL DEFAULT ''"}
+
+_CONTENT_TRUST_EVALUATION_COLUMNS = {
+    "content_confidence_at_eval": "TEXT NOT NULL DEFAULT ''",
+    "requirements_json": "TEXT NOT NULL DEFAULT '{}'",
+}
 
 _CREATE_MATERIALS = """
 CREATE TABLE IF NOT EXISTS materials (
@@ -319,10 +329,12 @@ class JobStore:
             self._conn.execute("PRAGMA foreign_keys = ON")
             self._conn.execute(_CREATE_JOBS)
             self._migrate_jobs_to_r2_schema()
+            self._migrate_jobs_to_r3_schema()
             self._conn.execute(_CREATE_JOB_SOURCES)
             self._conn.execute(_CREATE_COMPANY_WATCH)
             self._conn.execute(_CREATE_EVALUATIONS)
             self._add_missing_columns("evaluations", _MARKET_EVALUATION_COLUMNS)
+            self._add_missing_columns("evaluations", _CONTENT_TRUST_EVALUATION_COLUMNS)
             self._conn.execute(_CREATE_MATERIALS)
             self._conn.execute(_CREATE_DELIVERIES)
             self._conn.execute(_CREATE_GEMINI_USAGE)
@@ -338,6 +350,9 @@ class JobStore:
 
     def _migrate_jobs_to_r2_schema(self) -> None:
         self._add_missing_columns("jobs", _R2_JOB_COLUMNS)
+
+    def _migrate_jobs_to_r3_schema(self) -> None:
+        self._add_missing_columns("jobs", _R3_JOB_COLUMNS)
 
     def _add_missing_columns(self, table: str, columns: dict[str, str]) -> None:
         existing = {
@@ -559,8 +574,8 @@ class JobStore:
                     (fingerprint, source, source_job_id, url, company, title,
                      location, remote, description, description_hash,
                      canonical_url, ats_provider, ats_board, ats_job_id,
-                     first_seen_at, last_seen_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+                     content_confidence, first_seen_at, last_seen_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
                 """,
                 (
                     fingerprint,
@@ -577,6 +592,7 @@ class JobStore:
                     job.ats_provider,
                     job.ats_board,
                     job.ats_job_id,
+                    job.content_confidence or "",
                     now,
                     now,
                 ),
@@ -607,6 +623,7 @@ class JobStore:
                         ats_provider     = COALESCE(?, ats_provider),
                         ats_board        = COALESCE(?, ats_board),
                         ats_job_id       = COALESCE(?, ats_job_id),
+                        content_confidence = ?,
                         last_seen_at     = ?
                     WHERE id = ?
                     """,
@@ -622,6 +639,7 @@ class JobStore:
                         job.ats_provider,
                         job.ats_board,
                         job.ats_job_id,
+                        job.content_confidence or "",
                         now,
                         job_id,
                     ),
@@ -713,8 +731,8 @@ class JobStore:
                 (fingerprint, source, source_job_id, url, company, title,
                  location, remote, description, description_hash,
                  canonical_url, ats_provider, ats_board, ats_job_id,
-                 first_seen_at, last_seen_at, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+                 content_confidence, first_seen_at, last_seen_at, status)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
             """,
             (
                 fingerprint,
@@ -731,6 +749,7 @@ class JobStore:
                 job.ats_provider,
                 job.ats_board,
                 job.ats_job_id,
+                job.content_confidence or "",
                 now,
                 now,
             ),
@@ -742,7 +761,9 @@ class JobStore:
         if row is None:
             raise ValueError(f"job does not exist: {job_id}")
 
-        description = self._richer_text(row["description"], job.description)
+        description, description_confidence = self._better_description(
+            row["description"], row["content_confidence"], job.description, job.content_confidence
+        )
         description_changed = description_hash(description) != row["description_hash"]
         canonical_url = canonicalize_url(job.canonical_url) if job.canonical_url else ""
         persisted_url = job.canonical_url or row["url"] or job.url or ""
@@ -765,6 +786,7 @@ class JobStore:
                 ats_provider = ?,
                 ats_board = ?,
                 ats_job_id = ?,
+                content_confidence = ?,
                 last_seen_at = ?
             WHERE id = ?
             """,
@@ -780,6 +802,7 @@ class JobStore:
                 job.ats_provider or row["ats_provider"],
                 job.ats_board or row["ats_board"],
                 job.ats_job_id or row["ats_job_id"],
+                description_confidence,
                 _now_iso(),
                 job_id,
             ),
@@ -825,8 +848,9 @@ class JobStore:
         )
         if canonical_url and (survivor_has_ats or duplicate_has_ats):
             url = canonical_url
-        description = self._richer_text(
-            survivor["description"], duplicate["description"]
+        description, description_confidence = self._better_description(
+            survivor["description"], survivor["content_confidence"],
+            duplicate["description"], duplicate["content_confidence"],
         )
 
         self._conn.execute(
@@ -845,6 +869,7 @@ class JobStore:
                 ats_provider = ?,
                 ats_board = ?,
                 ats_job_id = ?,
+                content_confidence = ?,
                 first_seen_at = ?,
                 last_seen_at = ?
             WHERE id = ?
@@ -871,6 +896,7 @@ class JobStore:
                 duplicate["ats_job_id"]
                 if prefer_duplicate_identity
                 else survivor["ats_job_id"] or duplicate["ats_job_id"],
+                description_confidence,
                 min(survivor["first_seen_at"], duplicate["first_seen_at"]),
                 max(survivor["last_seen_at"], duplicate["last_seen_at"]),
                 survivor_id,
@@ -950,10 +976,22 @@ class JobStore:
         return bool(row["ats_provider"] and row["ats_board"] and row["ats_job_id"])
 
     @staticmethod
-    def _richer_text(current: str, candidate: str) -> str:
-        if candidate and len(candidate.strip()) > len((current or "").strip()):
-            return candidate
-        return current or candidate or ""
+    def _better_description(
+        current: str, current_confidence: str, candidate: str, candidate_confidence: str
+    ) -> tuple[str, str]:
+        if not candidate:
+            return current, current_confidence
+        if not current:
+            return candidate, candidate_confidence
+        current_rank = content_confidence.tier_rank(current_confidence)
+        candidate_rank = content_confidence.tier_rank(candidate_confidence)
+        if candidate_rank < current_rank:
+            return candidate, candidate_confidence
+        if candidate_rank > current_rank:
+            return current, current_confidence
+        if len(candidate.strip()) > len(current.strip()):
+            return candidate, candidate_confidence
+        return current, current_confidence
 
     def record_job_source(
         self,
@@ -1835,17 +1873,19 @@ class JobStore:
         with self._conn:
             self._conn.execute("PRAGMA foreign_keys = ON")
             row = self._conn.execute(
-                "SELECT description_hash FROM jobs WHERE id = ?", (job_id,)
+                "SELECT description_hash, content_confidence FROM jobs WHERE id = ?", (job_id,)
             ).fetchone()
             description_hash = row["description_hash"] if row else ""
+            content_confidence_value = row["content_confidence"] if row else ""
             self._conn.execute(
                 """
                 INSERT INTO evaluations
                     (job_id, total_score, scores_json, decision,
                      hard_blockers_json, strengths_json, gaps_json,
                      salary_note, location_note, rationale, model, status,
-                     market_id, description_hash_at_eval, evaluated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     market_id, description_hash_at_eval, content_confidence_at_eval,
+                     requirements_json, evaluated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -1862,6 +1902,8 @@ class JobStore:
                     evaluation.status,
                     evaluation.market_id,
                     description_hash,
+                    content_confidence_value,
+                    json.dumps(evaluation.requirements),
                     _now_iso(),
                 ),
             )
@@ -1940,7 +1982,7 @@ class JobStore:
         row = self._conn.execute(
             """
             SELECT source, title, company, location, url, description,
-                   source_job_id, remote, market_id
+                   source_job_id, remote, market_id, content_confidence
             FROM jobs WHERE id = ?
             """,
             (job_id,),
@@ -1957,6 +1999,7 @@ class JobStore:
             source_job_id=row["source_job_id"],
             remote=None if row["remote"] is None else bool(row["remote"]),
             market_id=row["market_id"] or None,
+            content_confidence=row["content_confidence"] or "",
         )
 
     def get_evaluation(self, job_id: int) -> Evaluation | None:
@@ -1964,7 +2007,8 @@ class JobStore:
             """
             SELECT total_score, scores_json, decision, hard_blockers_json,
                    strengths_json, gaps_json, salary_note, location_note,
-                   rationale, model, status, market_id
+                   rationale, model, status, market_id, content_confidence_at_eval,
+                   requirements_json
             FROM evaluations
             WHERE job_id = ?
             ORDER BY id DESC
@@ -1988,6 +2032,8 @@ class JobStore:
             model=row["model"],
             status=row["status"],
             market_id=row["market_id"],
+            content_confidence=row["content_confidence_at_eval"],
+            requirements=json.loads(row["requirements_json"]) if row["requirements_json"] else {},
         )
 
     def get_material(self, job_id: int) -> Material | None:
