@@ -1,6 +1,9 @@
 name: Daily Job Hunter
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '23 9 * * *'
+      timezone: "Europe/Berlin"
 permissions:
   contents: read
   actions: read
