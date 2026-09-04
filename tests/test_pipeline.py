@@ -13,6 +13,7 @@ from job_hunter.models import (
     CandidateContext,
     CandidatePreferences,
     CompanyWatchSeed,
+    DigestItem,
     Evaluation,
     GeminiQuotaSettings,
     GeminiUsageSummary,
@@ -26,7 +27,7 @@ from job_hunter.pipeline import run_pipeline, should_run_scheduled
 from job_hunter.sources import GmailStagedSource, LearnedAtsSource
 from job_hunter.sources.company_watch import CompanyWatchSource
 from job_hunter.store import JobStore
-from job_hunter.telegram import build_gemini_pause_warning
+from job_hunter.telegram import build_digest, build_gemini_pause_warning, select_deliverable_items
 from job_hunter.watchlist import promote_company as persist_promoted_company
 from tests.market_fixtures import make_market_policy
 
@@ -2004,3 +2005,29 @@ def test_run_pipeline_forwards_store_to_build_sources_when_sources_not_given(
     run_pipeline(settings, store=store, gemini=gemini, telegram=telegram)
 
     assert captured["store"] is store
+
+
+def test_capped_job_is_excluded_from_digest_and_navigation():
+    capped = DigestItem(
+        job_id=1,
+        company="Forecast GmbH",
+        title="Product Analytics Lead",
+        score=64,
+        decision="skip",
+        url="https://example.test/jobs/1",
+        hard_blockers=[],
+    )
+    plausible = DigestItem(
+        job_id=2,
+        company="Example GmbH",
+        title="Senior Frontend Engineer",
+        score=70,
+        decision="possible_match",
+        url="https://example.test/jobs/2",
+        hard_blockers=[],
+    )
+
+    deliverable = select_deliverable_items([capped, plausible])
+
+    assert [item.job_id for item in deliverable] == [2]
+    assert "Forecast GmbH" not in build_digest([capped, plausible])
