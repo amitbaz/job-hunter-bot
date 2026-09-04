@@ -1,5 +1,9 @@
 import job_hunter.canonical as canonical
-from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
+from job_hunter.canonical import (
+    CanonicalResolver,
+    fetch_authoritative_description,
+    parse_supported_ats_url,
+)
 from job_hunter.models import AtsReference, Job
 
 
@@ -356,3 +360,32 @@ def test_resolution_failure_is_non_blocking():
         )
     )
     assert result is None
+
+
+def test_fetch_authoritative_description_dispatches_by_provider(monkeypatch):
+    ats = AtsReference(provider="ashby", board="acme", job_id="abc")
+    called = {}
+
+    def fake_fetch(board, url, http):
+        called["args"] = (board, url)
+        return "authoritative text"
+
+    monkeypatch.setattr("job_hunter.sources.ashby.fetch_description", fake_fetch)
+    result = fetch_authoritative_description(ats, "https://jobs.ashbyhq.com/acme/abc", http=object())
+    assert result == "authoritative text"
+    assert called["args"] == ("acme", "https://jobs.ashbyhq.com/acme/abc")
+
+
+def test_fetch_authoritative_description_returns_none_for_unsupported_provider():
+    ats = AtsReference(provider="unknown_provider", board="acme", job_id="abc")
+    assert fetch_authoritative_description(ats, "https://example.com/x", http=object()) is None
+
+
+def test_fetch_authoritative_description_swallows_fetch_errors(monkeypatch):
+    ats = AtsReference(provider="ashby", board="acme", job_id="abc")
+
+    def raising_fetch(board, url, http):
+        raise RuntimeError("network error")
+
+    monkeypatch.setattr("job_hunter.sources.ashby.fetch_description", raising_fetch)
+    assert fetch_authoritative_description(ats, "https://jobs.ashbyhq.com/acme/abc", http=object()) is None

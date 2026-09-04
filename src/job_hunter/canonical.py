@@ -13,9 +13,18 @@ from job_hunter.job_identity import (
     normalize_job_title,
 )
 from job_hunter.models import AtsReference, CanonicalResolution, Job
+from job_hunter.sources import ashby as ashby_source
+from job_hunter.sources import greenhouse as greenhouse_source
+from job_hunter.sources import lever as lever_source
 
 if TYPE_CHECKING:
     from job_hunter.http import HttpClient
+
+_DESCRIPTION_FETCHERS = {
+    "ashby": ashby_source,
+    "lever": lever_source,
+    "greenhouse": greenhouse_source,
+}
 
 
 def parse_supported_ats_url(url: str) -> AtsReference | None:
@@ -167,3 +176,20 @@ def _titles_match(left: Job, right: Job) -> bool:
 
 def _same_ats_board(left: AtsReference | None, right: AtsReference) -> bool:
     return left is not None and (left.provider, left.board) == (right.provider, right.board)
+
+
+def fetch_authoritative_description(
+    ats: AtsReference, target_url: str, http: "HttpClient"
+) -> str | None:
+    """Fetch the full official description for a resolved ATS posting.
+
+    Non-fatal by design, matching the rest of this module: a fetch failure
+    here should never take down canonical resolution.
+    """
+    adapter = _DESCRIPTION_FETCHERS.get(ats.provider)
+    if adapter is None:
+        return None
+    try:
+        return adapter.fetch_description(ats.board, target_url, http)
+    except Exception:
+        return None

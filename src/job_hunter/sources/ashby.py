@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from job_hunter.models import Job
+from job_hunter.normalize import canonicalize_url
 
 from .base import is_stale_board_error, logger, strip_html
 
@@ -41,3 +42,19 @@ class AshbySource:
                 )
             )
         return jobs
+
+
+def fetch_description(board: str, target_url: str, http) -> str | None:
+    """Return the full description for the job at target_url on this board.
+
+    Reuses the same board-listing endpoint discover() already hits, since
+    it returns every job's full description in one response — no separate
+    per-job endpoint needed.
+    """
+    data = http.get_json(_URL_TEMPLATE.format(board=board))
+    target = canonicalize_url(target_url)
+    for item in data.get("jobs", []):
+        if canonicalize_url(item.get("jobUrl", "")) == target:
+            description = item.get("descriptionPlain") or item.get("descriptionHtml", "")
+            return strip_html(description) or None
+    return None

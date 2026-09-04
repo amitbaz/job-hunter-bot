@@ -2,6 +2,7 @@ import logging
 
 import requests
 
+from job_hunter.sources import ashby, greenhouse, lever
 from job_hunter.sources.ashby import AshbySource
 from job_hunter.sources.base import is_stale_board_error
 from job_hunter.sources.greenhouse import GreenhouseSource
@@ -72,3 +73,101 @@ def test_ashby_404_logs_compact_without_traceback(caplog):
     records = [r for r in caplog.records if "dead-board" in r.getMessage()]
     assert len(records) == 1
     assert records[0].exc_info is None
+
+
+class _FakeHttp:
+    def __init__(self, data) -> None:
+        self._data = data
+
+    def get_json(self, url, **kwargs):
+        return self._data
+
+
+def test_ashby_fetch_description_matches_by_url():
+    http = _FakeHttp(
+        {
+            "jobs": [
+                {
+                    "jobUrl": "https://jobs.ashbyhq.com/acme/abc",
+                    "descriptionPlain": "Full JD text",
+                },
+            ]
+        }
+    )
+    result = ashby.fetch_description("acme", "https://jobs.ashbyhq.com/acme/abc", http)
+    assert result == "Full JD text"
+
+
+def test_ashby_fetch_description_returns_none_when_url_not_found():
+    http = _FakeHttp(
+        {
+            "jobs": [
+                {
+                    "jobUrl": "https://jobs.ashbyhq.com/acme/abc",
+                    "descriptionPlain": "Full JD text",
+                },
+            ]
+        }
+    )
+    result = ashby.fetch_description("acme", "https://jobs.ashbyhq.com/acme/does-not-exist", http)
+    assert result is None
+
+
+def test_lever_fetch_description_matches_by_url():
+    http = _FakeHttp(
+        [
+            {
+                "hostedUrl": "https://jobs.lever.co/acme/abc-123",
+                "descriptionPlain": "Full JD text",
+            },
+        ]
+    )
+    result = lever.fetch_description("acme", "https://jobs.lever.co/acme/abc-123", http)
+    assert result == "Full JD text"
+
+
+def test_lever_fetch_description_returns_none_when_url_not_found():
+    http = _FakeHttp(
+        [
+            {
+                "hostedUrl": "https://jobs.lever.co/acme/abc-123",
+                "descriptionPlain": "Full JD text",
+            },
+        ]
+    )
+    result = lever.fetch_description("acme", "https://jobs.lever.co/acme/does-not-exist", http)
+    assert result is None
+
+
+def test_greenhouse_fetch_description_matches_by_url():
+    http = _FakeHttp(
+        {
+            "jobs": [
+                {
+                    "absolute_url": "https://boards.greenhouse.io/acme/jobs/456",
+                    "content": "Full JD text",
+                },
+            ]
+        }
+    )
+    result = greenhouse.fetch_description(
+        "acme", "https://boards.greenhouse.io/acme/jobs/456", http
+    )
+    assert result == "Full JD text"
+
+
+def test_greenhouse_fetch_description_returns_none_when_url_not_found():
+    http = _FakeHttp(
+        {
+            "jobs": [
+                {
+                    "absolute_url": "https://boards.greenhouse.io/acme/jobs/456",
+                    "content": "Full JD text",
+                },
+            ]
+        }
+    )
+    result = greenhouse.fetch_description(
+        "acme", "https://boards.greenhouse.io/acme/jobs/does-not-exist", http
+    )
+    assert result is None
