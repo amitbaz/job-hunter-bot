@@ -1,0 +1,95 @@
+name: Fix PR 49 test expectations
+
+on:
+  push:
+    branches:
+      - fix/gmail-thread-links
+
+permissions:
+  contents: write
+
+jobs:
+  fix-tests:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/gmail-thread-links
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Update stale Gmail-link expectations
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(path: str, old: str, new: str) -> None:
+              file = Path(path)
+              text = file.read_text()
+              if old not in text:
+                  raise SystemExit(f"expected text not found in {path}: {old!r}")
+              file.write_text(text.replace(old, new))
+
+          replace(
+              "tests/test_pipeline.py",
+              "https://mail.google.com/mail/#all/review-1",
+              "https://mail.google.com/mail/u/0/#all/thread-review-1",
+          )
+          replace(
+              "tests/test_pipeline.py",
+              "https://mail.google.com/mail/#all/review-2",
+              "https://mail.google.com/mail/u/0/#all/thread-review-2",
+          )
+          replace(
+              "tests/test_pipeline_navigator.py",
+              "https://mail.google.com/mail/#all/gmail-review-1",
+              "https://mail.google.com/mail/u/0/#all/thread-gmail-review-1",
+          )
+
+          replace(
+              "tests/test_telegram.py",
+              '                    source_message_id="m-company",\n                ),',
+              '                    source_message_id="m-company",\n                    source_thread_id="thread-m-company",\n                ),',
+          )
+          replace(
+              "tests/test_telegram.py",
+              '                    source_message_id="m-subject",\n                    occurred_at="2026-08-31T11:00:00+00:00",',
+              '                    source_message_id="m-subject",\n                    source_thread_id="thread-m-subject",\n                    occurred_at="2026-08-31T11:00:00+00:00",',
+          )
+          replace(
+              "tests/test_telegram.py",
+              '    assert "https://mail.google.com/mail/#all/m-company" in digest\n    assert "https://mail.google.com/mail/#all/m-subject" in digest',
+              '    assert "https://mail.google.com/mail/u/0/#all/thread-m-company" in digest\n    assert "https://mail.google.com/mail/u/0/#all/thread-m-subject" in digest',
+          )
+          replace(
+              "tests/test_telegram.py",
+              '            source_message_id=f"m-{index}",\n            rationale="internal detail that must not be shown",',
+              '            source_message_id=f"m-{index}",\n            source_thread_id=f"thread-m-{index}",\n            rationale="internal detail that must not be shown",',
+          )
+          replace(
+              "tests/test_telegram.py",
+              '            assert f"https://mail.google.com/mail/#all/m-{event_id}" in text',
+              '            assert f"https://mail.google.com/mail/u/0/#all/thread-m-{event_id}" in text',
+          )
+
+          Path(".github/workflows/fix-pr49-tests.yml").unlink()
+          PY
+
+      - name: Install test dependencies
+        run: pip install -e '.[test,webhook]'
+
+      - name: Verify full suite
+        run: pytest -q
+
+      - name: Commit repaired tests
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add tests/test_pipeline.py tests/test_pipeline_navigator.py tests/test_telegram.py .github/workflows/fix-pr49-tests.yml
+          git commit -m "test: update Gmail thread-link expectations (#50)"
+          git push origin HEAD:fix/gmail-thread-links
