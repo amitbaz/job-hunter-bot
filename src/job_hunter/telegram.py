@@ -103,7 +103,8 @@ def _gmail_review_explanation(item: ReviewItem) -> str:
 
 
 def _gmail_review_block(item: ReviewItem) -> str:
-    gmail_url = f"https://mail.google.com/mail/#all/{item.source_message_id}"
+    gmail_id = item.source_thread_id or item.source_message_id
+    gmail_url = f"https://mail.google.com/mail/u/0/#all/{gmail_id}"
     return "\n".join(
         [
             _gmail_review_title(item),
