@@ -371,6 +371,7 @@ class ReviewItem:
     rationale: str
     event_type: str
     source_message_id: str
+    source_thread_id: str | None
 
 
 @dataclass(slots=True)
