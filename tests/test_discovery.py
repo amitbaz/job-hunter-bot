@@ -525,6 +525,111 @@ def test_collect_candidates_counts_unresolved_canonical_urls(store, policy):
     assert result.eligible[0][1].url == "https://yc.test/unresolved"
 
 
+def test_canonical_resolution_upgrades_description_when_ats_found(
+    store, policy, monkeypatch
+):
+    job = Job(
+        source="hackernews",
+        title="Senior Product Engineer",
+        company="Acme",
+        location="Berlin",
+        url="https://news.ycombinator.com/item?id=1",
+        description="original weak text React TypeScript",
+        remote=True,
+    )
+    resolution = CanonicalResolution(
+        url="https://jobs.ashbyhq.com/acme/abc",
+        ats=AtsReference(provider="ashby", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="test",
+    )
+    monkeypatch.setattr(
+        "job_hunter.discovery.fetch_authoritative_description",
+        lambda ats, url, http: "The real authoritative JD",
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert result.eligible[0][1].description == "The real authoritative JD"
+    assert result.eligible[0][1].content_confidence == OFFICIAL_ATS
+
+
+def test_canonical_resolution_skips_description_fetch_when_already_official_ats(
+    store, policy, monkeypatch
+):
+    job = Job(
+        source="ashby",
+        title="Senior Product Engineer",
+        company="Acme",
+        location="Berlin",
+        url="https://jobs.ashbyhq.com/acme/abc",
+        description="already authoritative React TypeScript",
+        remote=True,
+    )
+    resolution = CanonicalResolution(
+        url="https://jobs.ashbyhq.com/acme/abc",
+        ats=AtsReference(provider="ashby", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="direct",
+    )
+    calls = []
+    monkeypatch.setattr(
+        "job_hunter.discovery.fetch_authoritative_description",
+        lambda ats, url, http: calls.append(1) or "should not be used",
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert calls == []
+    assert result.eligible[0][1].description == "already authoritative React TypeScript"
+
+
+def test_canonical_resolution_keeps_existing_description_when_fetch_fails(
+    store, policy, monkeypatch
+):
+    job = Job(
+        source="hackernews",
+        title="Senior Product Engineer",
+        company="Acme",
+        location="Berlin",
+        url="https://news.ycombinator.com/item?id=1",
+        description="original weak text React TypeScript",
+        remote=True,
+    )
+    resolution = CanonicalResolution(
+        url="https://jobs.ashbyhq.com/acme/abc",
+        ats=AtsReference(provider="ashby", board="acme", job_id="abc"),
+        confidence=1.0,
+        method="test",
+    )
+    monkeypatch.setattr(
+        "job_hunter.discovery.fetch_authoritative_description",
+        lambda ats, url, http: None,
+    )
+
+    result = collect_candidates(
+        [FakeSource([job])],
+        store,
+        NoOpHttp(),
+        policy,
+        resolver=FakeResolver(resolution),
+    )
+
+    assert result.eligible[0][1].description == "original weak text React TypeScript"
+
+
 def test_resolver_exception_preserves_candidate_and_continues_collection(store, policy):
     first = Job(
         source="first",

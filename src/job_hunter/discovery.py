@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 
 from job_hunter import content_confidence
 from job_hunter.ats_registry import harvest_ats_board
-from job_hunter.canonical import CanonicalResolver, parse_supported_ats_url
+from job_hunter.canonical import (
+    CanonicalResolver,
+    fetch_authoritative_description,
+    parse_supported_ats_url,
+)
 from job_hunter.fetching import enrich_job
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import job_fallback_identity
@@ -428,6 +432,13 @@ def collect_candidates(
                         job.ats_job_id = resolution.ats.job_id
                         if _harvest_ats_board_safely(store, job):
                             stats.ats_boards_discovered += 1
+                        if job.content_confidence != content_confidence.OFFICIAL_ATS:
+                            authoritative = fetch_authoritative_description(
+                                resolution.ats, resolution.url, http
+                            )
+                            if authoritative:
+                                job.description = authoritative
+                                job.content_confidence = content_confidence.OFFICIAL_ATS
                     # Canonical resolution can surface stronger, directly
                     # observed location evidence than the query-time hint that
                     # seeded the earlier attribution above, so re-run it
