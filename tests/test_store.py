@@ -60,6 +60,35 @@ def _evaluation(job_id, **overrides):
     return Evaluation(**defaults)
 
 
+def _drop_raw_model_score_column(db_path):
+    """Simulate a database written before `raw_model_score` existed.
+
+    Drops the column outright (rather than just zeroing its values) so that
+    reopening the store genuinely exercises the add-column-then-backfill
+    migration path in `_add_missing_columns` / `_backfill_raw_model_score`.
+    """
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        if sqlite3.sqlite_version_info >= (3, 35, 0):
+            conn.execute("ALTER TABLE evaluations DROP COLUMN raw_model_score")
+        else:
+            columns = [
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(evaluations)")
+                if row["name"] != "raw_model_score"
+            ]
+            column_list = ", ".join(columns)
+            conn.execute(
+                f"CREATE TABLE evaluations_legacy AS SELECT {column_list} FROM evaluations"
+            )
+            conn.execute("DROP TABLE evaluations")
+            conn.execute("ALTER TABLE evaluations_legacy RENAME TO evaluations")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _create_r1_jobs_only_db(path):
     conn = sqlite3.connect(path)
     conn.execute(
@@ -1895,3 +1924,47 @@ def test_save_evaluation_persists_evaluation_confidence_not_jobs_row(tmp_path):
     store.save_evaluation(job_id, evaluation)
     saved = store.get_evaluation(job_id)
     assert saved.content_confidence == AGGREGATOR_TEXT
+
+
+def test_evaluation_raw_model_score_round_trip(tmp_path):
+    store = JobStore(tmp_path / "state.sqlite3")
+    job_id, _, _ = store.upsert_job(Job(source="x", source_job_id="1", title="Analyst", company="Acme"))
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=64, raw_model_score=89))
+    loaded = store.get_evaluation(job_id)
+    assert loaded.total_score == 64
+    assert loaded.raw_model_score == 89
+
+
+def test_legacy_evaluation_rows_backfill_raw_model_score(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    store = JobStore(db_path)
+    job_id, _, _ = store.upsert_job(Job(source="x", source_job_id="1", title="Analyst", company="Acme"))
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=77, raw_model_score=77))
+    store._conn.close()
+
+    # Simulate a database from before `raw_model_score` existed: the column
+    # is genuinely absent, so reopening must add it and then backfill it.
+    _drop_raw_model_score_column(db_path)
+
+    reopened = JobStore(db_path)
+    columns = {row["name"] for row in reopened._conn.execute("PRAGMA table_info(evaluations)")}
+    assert "raw_model_score" in columns
+    assert reopened.get_evaluation(job_id).raw_model_score == 77
+
+
+def test_legacy_evaluation_row_with_genuinely_zero_score_stays_zero(tmp_path):
+    db_path = tmp_path / "state.sqlite3"
+    store = JobStore(db_path)
+    job_id, _, _ = store.upsert_job(Job(source="x", source_job_id="1", title="Analyst", company="Acme"))
+    store.save_evaluation(job_id, _evaluation(job_id, total_score=0, raw_model_score=0))
+    store._conn.close()
+
+    # Same missing-column simulation as above, but for a row whose true raw
+    # score is 0 rather than merely defaulted to 0 — the backfill must leave
+    # it at 0, not mistake it for an un-migrated row and rewrite it wrongly.
+    _drop_raw_model_score_column(db_path)
+
+    reopened = JobStore(db_path)
+    evaluation = reopened.get_evaluation(job_id)
+    assert evaluation.total_score == 0
+    assert evaluation.raw_model_score == 0

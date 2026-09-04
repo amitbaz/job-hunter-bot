@@ -4,7 +4,7 @@ import pytest
 
 from job_hunter.content_confidence import AGGREGATOR_TEXT, OFFICIAL_ATS, PARTIAL_UNKNOWN
 from job_hunter.evaluation import EvaluationError, evaluate_job
-from job_hunter.models import CandidateContext, CandidatePreferences, Job, SearchPolicy
+from job_hunter.models import CandidateContext, CandidatePreferences, Evaluation, Job, SearchPolicy
 from tests.market_fixtures import make_market_policy
 
 # A sentinel that would only appear in the prompt if some future change
@@ -397,16 +397,17 @@ def test_invalid_requirement_depth_is_rejected(fake_gemini, job, policy, context
         evaluate_job(job, context, policy, fake_gemini)
 
 
-def test_major_unsupported_must_have_caps_below_high_priority(fake_gemini, job, policy, context):
+def test_major_unsupported_must_have_caps_score_below_possible(fake_gemini, job, policy, context):
     payload = _valid_payload(total_score=89)
     payload["requirements"]["must_have"] = [
         {"requirement": "Deep PostgreSQL expertise", "depth": "deep_expert", "candidate_support": "unsupported"}
     ]
     fake_gemini.text = json.dumps(payload)
     evaluation = evaluate_job(job, context, policy, fake_gemini)
-    assert evaluation.total_score == 89
-    assert evaluation.decision not in ("high_priority", "package_match")
-    assert evaluation.decision == "possible_match"
+    assert evaluation.raw_model_score == 89
+    assert evaluation.total_score == policy.thresholds["possible"] - 1
+    assert evaluation.total_score < policy.thresholds["possible"]
+    assert evaluation.decision == "skip"
 
 
 def test_familiarity_depth_unsupported_must_have_does_not_gate(fake_gemini, job, policy, context):
@@ -417,6 +418,7 @@ def test_familiarity_depth_unsupported_must_have_does_not_gate(fake_gemini, job,
     fake_gemini.text = json.dumps(payload)
     evaluation = evaluate_job(job, context, policy, fake_gemini)
     assert evaluation.decision == "high_priority"
+    assert evaluation.total_score == 89
 
 
 def test_unsupported_preferred_requirement_does_not_gate(fake_gemini, job, policy, context):
@@ -427,6 +429,7 @@ def test_unsupported_preferred_requirement_does_not_gate(fake_gemini, job, polic
     fake_gemini.text = json.dumps(payload)
     evaluation = evaluate_job(job, context, policy, fake_gemini)
     assert evaluation.decision == "high_priority"
+    assert evaluation.total_score == 89
 
 
 def test_insufficient_content_confidence_caps_below_high_priority(fake_gemini, job, policy, context):
@@ -481,3 +484,62 @@ def test_prompt_instructs_requirement_extraction(fake_gemini, job, policy, conte
     evaluate_job(job, context, policy, fake_gemini)
     prompt = fake_gemini.prompts[0][0]
     assert "must-have" in prompt.lower() or "must_have" in prompt
+
+
+def test_evaluation_defaults_raw_model_score_to_zero():
+    evaluation = Evaluation(
+        job_id=1,
+        total_score=70,
+        scores={},
+        decision="possible_match",
+        hard_blockers=[],
+        strengths=[],
+        gaps=[],
+        salary_note="",
+        location_note="",
+        rationale="",
+        model="m",
+    )
+    assert evaluation.raw_model_score == 0
+
+
+def test_experience_depth_unsupported_must_have_is_also_capped(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89)
+    payload["requirements"]["must_have"] = [
+        {"requirement": "End-to-end forecasting", "depth": "experience", "candidate_support": "unsupported"}
+    ]
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.total_score == policy.thresholds["possible"] - 1
+    assert evaluation.decision == "skip"
+
+
+def test_partial_support_must_have_is_not_capped(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89)
+    payload["requirements"]["must_have"] = [
+        {"requirement": "Deep PostgreSQL expertise", "depth": "deep_expert", "candidate_support": "partial"}
+    ]
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.total_score == 89
+    assert evaluation.raw_model_score == 89
+    assert evaluation.decision == "high_priority"
+
+
+def test_hard_blocker_takes_precedence_over_cap(fake_gemini, job, policy, context):
+    payload = _valid_payload(total_score=89, hard_blockers=["Requires on-site in the US"])
+    payload["requirements"]["must_have"] = [
+        {"requirement": "Deep PostgreSQL expertise", "depth": "deep_expert", "candidate_support": "unsupported"}
+    ]
+    fake_gemini.text = json.dumps(payload)
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.decision == "blocked"
+    assert evaluation.total_score == policy.thresholds["possible"] - 1
+    assert evaluation.raw_model_score == 89
+
+
+def test_uncapped_evaluation_keeps_raw_and_total_in_sync(fake_gemini, job, policy, context):
+    fake_gemini.text = json.dumps(_valid_payload())
+    evaluation = evaluate_job(job, context, policy, fake_gemini)
+    assert evaluation.total_score == 89
+    assert evaluation.raw_model_score == 89

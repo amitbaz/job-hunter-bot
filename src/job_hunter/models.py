@@ -155,6 +155,9 @@ class Evaluation:
     market_id: str = ""
     content_confidence: str = ""
     requirements: dict = field(default_factory=dict)
+    #: Gemini's raw component sum, before any deterministic cap. Diagnostics
+    #: only — `total_score` is the number every consumer should use.
+    raw_model_score: int = 0
 
 
 @dataclass(slots=True)

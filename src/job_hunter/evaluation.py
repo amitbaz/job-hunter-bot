@@ -249,6 +249,16 @@ def _validate_requirement_list(items: object, label: str) -> list[dict]:
     return validated
 
 
+def _capped_score(total: int, possible_threshold: int) -> int:
+    """Lower `total` so it cannot sit in the `possible_match` band or above.
+
+    Applied when the candidate has no support for a core requirement. The cap
+    is derived from configuration rather than hardcoded so it tracks
+    `policy.thresholds["possible"]`; `max(0, ...)` guards a threshold of 0.
+    """
+    return min(total, max(0, possible_threshold - 1))
+
+
 def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemini: "GeminiClient") -> Evaluation:
     market = market_by_id(policy, job.market_id) if job.market_id and policy.markets else None
 
@@ -302,7 +312,16 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
         for item in must_have
     )
     insufficient_content = not content_confidence.is_sufficient(job.content_confidence)
-    confident_decision_available = not major_unsupported_must_have and not insufficient_content
+    # A major unsupported must-have no longer needs to gate the decision ladder:
+    # capping the score below `possible` already puts it out of reach of the
+    # `package_match` and `high_priority` rungs. Thin postings still gate here,
+    # because failing to read a description is not evidence of a poor fit.
+    confident_decision_available = not insufficient_content
+
+    possible_threshold = policy.thresholds.get("possible", 65)
+    raw_total = total
+    if major_unsupported_must_have:
+        total = _capped_score(total, possible_threshold)
 
     if hard_blockers:
         decision = "blocked"
@@ -310,7 +329,7 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
         decision = "high_priority"
     elif total >= policy.thresholds.get("package", 75) and confident_decision_available:
         decision = "package_match"
-    elif total >= policy.thresholds.get("possible", 65):
+    elif total >= possible_threshold:
         decision = "possible_match"
     else:
         decision = "skip"
@@ -330,4 +349,5 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
         market_id=job.market_id or "",
         content_confidence=job.content_confidence or content_confidence.PARTIAL_UNKNOWN,
         requirements={"must_have": must_have, "preferred": preferred},
+        raw_model_score=raw_total,
     )

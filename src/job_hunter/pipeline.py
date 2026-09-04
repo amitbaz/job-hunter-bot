@@ -492,6 +492,12 @@ def _evaluate_and_deliver_job(
     store.save_evaluation(job_id, evaluation)
     store.complete_ai_work("job_evaluation", job_id)
 
+    if evaluation.total_score != evaluation.raw_model_score:
+        logger.info(
+            "capped match score job_id=%s raw=%s effective=%s decision=%s",
+            job_id, evaluation.raw_model_score, evaluation.total_score, evaluation.decision,
+        )
+
     promoted = False
     try:
         promotion_before = _watch_promotion_state(store.get_company_watch(job.company))
