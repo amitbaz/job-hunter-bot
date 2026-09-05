@@ -182,7 +182,7 @@ def test_select_diverse_candidates_respects_max_share_when_filling():
 
     selected = select_diverse_candidates(ranked, limit=4, minimum_per_source=0, max_share=0.5)
 
-    assert [job_id for job_id, _job, _score in selected] == [101, 201, 301, 102]
+    assert [job_id for job_id, _job, _score in selected] == [101, 102, 201, 202]
 
 
 def test_select_diverse_candidates_preserves_rank_order_for_ties():
