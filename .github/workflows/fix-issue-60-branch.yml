@@ -26,11 +26,13 @@ jobs:
           python - <<'PY'
           from pathlib import Path
           import re
+          import textwrap
 
           pipeline_path = Path('src/job_hunter/pipeline.py')
           pipeline = pipeline_path.read_text()
 
-          fixed_eval = '''def _evaluate_and_deliver_job(
+          fixed_eval = textwrap.dedent('''\
+          def _evaluate_and_deliver_job(
               job_id: int,
               job: Job,
               candidate_context: CandidateContext,
@@ -120,7 +122,7 @@ jobs:
                   summary.skipped += 1
 
               return promoted, False, evaluation.decision
-          '''
+          ''')
 
           pipeline, count = re.subn(
               r'def _evaluate_and_deliver_job\(.*?\n(?=def _format_gemini_usage_log)',
@@ -132,7 +134,8 @@ jobs:
           if count != 1:
               raise SystemExit('failed to replace _evaluate_and_deliver_job')
 
-          fixed_loops = '''    for job_id in pending_evaluation_ids:
+          fixed_loops = textwrap.indent(textwrap.dedent('''\
+          for job_id in pending_evaluation_ids:
               if quota_blocked:
                   continue
               job = store.get_job(job_id)
@@ -179,12 +182,11 @@ jobs:
               deferred_by_budget,
               quota_deferred_count,
           )
-
-          '''
+          '''), '    ')
 
           pipeline, count = re.subn(
               r'    for job_id in pending_evaluation_ids:.*?(?=    for job_id in set\(store\.pending_delivery_job_ids\(\)\))',
-              fixed_loops,
+              fixed_loops + '\n',
               pipeline,
               count=1,
               flags=re.S,
@@ -192,12 +194,17 @@ jobs:
           if count != 1:
               raise SystemExit('failed to replace evaluation loops')
 
+          pipeline = pipeline.replace(
+              'from pathlib import Path\nfrom zoneinfo import ZoneInfo\nimport time\n',
+              'from pathlib import Path\nimport time\nfrom zoneinfo import ZoneInfo\n',
+          )
           pipeline_path.write_text(pipeline)
 
           test_path = Path('tests/test_pipeline.py')
           tests = test_path.read_text()
 
-          fixed_temp_test = '''def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary(
+          fixed_temp_test = textwrap.dedent('''\
+          def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary(
               settings, monkeypatch
           ):
               job = _job()
@@ -248,7 +255,7 @@ jobs:
               assert gemini.eval_calls == 1
 
 
-          '''
+          ''')
 
           tests, count = re.subn(
               r'def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary\(.*?(?=def test_pipeline_defers_remaining_candidates_after_first_quota_exception)',
@@ -269,12 +276,12 @@ jobs:
           PY
 
       - name: Install project
-        run: pip install -e '.[dev]'
+        run: pip install -e . pytest
 
       - name: Verify
         run: |
           python -m py_compile src/job_hunter/pipeline.py tests/test_pipeline.py
-          pytest tests/test_pipeline.py -q
+          pytest -q
 
       - name: Commit repaired branch
         shell: bash
@@ -282,6 +289,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           rm .github/workflows/fix-issue-60-branch.yml
-          git add src/job_hunter/pipeline.py tests/test_pipeline.py .github/workflows/fix-issue-60-branch.yml
+          rm -f .github/issue-60-repair-trigger
+          git add -A
           git commit -m "fix: repair Gemini capacity evaluation flow"
           git push origin HEAD:60-use-more-gemini-free-tier-capacity-for-daily-job-evaluation
