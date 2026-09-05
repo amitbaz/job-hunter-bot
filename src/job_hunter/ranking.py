@@ -124,8 +124,8 @@ def _location_evidence(job: Job) -> int:
 
 
 def _configured_roles(policy: SearchPolicy) -> list[str]:
-    """Return explicit role intent, preserving all configured role families."""
-    return _normalized_phrases([*policy.role_families, *policy.target_titles])
+    """Return explicit role-family intent when the strategy defines it."""
+    return _normalized_phrases(policy.role_families)
 
 
 def _configured_seniority(policy: SearchPolicy) -> list[str]:
@@ -157,8 +157,9 @@ def _role_seniority_fit(
     normalized_title = normalize_text(job.title or "")
     title_words = set(normalized_title.split())
 
-    # Explicit search configuration owns search intent. CV-inferred preferences
-    # remain a compatibility fallback only for legacy policies with no targets.
+    # Explicit role_families own search intent when configured. CV-inferred
+    # preferences remain a compatibility fallback for legacy policies that do
+    # not yet define role families.
     preferred_roles = _configured_roles(policy) or _normalized_phrases(preferences.preferred_roles)
     preferred_seniority = _configured_seniority(policy) or _normalized_phrases(
         preferences.preferred_seniority
