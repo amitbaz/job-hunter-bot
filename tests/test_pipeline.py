@@ -1494,7 +1494,8 @@ def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary(
     assert store.list_pending_ai_work("job_evaluation") == []
     assert summary.ready_to_apply == 1
     assert gemini.eval_calls == 1
-  
+
+
 def test_pipeline_defers_remaining_candidates_after_first_quota_exception(settings):
     jobs = _jobs_for_source("ashby", 3)
     store = JobStore(settings.db_path)
@@ -1730,10 +1731,10 @@ def test_pipeline_caps_evaluations_at_diverse_shortlist_budget(settings, caplog)
     assert "canonical_network_attempts=" in caplog.text
     assert "eligible sources: ashby=160 remotive=40" in caplog.text
     assert "selected sources: ashby=60 remotive=40" in caplog.text
-assert (
-    "evaluation_capacity selected=100 evaluated=100 "
-    "deferred_by_budget=100 quota_deferred=0"
-) in caplog.text
+    assert (
+        "evaluation_capacity selected=100 evaluated=100 "
+        "deferred_by_budget=100 quota_deferred=0"
+    ) in caplog.text
 
 def test_pipeline_logs_profile_fallback_without_private_content(settings, caplog):
     settings.candidate_profile = "PRIVATE_RESUME_TEXT"
