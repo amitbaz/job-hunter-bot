@@ -266,7 +266,7 @@ def evaluate_job(job: Job, context: CandidateContext, policy: SearchPolicy, gemi
         _build_evaluation_prompt(job, context, policy, market),
         purpose="job_evaluation",
         thinking_level="medium",
-        max_output_tokens=1200,
+        max_output_tokens=5000,
         json_mode=True,
         max_attempts=_EVALUATION_MAX_ATTEMPTS,
     )
