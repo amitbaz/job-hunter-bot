@@ -7,7 +7,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import job_hunter.pipeline
-from job_hunter.gemini_usage import GeminiBudgetExceeded, GeminiQuotaPaused
+from job_hunter.gemini_usage import (
+    GeminiBudgetExceeded,
+    GeminiQuotaPaused,
+    GeminiTemporaryCapacity,
+)
 from job_hunter.gmail_models import ExtractedJob
 from job_hunter.models import (
     CandidateContext,
@@ -383,7 +387,7 @@ def policy():
         blocked_title_keywords=["junior"],
         salary_floor_eur=90000,
         thresholds={"package": 75, "possible": 65},
-        max_jobs_per_run=35,
+        max_jobs_per_run=100,
     )
 
 
@@ -1441,7 +1445,56 @@ def test_pipeline_defers_evaluation_when_quota_paused(settings):
     assert summary.errors == 0
     assert summary.skipped == 0
 
+def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary(
+    settings, monkeypatch
+):
+    job = _job()
+    store = JobStore(settings.db_path)
+    telegram = FakeTelegram()
 
+    class TemporarilyLimitedGemini(FakeGemini):
+        def __init__(self):
+            super().__init__()
+            self.temporary_limit_raised = False
+
+        def generate_text(self, prompt, **kwargs):
+            if (
+                kwargs.get("purpose") == "job_evaluation"
+                and not self.temporary_limit_raised
+            ):
+                self.temporary_limit_raised = True
+                raise GeminiTemporaryCapacity(
+                    "temporary Gemini RPM capacity reached",
+                    retry_after_seconds=2.5,
+                )
+
+            return super().generate_text(prompt, **kwargs)
+
+    gemini = TemporarilyLimitedGemini()
+    sleeps = []
+
+    monkeypatch.setattr(
+        job_hunter.pipeline.time,
+        "sleep",
+        lambda seconds: sleeps.append(seconds),
+    )
+
+    summary = run_pipeline(
+        settings,
+        sources=[FakeSource([job])],
+        store=store,
+        gemini=gemini,
+        telegram=telegram,
+    )
+
+    job_id, _, _ = store.upsert_job(job)
+
+    assert sleeps == [2.5]
+    assert store.get_evaluation(job_id) is not None
+    assert store.list_pending_ai_work("job_evaluation") == []
+    assert summary.ready_to_apply == 1
+    assert gemini.eval_calls == 1
+  
 def test_pipeline_defers_remaining_candidates_after_first_quota_exception(settings):
     jobs = _jobs_for_source("ashby", 3)
     store = JobStore(settings.db_path)
@@ -1656,8 +1709,8 @@ def test_pipeline_evaluates_all_eligible_jobs_when_under_budget(settings):
 
 
 def test_pipeline_caps_evaluations_at_diverse_shortlist_budget(settings, caplog):
-    ashby_jobs = _jobs_for_source("ashby", 80)
-    remotive_jobs = _jobs_for_source("remotive", 20)
+    ashby_jobs = _jobs_for_source("ashby", 160)
+    remotive_jobs = _jobs_for_source("remotive", 40)
     store = JobStore(settings.db_path)
     gemini = FakeGemini()
     telegram = FakeTelegram()
@@ -1671,13 +1724,16 @@ def test_pipeline_caps_evaluations_at_diverse_shortlist_budget(settings, caplog)
             telegram=telegram,
         )
 
-    assert summary.ready_to_apply == 35
-    assert gemini.eval_calls == 35
-    assert "deferred_by_budget=65" in caplog.text
+    assert summary.ready_to_apply == 100
+    assert gemini.eval_calls == 100
+    assert "deferred_by_budget=100" in caplog.text
     assert "canonical_network_attempts=" in caplog.text
-    assert "eligible sources: ashby=80 remotive=20" in caplog.text
-    assert "selected sources: ashby=18 remotive=17" in caplog.text
-
+    assert "eligible sources: ashby=160 remotive=40" in caplog.text
+    assert "selected sources: ashby=60 remotive=40" in caplog.text
+assert (
+    "evaluation_capacity selected=100 evaluated=100 "
+    "deferred_by_budget=100 quota_deferred=0"
+) in caplog.text
 
 def test_pipeline_logs_profile_fallback_without_private_content(settings, caplog):
     settings.candidate_profile = "PRIVATE_RESUME_TEXT"
