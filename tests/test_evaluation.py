@@ -230,7 +230,7 @@ def test_evaluation_uses_expected_resource_controls(fake_gemini, job, policy, co
 
     assert purpose == "job_evaluation"
     assert thinking_level == "medium"
-    assert max_output_tokens == 1200
+    assert max_output_tokens == 5000
     assert json_mode is True
     assert max_attempts == 2
 
