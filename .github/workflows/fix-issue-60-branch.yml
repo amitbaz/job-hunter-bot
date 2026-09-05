@@ -1,0 +1,287 @@
+name: Repair issue 60 branch
+
+on:
+  push:
+    branches:
+      - 60-use-more-gemini-free-tier-capacity-for-daily-job-evaluation
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 60-use-more-gemini-free-tier-capacity-for-daily-job-evaluation
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Patch branch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          pipeline_path = Path('src/job_hunter/pipeline.py')
+          pipeline = pipeline_path.read_text()
+
+          fixed_eval = '''def _evaluate_and_deliver_job(
+              job_id: int,
+              job: Job,
+              candidate_context: CandidateContext,
+              settings: Settings,
+              store: JobStore,
+              gemini: GeminiClient,
+              digest_items: list[DigestItem],
+              summary: RunSummary,
+          ) -> tuple[bool, bool, str | None]:
+              """Evaluate one job and add it to the digest."""
+              if store.get_evaluation(job_id) is not None and store.has_delivery(job_id, "telegram_message"):
+                  store.complete_ai_work("job_evaluation", job_id)
+                  return False, False, None
+
+              while True:
+                  try:
+                      evaluation = evaluate_job(
+                          job,
+                          candidate_context,
+                          settings.policy,
+                          gemini,
+                      )
+                      break
+                  except GeminiTemporaryCapacity as exc:
+                      logger.info(
+                          "Gemini temporary capacity reached; waiting %.2fs before retrying job_id=%s",
+                          exc.retry_after_seconds,
+                          job_id,
+                      )
+                      time.sleep(exc.retry_after_seconds)
+                  except (GeminiBudgetExceeded, GeminiQuotaPaused):
+                      logger.warning(
+                          "job evaluation deferred by Gemini quota for job_id=%s",
+                          job_id,
+                      )
+                      store.enqueue_ai_work("job_evaluation", job_id)
+                      return False, True, None
+                  except Exception:
+                      logger.exception("evaluation failed for job_id=%s", job_id)
+                      summary.errors += 1
+                      return False, False, None
+
+              store.save_evaluation(job_id, evaluation)
+              store.complete_ai_work("job_evaluation", job_id)
+
+              if evaluation.total_score != evaluation.raw_model_score:
+                  logger.info(
+                      "capped match score job_id=%s raw=%s effective=%s decision=%s",
+                      job_id, evaluation.raw_model_score, evaluation.total_score, evaluation.decision,
+                  )
+
+              promoted = False
+              try:
+                  promotion_before = _watch_promotion_state(store.get_company_watch(job.company))
+                  promoted_watch_id = promote_company(
+                      store,
+                      job_id=job_id,
+                      job=job,
+                      evaluation=evaluation,
+                      package_threshold=settings.policy.thresholds["package"],
+                  )
+                  promotion_after = _watch_promotion_state(store.get_company_watch(job.company))
+                  promoted = promoted_watch_id is not None and promotion_after != promotion_before
+              except Exception:
+                  logger.exception("company watch promotion failed for job_id=%s", job_id)
+                  summary.errors += 1
+
+              item = DigestItem(
+                  job_id=job_id,
+                  company=job.company,
+                  title=job.title,
+                  score=evaluation.total_score,
+                  decision=evaluation.decision,
+                  url=job.url,
+                  hard_blockers=evaluation.hard_blockers,
+                  location=job.location,
+                  market_id=evaluation.market_id or job.market_id or "",
+                  market_note=evaluation.location_note or "",
+              )
+              digest_items.append(item)
+
+              if evaluation.decision in _READY_DECISIONS:
+                  summary.ready_to_apply += 1
+              elif evaluation.decision == "possible_match":
+                  summary.possible_matches += 1
+              else:
+                  summary.skipped += 1
+
+              return promoted, False, evaluation.decision
+          '''
+
+          pipeline, count = re.subn(
+              r'def _evaluate_and_deliver_job\(.*?\n(?=def _format_gemini_usage_log)',
+              fixed_eval + '\n',
+              pipeline,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('failed to replace _evaluate_and_deliver_job')
+
+          fixed_loops = '''    for job_id in pending_evaluation_ids:
+              if quota_blocked:
+                  continue
+              job = store.get_job(job_id)
+              if job is None:
+                  store.complete_ai_work("job_evaluation", job_id)
+                  continue
+              promoted, blocked, decision = _evaluate_and_deliver_job(
+                  job_id, job, candidate_context, settings, store, gemini, digest_items, summary
+              )
+              if decision is not None:
+                  evaluated_count += 1
+              if blocked:
+                  quota_deferred_count += 1
+              _record_decision(decision_counts, job.market_id, decision)
+              _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
+              if promoted:
+                  companies_promoted += 1
+              quota_blocked = quota_blocked or blocked
+
+          for job_id, job, _score in selected:
+              if job_id in pending_evaluation_id_set:
+                  continue
+              if quota_blocked:
+                  store.enqueue_ai_work("job_evaluation", job_id)
+                  quota_deferred_count += 1
+                  continue
+              promoted, blocked, decision = _evaluate_and_deliver_job(
+                  job_id, job, candidate_context, settings, store, gemini, digest_items, summary
+              )
+              if decision is not None:
+                  evaluated_count += 1
+              if blocked:
+                  quota_deferred_count += 1
+              _record_decision(decision_counts, job.market_id, decision)
+              _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
+              if promoted:
+                  companies_promoted += 1
+              quota_blocked = quota_blocked or blocked
+
+          logger.info(
+              "evaluation_capacity selected=%s evaluated=%s deferred_by_budget=%s quota_deferred=%s",
+              len(selected),
+              evaluated_count,
+              deferred_by_budget,
+              quota_deferred_count,
+          )
+
+          '''
+
+          pipeline, count = re.subn(
+              r'    for job_id in pending_evaluation_ids:.*?(?=    for job_id in set\(store\.pending_delivery_job_ids\(\)\))',
+              fixed_loops,
+              pipeline,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('failed to replace evaluation loops')
+
+          pipeline_path.write_text(pipeline)
+
+          test_path = Path('tests/test_pipeline.py')
+          tests = test_path.read_text()
+
+          fixed_temp_test = '''def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary(
+              settings, monkeypatch
+          ):
+              job = _job()
+              store = JobStore(settings.db_path)
+              telegram = FakeTelegram()
+
+              class TemporarilyLimitedGemini(FakeGemini):
+                  def __init__(self):
+                      super().__init__()
+                      self.temporary_limit_raised = False
+
+                  def generate_text(self, prompt, **kwargs):
+                      if (
+                          kwargs.get("purpose") == "job_evaluation"
+                          and not self.temporary_limit_raised
+                      ):
+                          self.temporary_limit_raised = True
+                          raise GeminiTemporaryCapacity(
+                              "temporary Gemini RPM capacity reached",
+                              retry_after_seconds=2.5,
+                          )
+
+                      return super().generate_text(prompt, **kwargs)
+
+              gemini = TemporarilyLimitedGemini()
+              sleeps = []
+
+              monkeypatch.setattr(
+                  job_hunter.pipeline.time,
+                  "sleep",
+                  lambda seconds: sleeps.append(seconds),
+              )
+
+              summary = run_pipeline(
+                  settings,
+                  sources=[FakeSource([job])],
+                  store=store,
+                  gemini=gemini,
+                  telegram=telegram,
+              )
+
+              job_id, _, _ = store.upsert_job(job)
+
+              assert sleeps == [2.5]
+              assert store.get_evaluation(job_id) is not None
+              assert store.list_pending_ai_work("job_evaluation") == []
+              assert summary.ready_to_apply == 1
+              assert gemini.eval_calls == 1
+
+
+          '''
+
+          tests, count = re.subn(
+              r'def test_pipeline_waits_and_retries_when_gemini_capacity_is_temporary\(.*?(?=def test_pipeline_defers_remaining_candidates_after_first_quota_exception)',
+              fixed_temp_test,
+              tests,
+              count=1,
+              flags=re.S,
+          )
+          if count != 1:
+              raise SystemExit('failed to replace temporary-capacity test')
+
+          tests = tests.replace(
+              'assert "selected sources: ashby=60 remotive=40" in caplog.text\nassert (\n    "evaluation_capacity selected=100 evaluated=100 "\n    "deferred_by_budget=100 quota_deferred=0"\n) in caplog.text',
+              'assert "selected sources: ashby=60 remotive=40" in caplog.text\n    assert (\n        "evaluation_capacity selected=100 evaluated=100 "\n        "deferred_by_budget=100 quota_deferred=0"\n    ) in caplog.text',
+          )
+
+          test_path.write_text(tests)
+          PY
+
+      - name: Install project
+        run: pip install -e '.[dev]'
+
+      - name: Verify
+        run: |
+          python -m py_compile src/job_hunter/pipeline.py tests/test_pipeline.py
+          pytest tests/test_pipeline.py -q
+
+      - name: Commit repaired branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm .github/workflows/fix-issue-60-branch.yml
+          git add src/job_hunter/pipeline.py tests/test_pipeline.py .github/workflows/fix-issue-60-branch.yml
+          git commit -m "fix: repair Gemini capacity evaluation flow"
+          git push origin HEAD:60-use-more-gemini-free-tier-capacity-for-daily-job-evaluation
