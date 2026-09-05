@@ -152,18 +152,22 @@ def test_profile_priority_score_counts_unique_signals_once():
     assert profile_priority_score(unique, preferences, policy) > profile_priority_score(repeated, preferences, policy)
 
 
-def test_select_diverse_candidates_takes_minimum_per_source_first():
+def test_select_diverse_candidates_does_not_reserve_slots_for_weak_sources():
     ranked = [
-        (101, Job(source="ashby", title="Role", company="A1"), 95),
-        (102, Job(source="ashby", title="Role", company="A2"), 94),
-        (201, Job(source="remotive", title="Role", company="B1"), 70),
-        (202, Job(source="remotive", title="Role", company="B2"), 69),
-        (301, Job(source="hackernews", title="Role", company="C1"), 60),
+        (101, Job(source="ashby", title="Role"), 95),
+        (102, Job(source="ashby", title="Role"), 94),
+        (201, Job(source="remotive", title="Role"), 70),
+        (301, Job(source="hackernews", title="Role"), 40),
     ]
 
-    selected = select_diverse_candidates(ranked, limit=4, minimum_per_source=1, max_share=0.75)
+    selected = select_diverse_candidates(
+        ranked,
+        limit=3,
+        minimum_per_source=0,
+        max_share=0.75,
+    )
 
-    assert [job_id for job_id, _job, _score in selected] == [101, 201, 301, 102]
+    assert [job_id for job_id, _job, _score in selected] == [101, 102, 201]
 
 
 def test_select_diverse_candidates_respects_max_share_when_filling():
@@ -176,7 +180,7 @@ def test_select_diverse_candidates_respects_max_share_when_filling():
         (301, Job(source="hackernews", title="Role", company="C1"), 94),
     ]
 
-    selected = select_diverse_candidates(ranked, limit=4, minimum_per_source=1, max_share=0.5)
+    selected = select_diverse_candidates(ranked, limit=4, minimum_per_source=0, max_share=0.5)
 
     assert [job_id for job_id, _job, _score in selected] == [101, 201, 301, 102]
 
@@ -188,7 +192,7 @@ def test_select_diverse_candidates_preserves_rank_order_for_ties():
         (3, Job(source="remotive", title="Role", company="Gamma"), 80),
     ]
 
-    selected = select_diverse_candidates(ranked, limit=3, minimum_per_source=2, max_share=1.0)
+    selected = select_diverse_candidates(ranked, limit=3, minimum_per_source=0, max_share=1.0)
 
     assert [job_id for job_id, _job, _score in selected] == [2, 1, 3]
 
@@ -199,7 +203,7 @@ def test_select_diverse_candidates_fills_budget_when_share_cap_blocks_remaining_
         *[(200 + index, Job(source="remotive", title="Role", company=f"B{index:02d}"), 80 - index) for index in range(20)],
     ]
 
-    selected = select_diverse_candidates(ranked, limit=35, minimum_per_source=2, max_share=0.5)
+    selected = select_diverse_candidates(ranked, limit=35, minimum_per_source=0, max_share=0.5)
 
     assert len(selected) == 35
     counts = {}
