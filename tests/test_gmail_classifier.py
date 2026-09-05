@@ -329,7 +329,7 @@ def test_semantic_gmail_call_uses_bounded_resource_controls():
     call_kwargs = gemini.kwargs[0]
     assert call_kwargs["purpose"] == "gmail_semantic"
     assert call_kwargs["thinking_level"] == "minimal"
-    assert call_kwargs["max_output_tokens"] == 800
+    assert call_kwargs["max_output_tokens"] == 5000
     _, json_mode, schema = gemini.calls[0]
     assert json_mode is True
     assert schema is not None
@@ -592,3 +592,52 @@ def test_semantic_prompt_includes_only_allowed_message_content_and_body_prefix()
     assert "body-prefix" in prompt
     assert "https://example.com/jobs/42" in prompt
     assert "SECRET_AFTER_LIMIT" not in prompt
+
+    
+def test_semantic_gmail_parses_large_structured_job_alert_response():
+    jobs = [
+        {
+            "source_platform": "linkedin",
+            "source_job_id": str(1000 + index),
+            "url": f"https://www.linkedin.com/jobs/view/{1000 + index}/",
+            "company": f"Company {index}",
+            "title": f"Senior Frontend Engineer {index}",
+            "location": "Berlin, Germany",
+            "remote": True,
+            "description": (
+                "Senior frontend engineering role focused on React, TypeScript, "
+                "architecture, performance, testing, and cross-functional product "
+                "development. " * 8
+            ),
+        }
+        for index in range(5)
+    ]
+
+    job_urls = [job["url"] for job in jobs]
+
+    gemini = FakeGemini(
+        semantic_response(
+            kind="JOB_ALERT",
+            company="",
+            role_title="",
+            source_job_id=None,
+            job_urls=job_urls,
+            jobs=jobs,
+            rationale="Job alert containing multiple relevant frontend roles.",
+        )
+    )
+
+    result = classify_email(
+        message(
+            "Hiring opportunities for you",
+            "Several frontend roles may match your preferences.",
+            links=job_urls,
+        ),
+        gemini,
+    )
+
+    assert len(gemini.calls) == 1
+    assert result.kind == "JOB_ALERT"
+    assert len(result.jobs) == 5
+    assert [job.url for job in result.jobs] == job_urls
+    assert all(job.description for job in result.jobs)
