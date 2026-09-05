@@ -462,7 +462,7 @@ def _generate_semantic_text(
         prompt,
         purpose="gmail_semantic",
         thinking_level="minimal",
-        max_output_tokens=800,
+        max_output_tokens=5000,
         json_mode=True,
         json_schema=_GMAIL_CLASSIFICATION_SCHEMA,
     )
