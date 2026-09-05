@@ -37,6 +37,8 @@ _CAREER_SIGNALS = (
     "greenfield",
 )
 
+_SENIORITY_WORDS = ("intern", "junior", "mid", "senior", "staff", "lead", "principal", "head")
+
 _REGION_WORDS = frozenset({
     "europe", "emea", "germany", "netherlands", "spain", "portugal",
     "poland", "france", "italy", "austria", "ireland", "switzerland", "uk",
@@ -121,12 +123,49 @@ def _location_evidence(job: Job) -> int:
     return 5
 
 
-def _role_seniority_fit(job: Job, preferences: CandidatePreferences) -> int:
+def _configured_roles(policy: SearchPolicy) -> list[str]:
+    """Return explicit role intent, preserving all configured role families."""
+    return _normalized_phrases([*policy.role_families, *policy.target_titles])
+
+
+def _configured_seniority(policy: SearchPolicy) -> list[str]:
+    seniority: list[str] = []
+    for role in _configured_roles(policy):
+        role_words = set(role.split())
+        for word in _SENIORITY_WORDS:
+            if word in role_words and word not in seniority:
+                seniority.append(word)
+    return seniority
+
+
+def _configured_locations(policy: SearchPolicy) -> list[str]:
+    return _normalized_phrases(
+        [
+            location
+            for market in policy.markets
+            if market.enabled
+            for location in market.locations
+        ]
+    )
+
+
+def _role_seniority_fit(
+    job: Job,
+    preferences: CandidatePreferences,
+    policy: SearchPolicy,
+) -> int:
     normalized_title = normalize_text(job.title or "")
     title_words = set(normalized_title.split())
 
+    # Explicit search configuration owns search intent. CV-inferred preferences
+    # remain a compatibility fallback only for legacy policies with no targets.
+    preferred_roles = _configured_roles(policy) or _normalized_phrases(preferences.preferred_roles)
+    preferred_seniority = _configured_seniority(policy) or _normalized_phrases(
+        preferences.preferred_seniority
+    )
+
     best_role_ratio = 0.0
-    for role in _normalized_phrases(preferences.preferred_roles):
+    for role in preferred_roles:
         if role == normalized_title:
             best_role_ratio = 1.0
             break
@@ -136,8 +175,7 @@ def _role_seniority_fit(job: Job, preferences: CandidatePreferences) -> int:
         best_role_ratio = max(best_role_ratio, len(title_words & role_words) / len(role_words))
 
     role_score = round(25 * best_role_ratio)
-    seniority_words = _normalized_phrases(preferences.preferred_seniority)
-    seniority_score = 10 if any(word in title_words for word in seniority_words) else 0
+    seniority_score = 10 if any(word in title_words for word in preferred_seniority) else 0
     return min(35, role_score + seniority_score)
 
 
@@ -152,11 +190,19 @@ def _signal_coverage(job: Job, preferences: CandidatePreferences) -> int:
     return min(30, must_score + nice_score)
 
 
-def _profile_location_fit(job: Job, preferences: CandidatePreferences) -> int:
+def _profile_location_fit(
+    job: Job,
+    preferences: CandidatePreferences,
+    policy: SearchPolicy,
+) -> int:
     if not job.remote:
         return 0
 
-    preferred_locations = _normalized_phrases(preferences.preferred_locations)
+    # Active configured markets are authoritative. CV-inferred locations are
+    # only used for legacy policies that have no explicit market locations.
+    preferred_locations = _configured_locations(policy) or _normalized_phrases(
+        preferences.preferred_locations
+    )
     if not preferred_locations:
         return 15
 
@@ -181,11 +227,11 @@ _HOME_MARKET_REMOTE_POLICIES = frozenset({"preferred", "required"})
 
 def _market_location_fit(job: Job, preferences: CandidatePreferences, policy: SearchPolicy) -> int:
     if not job.market_id:
-        return _profile_location_fit(job, preferences)
+        return _profile_location_fit(job, preferences, policy)
 
-    market = next((m for m in policy.markets if m.id == job.market_id), None)
+    market = next((m for m in policy.markets if m.enabled and m.id == job.market_id), None)
     if market is None:
-        return _profile_location_fit(job, preferences)
+        return _profile_location_fit(job, preferences, policy)
 
     location_text = normalize_text(" ".join([job.location or "", job.description or ""]))
     target_city_match = any(normalize_text(city) in location_text for city in market.locations)
@@ -261,7 +307,7 @@ def _avoid_signal_penalty(job: Job, preferences: CandidatePreferences) -> int:
 
 def profile_priority_score(job: Job, preferences: CandidatePreferences, policy: SearchPolicy) -> int:
     total = (
-        _role_seniority_fit(job, preferences)
+        _role_seniority_fit(job, preferences, policy)
         + _signal_coverage(job, preferences)
         + _market_location_fit(job, preferences, policy)
         + source_quality(job)
