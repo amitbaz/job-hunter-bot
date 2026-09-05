@@ -288,7 +288,7 @@ def test_load_settings_uses_profile_discovery_defaults(monkeypatch, tmp_path: Pa
     settings = load_settings(cfg)
 
     assert settings.policy.max_jobs_per_run == 35
-    assert settings.policy.source_minimum_per_run == 2
+    assert settings.policy.source_minimum_per_run == 0
     assert settings.policy.source_max_share == 0.5
     assert settings.policy.manual_company_watch == []
     assert settings.policy.max_learned_ats_boards_per_run == 75
