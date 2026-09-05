@@ -6,6 +6,7 @@ import secrets
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+import time
 from zoneinfo import ZoneInfo
 
 from job_hunter.candidate_context import get_candidate_context
@@ -15,7 +16,12 @@ from job_hunter.cover_letter import generate_cover_letter
 from job_hunter.discovery import collect_candidates, metric_source_label
 from job_hunter.evaluation import evaluate_job
 from job_hunter.gemini import GeminiClient
-from job_hunter.gemini_usage import GEMINI_PURPOSES, GeminiBudgetExceeded, GeminiQuotaPaused
+from job_hunter.gemini_usage import (
+    GEMINI_PURPOSES,
+    GeminiBudgetExceeded,
+    GeminiQuotaPaused,
+    GeminiTemporaryCapacity,
+)
 from job_hunter.http import HttpClient
 from job_hunter.job_identity import normalize_company_name
 from job_hunter.models import (
@@ -478,16 +484,33 @@ def _evaluate_and_deliver_job(
         store.complete_ai_work("job_evaluation", job_id)
         return False, False, None
 
-    try:
-        evaluation = evaluate_job(job, candidate_context, settings.policy, gemini)
-    except (GeminiBudgetExceeded, GeminiQuotaPaused):
-        logger.warning("job evaluation deferred by Gemini quota for job_id=%s", job_id)
-        store.enqueue_ai_work("job_evaluation", job_id)
-        return False, True, None
-    except Exception:
-        logger.exception("evaluation failed for job_id=%s", job_id)
-        summary.errors += 1
-        return False, False, None
+    while True:
+        try:
+            evaluation = evaluate_job(
+                job,
+                candidate_context,
+                settings.policy,
+                gemini,
+            )
+            break
+        except GeminiTemporaryCapacity as exc:
+            logger.info(
+                "Gemini temporary capacity reached; waiting %.2fs before retrying job_id=%s",
+                exc.retry_after_seconds,
+                job_id,
+            )
+            time.sleep(exc.retry_after_seconds)
+        except (GeminiBudgetExceeded, GeminiQuotaPaused):
+            logger.warning(
+                "job evaluation deferred by Gemini quota for job_id=%s",
+                job_id,
+            )
+            store.enqueue_ai_work("job_evaluation", job_id)
+            return False, True, None
+        except Exception:
+            logger.exception("evaluation failed for job_id=%s", job_id)
+            summary.errors += 1
+            return False, False, None
 
     store.save_evaluation(job_id, evaluation)
     store.complete_ai_work("job_evaluation", job_id)
@@ -536,7 +559,6 @@ def _evaluate_and_deliver_job(
         summary.skipped += 1
 
     return promoted, False, evaluation.decision
-
 
 def _format_gemini_usage_log(summary: GeminiUsageSummary) -> str:
     """One structured log line at run completion: totals plus per-purpose counts."""
@@ -664,6 +686,8 @@ def run_pipeline(
     decision_counts: dict[str, dict[str, int]] = {}
     decision_counts_by_source: dict[str, dict[str, int]] = {}
     deferred_by_budget = max(0, len(ranked) - len(selected))
+    evaluated_count = 0
+    quota_deferred_count = 0
     logger.info(
         "discovery: raw=%s unique=%s prefilter_rejected=%s profession_rejected=%s eligible=%s selected=%s deferred_by_budget=%s canonical_network_attempts=%s sources=%s",
         discovery.stats.raw,
@@ -708,6 +732,10 @@ def run_pipeline(
         promoted, blocked, decision = _evaluate_and_deliver_job(
             job_id, job, candidate_context, settings, store, gemini, digest_items, summary
         )
+        if decision is not None:
+            evaluated_count += 1
+        if blocked:
+            quota_deferred_count += 1
         _record_decision(decision_counts, job.market_id, decision)
         _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
         if promoted:
@@ -719,15 +747,28 @@ def run_pipeline(
             continue
         if quota_blocked:
             store.enqueue_ai_work("job_evaluation", job_id)
+            quota_deferred_count += 1
             continue
         promoted, blocked, decision = _evaluate_and_deliver_job(
             job_id, job, candidate_context, settings, store, gemini, digest_items, summary
         )
+        if decision is not None:
+            evaluated_count += 1
+        if blocked:
+            quota_deferred_count += 1
         _record_decision(decision_counts, job.market_id, decision)
         _record_decision(decision_counts_by_source, metric_source_label(job.source), decision)
         if promoted:
             companies_promoted += 1
         quota_blocked = quota_blocked or blocked
+
+    logger.info(
+        "evaluation_capacity selected=%s evaluated=%s deferred_by_budget=%s quota_deferred=%s",
+        len(selected),
+        evaluated_count,
+        deferred_by_budget,
+        quota_deferred_count,
+    )
 
     for job_id in set(store.pending_delivery_job_ids()) - queued_job_ids - set(discovery.rediscovered_job_ids):
         _requeue_pending_delivery(job_id, store, digest_items)
